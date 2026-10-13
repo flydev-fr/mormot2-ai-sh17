@@ -16,6 +16,13 @@
 // - metric: cosine. The store normalises every vector to unit length on write
 //   and on query, so cosine similarity is the dot product and TRagHit.Distance is
 //   the cosine distance 1 - dot
+// - CONCURRENCY: the store opens its own connection. When the application writes
+//   domain tables of the SAME file through another connection, the file must use
+//   WAL (PRAGMA journal_mode=WAL, set by the owner - this unit never changes it):
+//   in rollback-journal mode a running scan holds a SHARED lock that makes every
+//   application COMMIT fail with SQLITE_BUSY (mORMot sets no busy timeout on the
+//   application side), and an application read blocks the store's writes.
+//   JournalMode reports the mode found at open
 // - clean-room; target license MPL/GPL/LGPL
 unit mormot.ai.vectorstore.native;
 
@@ -30,6 +37,7 @@ uses
   mormot.core.unicode,
   mormot.core.text,
   mormot.core.variants,
+  mormot.lib.static,      // SetFpuFlags/ResetFpuFlags
   mormot.db.raw.sqlite3,
   mormot.db.raw.sqlite3.static,
   mormot.ai.llm.types,
@@ -71,6 +79,7 @@ type
     fMeta: RawUtf8;
     fContract: TVectorContract;
     fBlobSize: integer;
+    fJournalMode: RawUtf8;
     /// validate (dimension, finite, non-zero) and scale to unit length
     function UnitVector(const aVec: TLlmEmbedding; const aWhat: RawUtf8): TLlmEmbedding;
     function RowIdOfKey(const aId: RawUtf8): Int64;
@@ -103,6 +112,10 @@ type
     property Contract: TVectorContract read fContract;
     /// the space name (table prefix)
     property Space: RawUtf8 read fSpace;
+    /// the journal mode of the file at open, lower-case ('wal', 'delete',
+    // 'memory' ...) - anything but 'wal' (or 'memory') is unsafe when another
+    // connection writes the same file concurrently, see the unit header
+    property JournalMode: RawUtf8 read fJournalMode;
   end;
 
 /// build a contract value
@@ -127,6 +140,8 @@ const
   NATIVE_MAX_DIM = 65536;
   /// IEEE-754 single: all exponent bits set = NaN or +-Inf
   SINGLE_EXP_MASK = $7F800000;
+  /// IEEE-754 double: the same test for a computed score
+  DOUBLE_EXP_MASK = Int64($7FF0000000000000);
 
 function VectorContract(const aModel, aModelSha256: RawUtf8; aDim: integer;
   aMaxTokens: integer; const aQueryPrefix, aDocumentPrefix: RawUtf8): TVectorContract;
@@ -201,8 +216,10 @@ procedure TTopK.Init(aCapacity: integer);
 begin
   Capacity := aCapacity;
   Count := 0;
-  SetLength(Score, aCapacity);
-  SetLength(RowId, aCapacity);
+  // grow on demand: a caller asking for k = MaxInt must not allocate 16 GB
+  // up front when the store holds a few hundred rows
+  SetLength(Score, MinPtrInt(aCapacity, 256));
+  SetLength(RowId, length(Score));
 end;
 
 function TTopK.Before(aScore: double; aRowId: Int64; aIndex: integer): boolean;
@@ -220,6 +237,11 @@ begin
       exit // not better than the current worst
     else
       dec(Count); // drop the worst, make room
+  if Count = length(Score) then
+  begin
+    SetLength(Score, MinPtrInt(Capacity, length(Score) * 2));
+    SetLength(RowId, length(Score));
+  end;
   i := Count;
   while (i > 0) and Before(aScore, aRowId, i - 1) do
   begin
@@ -257,6 +279,7 @@ begin
   // mORMot sets no busy timeout: a lock held by another connection (the
   // application writing its domain tables) would fail at once with SQLITE_BUSY
   fDB.BusyTimeout := 5000;
+  fJournalMode := LowerCase(fDB.ExecuteNoExceptionUtf8('PRAGMA journal_mode;'));
   OpenSpace;
 end;
 
@@ -574,6 +597,16 @@ begin
   case code of
     SQLITE_SELECT, SQLITE_READ, SQLITE_FUNCTION, SQLITE_RECURSIVE_:
       result := SQLITE_OK;
+    SQLITE_PRAGMA:
+      // FTS5 runs "PRAGMA data_version" (no argument = read only) internally
+      // on every MATCH; allowing exactly that keeps full-text key queries -
+      // the hybrid FTS5 + vector search - possible. Any other pragma, or
+      // data_version with an argument, stays denied
+      if (zCol = nil) and (zTab <> nil) and
+         (StrIComp(zTab, PAnsiChar('data_version')) = 0) then // no allocation
+        result := SQLITE_OK
+      else
+        result := SQLITE_DENY;
   else
     result := SQLITE_DENY; // PRAGMA, ATTACH, writes, transactions, DDL ...
   end;
@@ -585,6 +618,7 @@ var
   tail: PUtf8Char;
   rc, cols: integer;
   ro: boolean;
+  wrapped: RawUtf8;
 begin
   if TrimU(aKeySql) = '' then
     EVectorStore.RaiseUtf8('%.SearchWhere: empty key query - use Search', [self]);
@@ -624,6 +658,22 @@ begin
   if cols <> 1 then
     EVectorStore.RaiseUtf8('%.SearchWhere: key query returns % columns, ' +
       'expected exactly 1 (the external key)', [self, cols]);
+  // finally compile it exactly as Scan will embed it: a text that is valid on
+  // its own can still break the wrap (e.g. an unterminated /* comment) - report
+  // that here as EVectorStore instead of a raw SQLite error in the scan
+  stmt := 0;
+  sqlite3.set_authorizer(fDB.DB, KeySqlAuthorizer, nil);
+  try
+    wrapped := FormatUtf8('SELECT 1 WHERE NULL IN (%' + #10 + ')', [aKeySql]);
+    rc := sqlite3.prepare_v2(fDB.DB, pointer(wrapped), length(wrapped), stmt, tail);
+    if stmt <> 0 then
+      sqlite3.finalize(stmt);
+  finally
+    sqlite3.set_authorizer(fDB.DB, nil, nil);
+  end;
+  if rc <> SQLITE_OK then
+    EVectorStore.RaiseUtf8('%.SearchWhere: key query cannot be used as a ' +
+      'sub-select: %', [self, sqlite3.errmsg(fDB.DB)]);
 end;
 
 function TNativeVectorStore.SearchWhere(const aQuery: TLlmEmbedding;
@@ -649,6 +699,8 @@ var
   stmt: TSqlite3Statement;
   row: pointer;
   i: integer;
+  score: double;
+  fpu: cardinal;
 begin
   result := nil;
   q := UnitVector(aQuery, 'query');
@@ -688,6 +740,12 @@ begin
       // stream the rows: the BLOB is read in place (no copy, no allocation per
       // row); the CHECK constraint guarantees its size, verified anyway because
       // a foreign writer could have bypassed it with an older schema
+      // mask the FPU exceptions for the arithmetic of the scan: a foreign row
+      // with Inf or signalling-NaN bytes would otherwise trap INSIDE DotRow
+      // (Inf * 0 = invalid on x86_64) before the score test below could
+      // report it; masked, every such row ends in a non-finite score
+      fpu := SetFpuFlags(ffLibrary);
+      try
       while r.Step = SQLITE_ROW do
       begin
         if sqlite3.column_bytes(stmt, 1) <> fBlobSize then
@@ -695,8 +753,17 @@ begin
             'expected %)', [self, sqlite3.column_int64(stmt, 0),
             sqlite3.column_bytes(stmt, 1), fBlobSize]);
         row := sqlite3.column_blob(stmt, 1);
-        top.Offer(DotRow(pointer(q), row, fContract.Dim),
-          sqlite3.column_int64(stmt, 0));
+        score := DotRow(pointer(q), row, fContract.Dim);
+        // the query is finite, so a non-finite score means NaN/Inf bytes in
+        // the row (a foreign writer) - test the bits: comparing a NaN raises
+        // EInvalidOp once the FPU flags are restored
+        if PInt64(@score)^ and DOUBLE_EXP_MASK = DOUBLE_EXP_MASK then
+          EVectorStore.RaiseUtf8('%: row % has a corrupt embedding (non-finite ' +
+            'values)', [self, sqlite3.column_int64(stmt, 0)]);
+        top.Offer(score, sqlite3.column_int64(stmt, 0));
+      end;
+      finally
+        ResetFpuFlags(fpu);
       end;
     finally
       r.Close;

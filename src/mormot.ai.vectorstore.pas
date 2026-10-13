@@ -74,6 +74,9 @@ type
   // - aKeySql is trusted application code: never build it from user input, bind
   //   every variable part through aParams (? placeholders); the store refuses
   //   statements that are not read-only
+  // - only entity-keyed rows (Upsert) can match: anonymous Add rows have no key
+  // - TNativeVectorStore needs WAL when the application writes the same file
+  //   concurrently - see its unit header
   IFilteredVectorStore = interface(IVectorStore)
     ['{0F6B3C2A-7D41-4E8F-A2C5-91B7E3D4F608}']
     /// the aTopK documents nearest to aQuery among those whose external key is

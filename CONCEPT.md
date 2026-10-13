@@ -258,9 +258,9 @@ Config (`AI_EMBED_PROVIDER`), nie per `{$ifdef}`.
 
 **Vektorsuche gehört dazu:** `vec0` wird unabhängig davon durch einen nativen Store
 ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` je Vektorraum (`<space>_items`) als Wahrheit, quantisierte Kopie int8/1-bit + Nachbewertung, danach IVF — ausgelegt auf 2 Mio+ Vektoren je DB,
-mORMot bindet `create_function_v2`/`create_module_v2` auch statisch). Achtung: vec0
-rechnet heute mit **L2** (keine Metrik im Schema) — die Metrik des nativen Stores ist
-bewusst festzulegen.
+mORMot bindet `create_function_v2`/`create_module_v2` auch statisch). vec0 rechnete mit
+**L2** (keine Metrik im Schema); der native Store rechnet **Cosinus** auf Einheitsvektoren —
+das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 
 **Reihenfolge (Risiko zuerst, Details + Gates in docs/native-embeddings.md):**
 Referenzvertrag + deutscher Testkorpus → nativer Store (ersetzt vec0) →

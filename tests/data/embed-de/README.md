@@ -33,7 +33,8 @@ Beide Dateien sind JSON Lines (UTF-8, LF, kein BOM), ein Objekt je Zeile.
 - `1` = verwandt bzw. teilweise passend (andere Dimension oder Ausführung, z. B.
   DN 20 statt DN 15, oder Zubehör; reiner Artikel zu einer „liefern und
   montieren“-Anfrage).
-- nicht genannt = irrelevant. Jede Anfrage hat mindestens zwei Grad-2-Dokumente.
+- nicht genannt = irrelevant. Jede Anfrage hat mindestens zwei Grad-2-Dokumente (Regel
+  dieses Korpus; der Generator erzwingt allgemein mindestens eins).
 
 ## Aufbau
 
@@ -82,7 +83,7 @@ lembed-Laufzeit auskommen:
 
 - `manifest.json` – Referenzvertrag (Modell-SHA-256, Laufzeit, Dimension, Pooling,
   Normierung, Metrik, Tokenlimit, Sondertoken-Verhalten), SHA-256 dieser beiden
-  `.jsonl`-Dateien, Statistik, Metriken (nDCG@10, Recall@10, MRR) und die exakte
+  `.jsonl`-Dateien, Statistik, Metriken (nDCG@10, Recall@10, MRR = Kehrwert des Rangs des ersten Grad-2-Dokuments) und die exakte
   Top-20 je Anfrage (`[id, score, grade]`).
 - `docs.f32`, `queries.f32` – Vektoren als float32 little-endian, Zeile für Zeile in
   Dateireihenfolge.

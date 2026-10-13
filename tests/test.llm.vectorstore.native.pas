@@ -41,6 +41,8 @@ type
     procedure ContractTextIsNotReinterpreted;
     procedure SearchWhereFiltersBeforeTopK;
     procedure SearchWhereRejectsUnsafeSql;
+    procedure SearchWhereWithFts5;
+    procedure CorruptForeignRowsAreReported;
     procedure SpacesAreIsolated;
     procedure ReferenceParity;
   end;
@@ -430,6 +432,8 @@ begin
   Refused('SELEKT', 'non-compiling key query refused');
   Refused('SELECT ''a'';', 'trailing semicolon refused');
   Refused('SELECT ''a''' + #0 + ') OR 1=1 --', 'NUL byte refused');
+  // valid standalone, but an unterminated /* would swallow the wrap's ")"
+  Refused('SELECT ''a'' /* note', 'unterminated block comment refused');
   // statements that act while being COMPILED must be denied at compile time
   Refused('PRAGMA busy_timeout = 0', 'pragma refused');
   // valid SQL (one column) - only the authorizer can refuse it, and only if it
@@ -441,6 +445,98 @@ begin
   CheckEqual(length(store.SearchWhere(V4(1, 0, 0, 0), 5,
     'WITH k(id) AS (VALUES (''a'')) SELECT id FROM k', [])), 1, 'CTE key query');
   CheckEqual(store.Count, 2, 'nothing was deleted');
+end;
+
+procedure TTestVectorStoreNative.SearchWhereWithFts5;
+var
+  fn: TFileName;
+  app: TSqlDataBase;
+  store: IFilteredVectorStore;
+  hits: TRagHitDynArray;
+begin
+  // the hybrid search of the plan: full-text candidates (FTS5) restrict the
+  // vector search - FTS5 runs "PRAGMA data_version" internally on every MATCH,
+  // which the read-only authorizer must allow
+  fn := TempDb;
+  store := TNativeVectorStore.Create(StringToUtf8(fn), 'ft', C4);
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('CREATE VIRTUAL TABLE pos_fts USING fts5(id UNINDEXED, text);');
+    app.Execute('INSERT INTO pos_fts VALUES (''p1'', ''Kupferrohr verlegen''), ' +
+      '(''p2'', ''Wandfliesen verlegen''), (''p3'', ''Kupferrohr demontieren'');');
+  finally
+    app.Free;
+  end;
+  store.Upsert('p1', 'Kupferrohr verlegen', V4(1, 0, 0, 0));
+  store.Upsert('p2', 'Wandfliesen verlegen', V4(1, 0.1, 0, 0));
+  store.Upsert('p3', 'Kupferrohr demontieren', V4(0, 1, 0, 0));
+  hits := store.SearchWhere(V4(1, 0, 0, 0), 10,
+    'SELECT id FROM pos_fts WHERE pos_fts MATCH ?', ['Kupferrohr']);
+  CheckEqual(length(hits), 2, 'FTS5 candidates p1 + p3');
+  CheckEqual(hits[0].Key, 'p1', 'vector ranks within the FTS5 candidates');
+  Check(not HasKey(hits, 'p2'), 'non-matching text excluded');
+end;
+
+procedure TTestVectorStoreNative.CorruptForeignRowsAreReported;
+var
+  fn: TFileName;
+  app: TSqlDataBase;
+  store: IVectorStore;
+begin
+  // a foreign writer bypassing the store: right length, NaN content - must be
+  // reported as a corrupt row, not crash the comparison with EInvalidOp
+  fn := TempDb;
+  store := TNativeVectorStore.Create(StringToUtf8(fn), 'cr', C4);
+  store.Upsert('ok', 'ok', V4(1, 0, 0, 0));
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''bad'', ' +
+      '''nan'', X''0000C07F0000C07F0000C07F0000C07F'');');
+  finally
+    app.Free;
+  end;
+  try
+    store.Search(V4(1, 0, 0, 0), 5);
+    Check(false, 'quiet NaN row reported');
+  except
+    on E: EVectorStore do
+      Check(true, 'quiet NaN row reported');
+  end;
+  store.Delete('bad');
+  // +Inf in a component where the query is 0: Inf * 0 traps (invalid) on
+  // x86_64 unless the scan masks the FPU - and a signalling NaN traps always
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''inf'', ' +
+      '''inf'', X''0000803F0000807F0000807F0000807F'');');
+  finally
+    app.Free;
+  end;
+  try
+    store.Search(V4(1, 0, 0, 0), 5);
+    Check(false, 'Inf row reported');
+  except
+    on E: EVectorStore do
+      Check(true, 'Inf row reported');
+  end;
+  store.Delete('inf');
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''snan'', ' +
+      '''snan'', X''0100807F0100807F0100807F0100807F'');');
+  finally
+    app.Free;
+  end;
+  try
+    store.Search(V4(1, 0, 0, 0), 5);
+    Check(false, 'signalling NaN row reported');
+  except
+    on E: EVectorStore do
+      Check(true, 'signalling NaN row reported');
+  end;
+  store.Delete('snan');
+  // a huge k must not pre-allocate k slots
+  CheckEqual(length(store.Search(V4(1, 0, 0, 0), MaxInt)), 1, 'k = MaxInt works');
 end;
 
 procedure TTestVectorStoreNative.SpacesAreIsolated;
@@ -494,7 +590,12 @@ var
   qid: RawUtf8;
   c: TVectorContract;
   expect, hit: PDocVariantData;
-  score: double;
+  expIds: TRawUtf8DynArray;
+  expScores: TDoubleDynArray;
+const
+  /// scores closer than this count as a tie (the reference's smallest real
+  // gap between neighbours is ~2e-7, the store's re-normalisation shifts ~6e-7)
+  NEAR_TIE = 1e-6;
 begin
   refdir := FindReferenceDir;
   if CheckFailed(refdir <> '', 'reference data tests/data/embed-de found') then
@@ -542,14 +643,32 @@ begin
     hits := store.Search(q, top.Count);
     CheckEqual(length(hits), top.Count, 'top-N length');
     n := MinPtrInt(length(hits), top.Count);
+    // read the expected ranking once
+    SetLength(expIds, n);
+    SetLength(expScores, n);
     for j := 0 to n - 1 do
     begin
-      // same document at the same rank, same score (float32 rows, double sum)
       hit := _Safe(top.Values[j]);
-      if not VariantToDouble(hit^.Values[1], score) or
-         (hits[j].Key <> VariantToUtf8(hit^.Values[0])) or
-         (abs((1 - hits[j].Distance) - score) > 1e-5) then
-        inc(mism);
+      expIds[j] := VariantToUtf8(hit^.Values[0]);
+      if not VariantToDouble(hit^.Values[1], expScores[j]) then
+        expScores[j] := -2; // forces a mismatch below
+    end;
+    for j := 0 to n - 1 do
+    begin
+      // the score at every rank must match the reference (float32 rows summed
+      // in double; the store re-normalises, which moves scores by <1e-6)
+      if abs((1 - hits[j].Distance) - expScores[j]) > 1e-5 then
+        inc(mism)
+      // the document at every rank must match too - EXCEPT inside a near-tie:
+      // two reference scores closer than NEAR_TIE may swap under another
+      // rounding path (Delphi, FMA, the coming SIMD/int8 stages) without any
+      // retrieval meaning; such a swap is accepted, a real reordering is not
+      else if hits[j].Key <> expIds[j] then
+        if not (((j > 0) and (abs(expScores[j] - expScores[j - 1]) < NEAR_TIE) and
+                 (hits[j].Key = expIds[j - 1])) or
+                ((j < n - 1) and (abs(expScores[j] - expScores[j + 1]) < NEAR_TIE) and
+                 (hits[j].Key = expIds[j + 1]))) then
+          inc(mism);
     end;
     top.Clear;
   end;

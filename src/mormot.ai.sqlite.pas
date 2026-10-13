@@ -17,6 +17,7 @@ interface
 uses
   sysutils,
   mormot.core.base,
+  mormot.core.unicode, // Utf8ToString (mORMot's, as before the extraction)
   mormot.core.text,
   mormot.db.raw.sqlite3;
 

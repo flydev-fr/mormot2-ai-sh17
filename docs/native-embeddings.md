@@ -1,12 +1,13 @@
 # Native Embeddings + Vektorsuche in Pascal — Analyse
 
-> **Status: Entwurf zur Diskussion (2026-10-13), noch nicht entschieden.**
+> **Status (2026-10-13):** Plan entschieden und in Umsetzung. **Gebaut + gemessen:**
+> Schritt 1 (Referenzvertrag, Testkorpus, Basis-Metriken) und Schritt 2a (nativer Store,
+> exakte Suche) — siehe „Plan mit Prüfpunkten". **Noch Schätzung:** alles zu den
+> späteren Stufen (int8/IVF, nativer Encoder), insbesondere Aufwand und Performance.
 > Ziel: die C-Abhängigkeiten `vec0` (sqlite-vec) und `lembed0` + `libllama`/`ggml`
 > (sqlite-lembed) durch nativen Pascal-Code ersetzen — kein `load_extension`, keine
-> Arch-Bundles je Plattform. Entstanden aus einer zweistufigen Design-Diskussion
-> (Claude + Codex), beide Runden gegen den echten Code geprüft. **Nichts davon ist
-> gebaut oder gemessen** — alle Zahlen zu Aufwand/Performance sind Schätzungen bzw.
-> vorgeschlagene Gates.
+> Arch-Bundles je Plattform. Entstanden aus einer Design-Diskussion (Claude + Codex),
+> gegen den echten Code geprüft; die Umsetzung ist mit Codex und Claude Fable reviewt.
 >
 > Geprüfte Stände: dieses Repo, mORMot2 (Submodul), neural-api `b172061`
 > (2026-10-11), Modelldatei `vendor/models/bge-m3-q8_0.gguf`.
@@ -205,7 +206,17 @@ Treffer übrig):
   Quantisierung gegen den exakten Scan messen. Cache mit Speicherlimit/LRU, nicht alle
   Stores dauerhaft geladen; vorladen vs. streamen per Konfiguration.
 - **SIMD**: zuerst skalare Referenz (zugleich Test-Orakel), danach AVX2 (mit
-  Laufzeitprüfung) und NEON. SIMD ist Optimierung, keine Voraussetzung.
+  Laufzeitprüfung) und NEON. SIMD ist Optimierung, keine Voraussetzung. Für Stufe 2b
+  beachten: `column_blob` liefert bei kleinen BLOBs innerhalb einer Seite **nicht
+  ausgerichtete** Zeiger — Kernel mit ausgerichteten Loads müssen in einen eigenen,
+  ausgerichteten Puffer kopieren (der RAM-Index ist das ohnehin).
+- **Nebenläufigkeit / WAL** (umgesetzt in 2a, dokumentiert im Unit-Kopf): Der Store hat
+  eine eigene Verbindung. Schreibt die Anwendung dieselbe Datei parallel, **muss** die
+  Datei im WAL-Modus laufen — im Rollback-Journal hält ein Scan eine SHARED-Sperre, an
+  der jedes COMMIT der Anwendung sofort mit SQLITE_BUSY scheitert (mORMot setzt dort
+  keinen Busy-Timeout). `TNativeVectorStore.JournalMode` meldet den Modus beim Öffnen;
+  die Anwendung setzt WAL und einen Busy-Timeout auf ihrer Seite. Der RAM-Index von 2b
+  verkürzt die Lesesperre auf das Nachladen der Treffer.
 - **Extension-Lader**: `EnableSqliteExtensions`/`LoadSqliteExtension` aus
   `sqlitevec` in eine eigene Unit ziehen — lembed braucht sie, bis Teil B steht.
 
@@ -420,7 +431,8 @@ billigste Operation und passt direkt zu int8-Quantisierung.
 - **Determinismus**: zweimal derselbe Text ⇒ Cosinus 1,0; zwei getrennte Generatorläufe
   liefern **bitgleiche** Vektordateien.
 - **Durchsatz** (Snapdragon X, WSL aarch64, serialisiert, stark längenabhängig):
-  **~25 Texte/s** bei ~15 Tokens, **~4,7 Texte/s** beim Korpus (⌀ 51 Tokens, max. 234).
+  **~25 Texte/s** bei ~15 Tokens, **~3,6–5,7 Texte/s** beim Korpus (⌀ 51 Tokens, max. 234;
+  Streuung über vier Läufe, der Wert im Manifest ist der des erzeugenden Laufs).
   Hochgerechnet auf 2 Mio Artikel ≈ **22 h** (kurze Texte) bis **> 100 h** (Positionslänge)
   Erstindizierung — bestätigt: die Erzeugung ist der Engpass; IONOS oder ein schnellerer
   lokaler Pfad ist für Großbestände Pflicht. Auf x86_64 noch nicht gemessen.
@@ -443,13 +455,16 @@ billigste Operation und passt direkt zu int8-Quantisierung.
 
 ### Basis-Metriken des Orakels (lembed + bge-m3 q8, Stand 2026-10-13)
 
-| nDCG@10 | Recall@10 (Grad 2) | MRR (volle Rangliste) |
+| nDCG@10 | Recall@10 (Grad 2) | MRR (erstes Grad-2-Dokument, volle Rangliste) |
 |---|---|---|
 | **0,896** | **0,974** | **0,928** |
 
 Das ist die Messlatte für Gate 4/5 (nativer Encoder: nDCG@10 höchstens 1 Prozentpunkt
 darunter) und das Referenz-Ranking für Gate 2 (nativer Store im exakten Modus: identische
-Top-20 bis auf Gleichstände). Die schwächsten Anfragen sind die erwartbar schweren:
+Top-20; Plätze, deren Referenz-Scores weniger als 1e-6 auseinanderliegen, gelten als
+Gleichstand und dürfen tauschen — die Referenz hat echte Nachbarabstände ab ~2e-7, und
+andere Rundungspfade (Delphi, FMA, SIMD/int8 in Stufe 2) dürfen dort nicht als Fehler
+zählen). Gleiche Scores ordnen Generator und Store in Dateireihenfolge (= rowid). Die schwächsten Anfragen sind die erwartbar schweren:
 umgangssprachliche Kundenmails („Bad soll neue Fliesen an der Wand bekommen") und Wand- vs.
 Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 
@@ -458,7 +473,7 @@ Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 | # | Schritt | Umfang | Freigabe nur wenn |
 |---|---|---|---|
 | 1 ✓ | Referenzvertrag: Modell-Hash, Runtime-Version, Token-Flags, Kontextgrenze, Metrik, **deutscher Testkorpus** — **erledigt 2026-10-13**, siehe „Referenzvertrag v1" | 1–2 Tage | festgelegt und dokumentiert |
-| 2a ✓ | Nativer Store, exakte Suche: float32-BLOB je Vektorraum, Vertrag persistiert + erzwungen, Fachfilter (`IFilteredVectorStore.SearchWhere`, read-only SQL auf Fachtabellen derselben Datei, vor Top-k), mehrere Räume je Datei, Eingabeprüfung — **erledigt 2026-10-13** (`mormot.ai.vectorstore.native`, Tests `test.llm.vectorstore.native`) | – | **Parität: alle 58 Referenzanfragen liefern exakt die Top-20 der Referenz (Rang + Score)**; Atomarität, Fehlerfälle, Neustart, Raumtrennung getestet |
+| 2a ✓ | Nativer Store, exakte Suche: float32-BLOB je Vektorraum, Vertrag persistiert + erzwungen, Fachfilter (`IFilteredVectorStore.SearchWhere`, read-only SQL auf Fachtabellen derselben Datei, vor Top-k), mehrere Räume je Datei, Eingabeprüfung — **erledigt 2026-10-13** (`mormot.ai.vectorstore.native`, Tests `test.llm.vectorstore.native`) | – | **Parität: alle 58 Referenzanfragen liefern die Top-20 der Referenz (Score je Rang ± 1e-5, Dokument je Rang identisch außer bei Beinahe-Gleichstand < 1e-6)**; FTS5-Schlüsselabfragen (Hybridsuche) funktionieren; Atomarität, Fehlerfälle, Neustart, Raumtrennung getestet |
 | 2 | Nativer Store, schnell: quantisierte Kopie (int8/1-bit) im RAM + Nachbewertung mit float32, Multithread-Scan, Benchmark 2 Mio × 1024 | ~1 Woche | Recall@10 ≥ 0,95 gegen den exakten Modus; Gate-5-Zahlen |
 | 2b | IVF-Partitionierung (v2) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
 | 3 | GGUF-Reader + UGM-Tokenizer | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-/Sondertoken-Fällen; beschädigte Dateien sicher abgelehnt |
@@ -470,8 +485,8 @@ Die Gate-Zahlen sind **Vorschläge**, noch nicht abgestimmt.
 
 ## Offene Fragen (vor dem Start zu klären)
 
-- Metrik festlegen: L2 beibehalten (Parität zu vec0) oder Cosine/Skalarprodukt auf
-  normierten Vektoren?
+- ~~Metrik~~ — **entschieden**: Cosinus = Skalarprodukt auf Einheitsvektoren (Ranking
+  identisch zu L2), siehe „Referenzvertrag v1".
 - ~~Mengengerüst~~ — **beantwortet** (bis 2 Mio Artikel, Positionen ~2,6 Mio in 10
   Jahren, siehe „Mengengerüst"): Quantisierung in v1, IVF direkt danach.
 - ~~Zielhardware~~ — **beantwortet**: Consumer-Klasse, 32/64 GB RAM; int8 im RAM als Default.

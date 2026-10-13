@@ -1,6 +1,6 @@
 {
 	"format": 1,
-	"created_utc": "2026-10-13T11:29:15Z",
+	"created_utc": "2026-10-13T14:01:37Z",
 	"contract": {
 		"model": "BAAI/bge-m3",
 		"model_file": "bge-m3-q8_0.gguf",
@@ -36,14 +36,16 @@
 		"mean_tokens": 50.8375,
 		"norm_min": 0.9999993601041,
 		"norm_max": 1.000000807533,
-		"doc_embed_ms": 60353,
-		"docs_per_second": 4.34112637317118,
+		"doc_embed_ms": 72201,
+		"docs_per_second": 3.62875860445146,
 		"host": "Ubuntu Linux 6.18.54 12 x Qualcomm ARM 0x01 (aarch64)"
 	},
 	"metrics": {
 		"ndcg10": 0.89629361138298,
 		"recall10": 0.97413793103448,
-		"mrr": 0.92816091954023
+		"mrr": 0.92816091954023,
+		"mrr_note": "reciprocal rank of the first grade-2 document, full ranking",
+		"tie_break": "equal scores rank in corpus file order (= store rowid order)"
 	},
 	"queries": {
 		"q001": {

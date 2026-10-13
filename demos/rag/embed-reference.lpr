@@ -381,11 +381,13 @@ begin
         Fail('dimension % <> contract %', [dim, CONTRACT_DIM]);
       contract.InitFast;
       contract.AddValue('model', CONTRACT_MODEL);
-      contract.AddValueFromText('model_file', ExtractFileName(Utf8ToString(modelPath)));
-      contract.AddValueFromText('model_sha256', modelSha);
-      contract.AddValueFromText('runtime', 'sqlite-lembed ' +
+      // AddValueText for every string: AddValueFromText would turn a numeric-
+      // looking value into a number
+      contract.AddValueText('model_file', StringToUtf8(ExtractFileName(Utf8ToString(modelPath))));
+      contract.AddValueText('model_sha256', modelSha);
+      contract.AddValueText('runtime', 'sqlite-lembed ' +
         ScalarText('SELECT lembed_version();') + ' (llama.cpp)');
-      contract.AddValueFromText('sqlite', ScalarText('SELECT sqlite_version();'));
+      contract.AddValueText('sqlite', ScalarText('SELECT sqlite_version();'));
       contract.AddValue('dim', dim);
       contract.AddValue('pooling', CONTRACT_POOLING);
       contract.AddValue('normalize', 'l2');
@@ -405,9 +407,9 @@ begin
       corpus.InitFast;
       corpus.AddValue('docs', length(docs));
       corpus.AddValue('queries', length(queries));
-      corpus.AddValueFromText('corpus_sha256',
+      corpus.AddValueText('corpus_sha256',
         HashFile(datadir + 'corpus.jsonl', hfSHA256));
-      corpus.AddValueFromText('queries_sha256',
+      corpus.AddValueText('queries_sha256',
         HashFile(datadir + 'queries.jsonl', hfSHA256));
       corpus.AddValue('vector_files', _ArrFast(['docs.f32', 'queries.f32']));
       corpus.AddValue('vector_format', 'float32 little-endian, row-major, file order');
@@ -419,7 +421,7 @@ begin
       stats.AddValue('doc_embed_ms', embedMs);
       if embedMs > 0 then
         stats.AddValue('docs_per_second', length(docs) * 1000 / embedMs);
-      stats.AddValueFromText('host', OSVersionShort + ' ' + CpuInfoText);
+      stats.AddValueText('host', OSVersionShort + ' ' + CpuInfoText);
     finally
       FreeAndNil(db);
     end;
@@ -451,7 +453,7 @@ begin
         best := -1;
         for j := 0 to high(docs) do
           if not used[j] and ((best < 0) or (scores[j] > scores[best]) or
-             ((scores[j] = scores[best]) and (docs[j].Id < docs[best].Id))) then
+             ((scores[j] = scores[best]) and (j < best))) then
             best := j;
         if best < 0 then
           break;
@@ -475,7 +477,7 @@ begin
           rank := 1;
           for best := 0 to high(docs) do
             if (scores[best] > scores[j]) or
-               ((scores[best] = scores[j]) and (docs[best].Id < docs[j].Id)) then
+               ((scores[best] = scores[j]) and (best < j)) then
               inc(rank);
           if (firstRel = 0) or (rank < firstRel) then
             firstRel := rank;
@@ -514,9 +516,11 @@ begin
     metrics.AddValue('ndcg10', ndcgSum / length(queries));
     metrics.AddValue('recall10', recSum / length(queries));
     metrics.AddValue('mrr', mrrSum / length(queries));
+    metrics.AddValue('mrr_note', 'reciprocal rank of the first grade-2 document, full ranking');
+    metrics.AddValue('tie_break', 'equal scores rank in corpus file order (= store rowid order)');
     manifest.InitFast;
     manifest.AddValue('format', 1);
-    manifest.AddValueFromText('created_utc', NowUtcToString(true, 'T') + 'Z');
+    manifest.AddValueText('created_utc', NowUtcToString(true, 'T') + 'Z');
     manifest.AddValue('contract', variant(contract));
     manifest.AddValue('corpus', variant(corpus));
     manifest.AddValue('stats', variant(stats));
