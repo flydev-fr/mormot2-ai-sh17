@@ -89,13 +89,16 @@ kein SQLite) wollte, schleppte die statische SQLite-Abhängigkeit mit.
 ```
 mormot.ai.vectorstore           ✓ NUR IVectorStore + TRagHit + Vektor-Helfer (SQLite-frei)
 mormot.ai.vectorstore.sqlitevec ✓ TVec0Store (sqlite-vec) + Extension-Loader [static SQLite hier isoliert]
+mormot.ai.vectorstore.native    ○ nativer Store: BLOB-Spalte + Pascal-KNN, ersetzt vec0 (§5, docs/native-embeddings.md)
 mormot.ai.vectorstore.pgvector  ○ TPgVectorStore (IVectorStore) auf mormot.db.pgvector.* (Merge §4)
 mormot.ai.embeddings            ✓ NUR IEmbedder (zieht nicht mehr den LLM-Client)
 mormot.ai.embed.provider        ✓ TProviderEmbedder (OpenAI-Wire)
 mormot.ai.embed.ollama          ○ TOllamaEmbedder (aus Merge §4)
 mormot.ai.embed.lembed          ✓ TLembedEmbedder (sqlite-lembed, lokal; eigene :memory:-Connection) + SharedLembedEmbedder()
+mormot.ai.embed.native          ○ TNativeEmbedder (eigener Pascal-Encoder auf dem GGUF, Option D in §5)
 ```
-(✓ = gebaut, Demos grün · ○ = offen, kommt mit dem Merge §4)
+(✓ = gebaut, Demos grün · ○ = offen — pgvector/Ollama kommen mit dem Merge §4, die
+nativen Units mit §5)
 
 **Embedder = Prozess-Service, nicht pro DB.** Embedding-Erzeugung (`text → vector`)
 ist orthogonal zur Vektor-**Speicherung** (`IVectorStore`, pro DB). Ein lokales
@@ -190,15 +193,21 @@ hier gilt „Interface tief, Bindung hoch" — die Engine kennt nur `IEmbedder` 
 | **lembed** (heute) | GGUF-Modell in SQLite via `lembed0` | `lembed0` + `libllama`/`ggml` **je Arch** (`.so`/`.dll`), `load_extension` | ✓ gebaut, prozessweiter Singleton |
 | **Provider** | OpenAI-Wire `/embeddings` | Netz + API-Key | ✓ gebaut |
 | **Ollama** | HTTP an lokalen Ollama-Server | **externer Prozess** | ○ kommt mit §4 |
-| **neural-api** | **native Pascal-Inferenz im Prozess** | **keine** (statisch gelinkt) | ○ evaluieren |
+| **native** (Option D) | eigener Pascal-Encoder auf dem vorhandenen GGUF | **keine** | ○ vorgeschlagen (2026-10-13) |
+| **neural-api** | **native Pascal-Inferenz im Prozess** | **keine** (statisch gelinkt) | ○ strategisch für `ILlmClient`; als Embedder für bge-m3 heute nicht fertig |
+
+> **Stand 2026-10-13:** Die Ablösung von `vec0` **und** `lembed0` durch nativen Pascal-Code
+> ist in [docs/native-embeddings.md](docs/native-embeddings.md) analysiert (Entwurf zur
+> Diskussion, gegen den Code von neural-api `b172061` geprüft). Kernergebnisse unten; die
+> Details, der Plan mit Prüfpunkten und die offenen Fragen stehen dort.
 
 ### neural-api (CAI NEURAL API) — die interessante Option
 
 [joaopauloschuler/neural-api](https://github.com/joaopauloschuler/neural-api) —
-LGPL-2.1 **mit Linking-Exception**, 432★, sehr aktiv (Push 2026-07-28), AVX/AVX2/
-AVX512 + OpenCL. Kann laut README **echte LLM-Inferenz nativ in Pascal**: Qwen2.5
-(0.5B–32B), Qwen3, Llama/TinyLlama/SmolLM2, Mistral 7B, Phi-3-mini, OLMoE (MoE),
-RWKV, xLSTM (`ChatTerminal`); dazu Retrieval-Beispiele für die **E5/BGE/GTE**-Familie
+LGPL-2.1 **mit Linking-Exception**, sehr aktiv (letzter geprüfter Stand `b172061`,
+2026-10-11), AVX/AVX2/AVX512 + OpenCL. Kann **echte LLM-Inferenz nativ in Pascal**:
+Qwen2.5 (0.5B–32B), Qwen3, Llama/TinyLlama/SmolLM2, Mistral 7B, Phi-3-mini, OLMoE (MoE),
+RWKV, xLSTM (`ChatTerminal`); dazu Retrieval-Bausteine für die **E5/BGE/GTE**-Familie
 (`EmbeddingSearch`, `SemanticSearch`, `ColBERTSearch`, `DebertaReranker`).
 
 **Der Gewinn, wenn es trägt** — genau die Linie „Single Binary, kein externer
@@ -207,35 +216,56 @@ kein `libllama`/`ggml`, kein `load_extension`, **kein Arch-Bundle-Download + SHA
 im Docker-Entrypoint, kein Ollama-Server. Ein statisch gelinktes FPC-Binary macht
 Embeddings **und** Chat.
 
-**Die Haken — ehrlich, vor jeder Entscheidung zu klären:**
+**Was inzwischen vorhanden ist** (überholt frühere Annahmen hier): GGUF-Reader
+(`neuralgguf.pas`, Q8_0/K-Quants) und SafeTensors-Reader — der frühere Haken „kein GGUF,
+nur `.nn` über eine Python-Toolchain" gilt so **nicht mehr**; dazu
+`BuildXLMRobertaFromSafeTensors` (bge-m3 ist XLM-RoBERTa) mit Int8-Quantisierung,
+Unigram-/SentencePiece-Tokenizer, CLS/Mean-Pooling und E5/BGE-Präfixe.
 
-1. **Kein GGUF.** Eigenes `.nn`-Format; Import aus HuggingFace läuft über eine
-   **Python-Toolchain** (torch/transformers/safetensors: `slice_llama.py`,
-   `make_tiny_llama.py`). Relativierung: das ist ein **Bereitstellungs-Schritt**, kein
-   Laufzeit-Schritt — einmal konvertieren, `.nn` ausliefern (wie heute `.gguf`). **Kein
-   Python auf dem Server.**
-2. ~~**FPC/Lazarus only** (master; Delphi nur v2.0.0)~~ — **erledigt**: seit der
-   Entscheidung „eigene Extension statt mORMot-PR, FPC-only" (§1) ist das **kein
-   Hindernis mehr, sondern der Grund dafür**. neural-api darf **Kern-Abhängigkeit**
-   werden — als FPC-only-Backend hinter der Naht. Daran ändert auch Delphi 13 „soweit
-   möglich" (§1, 2026-09-10) nichts: unter Delphi fehlt dieses Backend dann eben.
-3. **Embedding-Tauglichkeit unverifiziert.** Das `EmbeddingSearch`-Beispiel fährt ein
-   Pico-Test-Fixture (`tiny_e5`, 2 Layer, hidden 8), kein Produktionsmodell. Ob
-   **bge-m3** (XLM-RoBERTa, 1024 dim) sauber konvertiert und rechnet, ist offen.
-4. **Performance unbelegt** gegenüber llama.cpp (hochoptimierte C++-Kernels).
+**Die Haken für unser Embedding-Modell (bge-m3) — Stand 2026-10-13:**
 
-**Entscheidung: neural-api ist das strategische Ziel-Backend** (§1) — eingebunden
-über dieselbe Naht: neue Units `mormot.ai.embed.neuralapi` / `mormot.ai.llm.neuralapi`
-hinter `IEmbedder`/`ILlmClient`. Die Naht bleibt **trotzdem** bestehen — auch wegen
-Delphi (dort fehlt neural-api), vor allem aber, weil Provider-/Ollama-/lembed-Backends weiter sinnvoll sind
-(Cloud-Modelle, bestehende Ollama-Deployments, Fallback).
+1. **Tokenizer-Normalisierung fehlt**: die SentencePiece-`precompiled_charsmap` wird
+   ignoriert → Abweichungen bei deutschem/Unicode-Text. Risiko Nr. 1.
+2. **GGUF nur für Decoder**: der GGUF-Pfad nimmt llama/qwen2/gemma2, nicht
+   `architecture=bert` + `tokenizer.model=t5` → unser `bge-m3-q8_0.gguf` lädt nicht;
+   Umweg über SafeTensors.
+3. ~~**FPC/Lazarus only**~~ — **kein Hindernis** (§1): FPC-only-Backends hinter der Naht
+   sind erlaubt; unter Delphi fehlt das Backend dann eben.
+4. **AArch64 ohne SIMD** (`NOTAVX`, skalar) — ARM-Entwicklungsrechner, Apple Silicon,
+   ARM-Server.
+5. **Nicht reentrant**, große Abhängigkeitsfläche (`neuralpretrained.pas` ~91k Zeilen,
+   zieht Chat/Audio/Diffusion; `neuralthread` braucht Lazarus `UTF8Process`).
+6. **Embedding-Tauglichkeit unverifiziert**: Paritätstests nur gegen ein Pico-Fixture
+   (2 Layer, Hidden 8); Performance gegenüber llama.cpp unbelegt.
 
-**Reihenfolge (Risiko zuerst):** ein **Spike** mit harten Kriterien, bevor umgestellt
-wird: (a) ein echtes E5/BGE-Modell konvertieren, (b) Embedding-**Qualität** gegen
-lembed vergleichen (gleiche Testsätze, Cosine-Ranking), (c) **Durchsatz** messen,
-(d) RAM-Bedarf. Fällt der Spike gut aus, wird neural-api der **Default**;
-lembed/Ollama/Provider bleiben Fallback — umgeschaltet per Config
-(`AI_EMBED_PROVIDER`), nie per `{$ifdef}`.
+**Entscheidung (gilt weiter): neural-api ist das strategische Ziel-Backend** (§1) — für
+die **generative** Inferenz (`mormot.ai.llm.neuralapi` hinter `ILlmClient`) hat es den
+größten Wert. Die Naht bleibt bestehen — wegen Delphi und weil Provider-/Ollama-/
+lembed-Backends weiter sinnvoll sind (Cloud-Modelle, bestehende Ollama-Deployments,
+Fallback).
+
+**Vorschlag für den Embedder (in Diskussion, nicht entschieden) — Option D:** ein
+eigener schlanker Encoder in der Extension, der das **vorhandene** `bge-m3-q8_0.gguf`
+liest (GGUF-Reader, UGM-Tokenizer inkl. Charsmap, BERT-Forward, `TNativeEmbedder`).
+Das GGUF ist selbsttragend (24 Layer, CLS-Pooling, 250 002 Tokens im XLM-R-ID-Raum,
+Scores, Charsmap, Q8_0/F32-Tensoren). Gleiche Gewichte und Tokenizer-Daten wie lembed
+→ **lembed ist das Test-Orakel**; keine Konvertierung, baut auch unter Delphi. Parität
+nur **annähernd** (tanh-GELU + Q8-Aktivierungen in ggml), Aufwand **mehrere Wochen**.
+neural-api übernimmt den Embedder später, sobald es Charsmap + BERT-GGUF kann (ggf.
+durch unseren Upstream-Beitrag) und dieselben Gates besteht. Umgeschaltet wird per
+Config (`AI_EMBED_PROVIDER`), nie per `{$ifdef}`.
+
+**Vektorsuche gehört dazu:** `vec0` wird unabhängig davon durch einen nativen Store
+ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` in `documents` als Wahrheit, quantisierte Kopie int8/1-bit + Nachbewertung, danach IVF — ausgelegt auf 2 Mio+ Vektoren je DB,
+mORMot bindet `create_function_v2`/`create_module_v2` auch statisch). Achtung: vec0
+rechnet heute mit **L2** (keine Metrik im Schema) — die Metrik des nativen Stores ist
+bewusst festzulegen.
+
+**Reihenfolge (Risiko zuerst, Details + Gates in docs/native-embeddings.md):**
+Referenzvertrag + deutscher Testkorpus → nativer Store (ersetzt vec0) →
+GGUF-Reader + Tokenizer (identische Token-IDs zu lembed) → Encoder (Cosine ≥ 0,999,
+nDCG@10 ≤ 1 Prozentpunkt Verlust) → Messung auf Zielhardware → Default-Wechsel,
+lembed bleibt expliziter Fallback.
 
 ## 6. MCP-Protokoll: Sprung auf 2026-07-28 (Greenfield, kein Legacy)
 
@@ -439,7 +469,7 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 Die Engine-Funktionsfläche (Phase D) steht, die **Repo-Auslösung** (§7) ist erledigt,
 der **MCP-Sprung auf 2026-07-28** (§6) ist durchgezogen und mit der
 Konsumenten-Bindung (Phase B) auch praktisch belegt; offen sind der **flydev-Merge**
-(§4) und die **Evaluation von neural-api** (§5). Diese Liste ist die konsolidierte
+(§4) und die **nativen Embeddings + Vektorsuche** (§5, inkl. neural-api). Diese Liste ist die konsolidierte
 Roadmap — DESIGN.md verweist hierher.
 
 0. **Repo-Auslösung (§7)** ✓ **erledigt (2026-07-29)** — `landrix/mormot2-ai`, Historie
@@ -507,12 +537,13 @@ Roadmap — DESIGN.md verweist hierher.
      schon entschieden, die frühere Nennung als Lücke war ein Doku-Fehler.
    - **Demo-Härtung** ✓ (bleibt gültig): Streamable-Demo bindet **Loopback**,
      `ask_claude` standardmäßig **deaktiviert** (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in).
-7. **neural-api integrieren** (§5) — Units `mormot.ai.embed.neuralapi` /
-   `mormot.ai.llm.neuralapi` hinter der bestehenden Naht; **Spike zuerst** (echtes
-   E5/BGE-Modell konvertieren, Qualität gegen lembed, Durchsatz, RAM). Ziel: alle
-   nativen Fremd-`.so` + der Docker-Bundle-Download entfallen. Seit §1 (eigene
-   Extension, Delphi nur „soweit möglich") **darf** es Kern-Abhängigkeit werden —
-   FPC-only hinter der Naht.
+7. **Native Embeddings + Vektorsuche** (§5, Analyse: `docs/native-embeddings.md`,
+   Entwurf 2026-10-13) — `vec0` durch `mormot.ai.vectorstore.native` ersetzen (klein,
+   zuerst), danach Option D (`mormot.ai.embed.native`, eigener Encoder auf dem GGUF)
+   gegen lembed als Orakel; Gates siehe Analyse. **neural-api** bleibt Ziel für
+   `mormot.ai.llm.neuralapi` (generativ) und übernimmt den Embedder, sobald es
+   Charsmap + BERT-GGUF kann. Ziel: alle nativen Fremd-`.so` + der Docker-Bundle-
+   Download entfallen.
 8. **Tests**: TVec0Store hat einen **env-gated Real-vec0-Test** (Keyed-Ops
    `Upsert`/`Delete`/`Search`-Key, `test.llm.rag`, läuft bei gesetztem `SQLITE_EXT_DIR`,
    sonst Skip). Offen: TLembedEmbedder-Realtest + RAG-Atomar-Rollback (brauchen die
