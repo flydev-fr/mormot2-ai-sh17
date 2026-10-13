@@ -87,9 +87,10 @@ kein SQLite) wollte, schleppte die statische SQLite-Abhängigkeit mit.
 **Ist-Struktur (umgesetzt):**
 
 ```
-mormot.ai.vectorstore           ✓ NUR IVectorStore + TRagHit + Vektor-Helfer (SQLite-frei)
-mormot.ai.vectorstore.sqlitevec ✓ TVec0Store (sqlite-vec) + Extension-Loader [static SQLite hier isoliert]
-mormot.ai.vectorstore.native    ○ nativer Store: BLOB-Spalte + Pascal-KNN, ersetzt vec0 (§5, docs/native-embeddings.md)
+mormot.ai.vectorstore           ✓ NUR IVectorStore/IFilteredVectorStore + TRagHit + Vektor-Helfer (SQLite-frei)
+mormot.ai.sqlite                ✓ RollbackIfOpen + Extension-Loader (geteilt von vec0, lembed, nativ)
+mormot.ai.vectorstore.sqlitevec ✓ TVec0Store (sqlite-vec) [static SQLite hier isoliert]
+mormot.ai.vectorstore.native    ◐ TNativeVectorStore: BLOB je Vektorraum + Pascal-Suche, filterbar, ohne Extension — 2a (exakt) ✓, int8/IVF offen (§5)
 mormot.ai.vectorstore.pgvector  ○ TPgVectorStore (IVectorStore) auf mormot.db.pgvector.* (Merge §4)
 mormot.ai.embeddings            ✓ NUR IEmbedder (zieht nicht mehr den LLM-Client)
 mormot.ai.embed.provider        ✓ TProviderEmbedder (OpenAI-Wire)
@@ -256,7 +257,7 @@ durch unseren Upstream-Beitrag) und dieselben Gates besteht. Umgeschaltet wird p
 Config (`AI_EMBED_PROVIDER`), nie per `{$ifdef}`.
 
 **Vektorsuche gehört dazu:** `vec0` wird unabhängig davon durch einen nativen Store
-ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` in `documents` als Wahrheit, quantisierte Kopie int8/1-bit + Nachbewertung, danach IVF — ausgelegt auf 2 Mio+ Vektoren je DB,
+ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` je Vektorraum (`<space>_items`) als Wahrheit, quantisierte Kopie int8/1-bit + Nachbewertung, danach IVF — ausgelegt auf 2 Mio+ Vektoren je DB,
 mORMot bindet `create_function_v2`/`create_module_v2` auch statisch). Achtung: vec0
 rechnet heute mit **L2** (keine Metrik im Schema) — die Metrik des nativen Stores ist
 bewusst festzulegen.

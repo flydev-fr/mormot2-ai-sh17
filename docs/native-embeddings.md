@@ -164,9 +164,12 @@ Treffer übrig):
 
 ### Empfohlener Entwurf: `mormot.ai.vectorstore.native`
 
-- **Schema**: die bestehende `documents`-Tabelle bekommt `embedding BLOB NOT NULL`
-  (float32 little-endian). Text, Schlüssel und Vektor sind **eine** atomare Zeile —
-  die heutige Zwei-Tabellen-Synchronisation (`documents` ↔ `vec_documents`) entfällt.
+- **Schema** (umgesetzt in 2a): je **Vektorraum** („space", z. B. `articles`,
+  `positions`, `positions_v2`) zwei Tabellen `<space>_items(id, ext_id, content,
+  embedding BLOB NOT NULL CHECK(Länge = dim·4))` und `<space>_meta` (Vertrag als JSON).
+  Text, Schlüssel und Vektor sind **eine** atomare Zeile — die Zwei-Tabellen-
+  Synchronisation von vec0 (`documents` ↔ `vec_documents`) entfällt. Mehrere Räume
+  liegen nebeneinander in derselben Datei (Neuindizierung ohne Ausfall).
 - **Validierung beim Schreiben**: exakte Länge (= Dimension), keine NaN/Inf, kein
   Nullvektor.
 - **Store-Metadaten** (eigene Tabelle): Dimension, Metrik, Fingerprint von Modell und
@@ -455,7 +458,8 @@ Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 | # | Schritt | Umfang | Freigabe nur wenn |
 |---|---|---|---|
 | 1 ✓ | Referenzvertrag: Modell-Hash, Runtime-Version, Token-Flags, Kontextgrenze, Metrik, **deutscher Testkorpus** — **erledigt 2026-10-13**, siehe „Referenzvertrag v1" | 1–2 Tage | festgelegt und dokumentiert |
-| 2 | Nativer Vektor-Store v1 (Teil A): float32-BLOB + quantisierte Kopie (int8/1-bit) + Nachbewertung, Multithread-Scan, Fachfilter, Indexvertrag + paralleler Neuaufbau | 1–2 Wochen | exakter Modus = Referenz-Ranking; Atomarität, Fehlerfälle, Neustart, Mandantentrennung getestet |
+| 2a ✓ | Nativer Store, exakte Suche: float32-BLOB je Vektorraum, Vertrag persistiert + erzwungen, Fachfilter (`IFilteredVectorStore.SearchWhere`, read-only SQL auf Fachtabellen derselben Datei, vor Top-k), mehrere Räume je Datei, Eingabeprüfung — **erledigt 2026-10-13** (`mormot.ai.vectorstore.native`, Tests `test.llm.vectorstore.native`) | – | **Parität: alle 58 Referenzanfragen liefern exakt die Top-20 der Referenz (Rang + Score)**; Atomarität, Fehlerfälle, Neustart, Raumtrennung getestet |
+| 2 | Nativer Store, schnell: quantisierte Kopie (int8/1-bit) im RAM + Nachbewertung mit float32, Multithread-Scan, Benchmark 2 Mio × 1024 | ~1 Woche | Recall@10 ≥ 0,95 gegen den exakten Modus; Gate-5-Zahlen |
 | 2b | IVF-Partitionierung (v2) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
 | 3 | GGUF-Reader + UGM-Tokenizer | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-/Sondertoken-Fällen; beschädigte Dateien sicher abgelehnt |
 | 4 | Encoder: skalare Referenz, dann Blocking/SIMD | mehrere Wochen | Cosine ≥ 0,999 je Fall, korrekte Normen, Batch = Einzel; nDCG@10 höchstens 1 Prozentpunkt unter lembed |

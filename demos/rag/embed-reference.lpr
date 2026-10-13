@@ -37,7 +37,7 @@ uses
   mormot.db.raw.sqlite3.static,
   mormot.ai.llm.types,
   mormot.ai.vectorstore,
-  mormot.ai.vectorstore.sqlitevec;
+  mormot.ai.sqlite;
 
 const
   /// the reference contract: lembed runs bge-m3 with the default llama.cpp

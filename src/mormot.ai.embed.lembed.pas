@@ -28,7 +28,7 @@ uses
   mormot.ai.llm.types,
   mormot.ai.embeddings,
   mormot.ai.vectorstore,           // BlobToVector helper (SQLite-free)
-  mormot.ai.vectorstore.sqlitevec; // Enable/LoadSqliteExtension + SqliteExtSuffix
+  mormot.ai.sqlite; // Enable/LoadSqliteExtension + SqliteExtSuffix
 
 type
   /// a local IEmbedder using sqlite-lembed (a GGUF model run inside SQLite)

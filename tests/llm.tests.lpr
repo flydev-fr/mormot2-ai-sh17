@@ -20,7 +20,8 @@ uses
   test.llm.anthropic,
   test.llm.structured,
   test.llm.rag,
-  test.llm.rag.tool;
+  test.llm.rag.tool,
+  test.llm.vectorstore.native;
 
 type
   TLlmTests = class(TSynTestsLogged)
@@ -38,7 +39,8 @@ begin
     TTestLlmAnthropic,
     TTestLlmStructured,
     TTestLlmRag,
-    TTestLlmRagTool
+    TTestLlmRagTool,
+    TTestVectorStoreNative
   ]);
 end;
 

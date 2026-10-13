@@ -1,15 +1,12 @@
-/// LandrixAI - sqlite-vec (vec0) backed IVectorStore + extension loader
+/// LandrixAI - sqlite-vec (vec0) backed IVectorStore
 // - part of the mormot.ai.* extension (LandrixAI)
 // - this is the SQLite edge of the vector abstraction: it loads the sqlite-vec
 //   (vec0) extension into mORMot's static SQLite and implements IVectorStore on
 //   top, so a full RAG pipeline can run in-process, offline, with no API. The
 //   static-SQLite dependency is isolated HERE - the engine (mormot.ai.rag) only
 //   sees mormot.ai.vectorstore (the interface), never this unit.
-// - mORMot does not bind sqlite3_enable_load_extension, so loading is enabled via
-//   db_config(SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION) - proven cross-platform (FPC,
-//   Linux+Windows); the extension shared libs live next to their llama/ggml deps.
-//   The loader helpers are public so the lembed embedder (mormot.ai.embed.lembed)
-//   can load lembed0 into the same connection.
+// - the extension loader and RollbackIfOpen live in mormot.ai.sqlite (shared with
+//   the lembed embedder and the native store)
 // - SQL patterns mirror the public sqlite-vec interface
 unit mormot.ai.vectorstore.sqlitevec;
 
@@ -24,18 +21,8 @@ uses
   mormot.db.raw.sqlite3,
   mormot.db.raw.sqlite3.static,
   mormot.ai.llm.types,
+  mormot.ai.sqlite,
   mormot.ai.vectorstore;
-
-/// the platform shared-library suffix for a SQLite extension
-function SqliteExtSuffix: RawUtf8;
-
-/// enable run-time extension loading on a connection (mORMot omits the dedicated
-/// enable API, so SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION via db_config is used)
-procedure EnableSqliteExtensions(aDB: TSqlite3DB);
-
-/// load a SQLite extension shared library by absolute path
-procedure LoadSqliteExtension(aDB: TSqlite3DB; const aPath: RawUtf8);
-
 
 type
   /// sqlite-vec (vec0) backed local vector store, owning its SQLite connection
@@ -67,64 +54,6 @@ type
 
 
 implementation
-
-function SqliteExtSuffix: RawUtf8;
-begin
-  {$ifdef OSWINDOWS}
-  result := '.dll';
-  {$else}
-  {$ifdef OSDARWIN}
-  result := '.dylib';
-  {$else}
-  result := '.so';
-  {$endif OSDARWIN}
-  {$endif OSWINDOWS}
-end;
-
-procedure EnableSqliteExtensions(aDB: TSqlite3DB);
-var
-  enabled: integer;
-begin
-  enabled := 0;
-  if not Assigned(sqlite3.db_config) then
-    ESqlite3Exception.RaiseUtf8('EnableSqliteExtensions: db_config unavailable', []);
-  if sqlite3.db_config(aDB, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, @enabled) <> SQLITE_OK then
-    ESqlite3Exception.RaiseUtf8('EnableSqliteExtensions failed: %',
-      [Utf8ToString(sqlite3.errmsg(aDB))]);
-end;
-
-procedure LoadSqliteExtension(aDB: TSqlite3DB; const aPath: RawUtf8);
-var
-  msg: PUtf8Char;
-begin
-  msg := nil;
-  if sqlite3.load_extension(aDB, pointer(aPath), nil, msg) <> SQLITE_OK then
-    ESqlite3Exception.RaiseUtf8('LoadSqliteExtension % failed: %',
-      [aPath, Utf8ToString(msg)]);
-end;
-
-
-// TSqlDataBase.Commit clears TransactionActive even when COMMIT itself fails
-// (e.g. SQLITE_BUSY), and RollBack checks exactly that flag - so an
-// `except RollBack` after a failed Commit is a no-op and the transaction stays
-// open: every later TransactionBegin fails and single writes silently join it.
-// Decide on SQLite's own state (get_autocommit) instead. Never raises: a failed
-// rollback must not hide the original exception.
-procedure RollbackIfOpen(aDB: TSqlDataBase);
-begin
-  if (aDB = nil) or (aDB.DB = 0) then
-    exit;
-  try
-    if sqlite3.get_autocommit(aDB.DB) = 0 then
-      if aDB.TransactionActive then
-        aDB.RollBack // also resets mORMot's flag
-      else
-        aDB.Execute('ROLLBACK TRANSACTION;'); // flag already gone (failed Commit)
-  except
-    // keep the original exception
-  end;
-end;
-
 
 { TVec0Store }
 

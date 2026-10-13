@@ -5,6 +5,8 @@
 //   alone, so it never drags in a concrete store's dependencies (e.g. the static
 //   SQLite linked by sqlite-vec). Concrete backends live in sibling units:
 //     mormot.ai.vectorstore.sqlitevec  - TVec0Store (sqlite-vec, local/edge)
+//     mormot.ai.vectorstore.native     - TNativeVectorStore (plain SQLite tables +
+//                                        Pascal search, no extension; filterable)
 //     mormot.ai.vectorstore.pgvector   - TPgVectorStore (server/multi-tenant, future)
 //   which backend is wired in is a composition decision (DI), never an {$ifdef}.
 // - clean-room; target license MPL/GPL/LGPL
@@ -20,6 +22,8 @@ uses
 
 type
   /// one KNN hit: the stored document id, its text and the backend distance
+  // - Distance is backend-specific: L2 for TVec0Store, cosine distance (1 - dot
+  //   on unit vectors) for TNativeVectorStore - compare hits of ONE store only
   TRagHit = record
     DocId: Int64;
     Text: RawUtf8;
@@ -60,6 +64,22 @@ type
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     /// number of stored documents
     function Count: Int64;
+  end;
+
+  /// a vector store whose search can be restricted to a domain-defined subset
+  // - the subset is a read-only SQL query returning ONE column of external keys
+  //   (the aId values of Upsert), evaluated in the store's own database - so it
+  //   can join domain tables living in the same file (e.g. "positions of this
+  //   tenant, of these kinds"); restriction happens BEFORE top-k, never after
+  // - aKeySql is trusted application code: never build it from user input, bind
+  //   every variable part through aParams (? placeholders); the store refuses
+  //   statements that are not read-only
+  IFilteredVectorStore = interface(IVectorStore)
+    ['{0F6B3C2A-7D41-4E8F-A2C5-91B7E3D4F608}']
+    /// the aTopK documents nearest to aQuery among those whose external key is
+    // returned by aKeySql (bound with aParams), closest first
+    function SearchWhere(const aQuery: TLlmEmbedding; aTopK: integer;
+      const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
   end;
 
 

@@ -13,6 +13,7 @@ uses
   mormot.core.test,
   mormot.ai.llm.types,
   mormot.ai.vectorstore,
+  mormot.ai.sqlite,
   mormot.ai.vectorstore.sqlitevec,
   mormot.ai.rag;
 
