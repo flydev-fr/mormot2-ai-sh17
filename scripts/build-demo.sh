@@ -46,7 +46,7 @@ else
          llm/llm-chat.lpr llm/llm-agent.lpr llm/llm-structured.lpr \
          llm/llm-embed.lpr llm/llm-vision.lpr llm/llm-anthropic.lpr \
          rag/rag-spike.lpr rag/rag-chat.lpr rag/rag-agent.lpr \
-         rag/embed-reference.lpr)
+         rag/embed-reference.lpr rag/vector-bench.lpr)
 fi
 
 build_one() {

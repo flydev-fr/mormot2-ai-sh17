@@ -175,11 +175,23 @@ Treffer übrig):
   Nullvektor.
 - **Store-Metadaten** (eigene Tabelle): Dimension, Metrik, Fingerprint von Modell und
   Tokenizer, Formatversion. Modellwechsel ⇒ erzwungene Neuindexierung.
-- **Suche (gestuft, siehe Mengengerüst)**: kompakte quantisierte Kopie (int8 und/oder
-  1-bit) zusammenhängend im Speicher + Rowid-Zuordnung → Kandidaten (z. B. Top-100) →
-  **Nachbewertung mit den float32-Originalen** aus SQLite → Top-k-Heap, Gleichstand
-  deterministisch nach ID. Scan über mehrere Threads. Für Cosine einmal normieren.
-  Berechtigungs-/Mandanten-/Fachfilter **vor** Top-k anwenden, nicht danach.
+- **Suche (gestuft, umgesetzt in 2b)**: jede Zeile speichert zusätzlich einen
+  **1-Bit-Code** (Spalte `sign`, Bit i = Komponente i > 0; 128 Byte bei 1024 dim). Ab
+  `IndexMinRows` (Default 20 000) hält der Store diese Codes im RAM (244 MiB bei 2 Mio),
+  wählt per **Hamming-Distanz** (Popcount, Zählsortierung statt sortierter Liste)
+  `Oversample` Kandidaten (Default 2000) und bewertet sie **exakt mit den float32-
+  Originalen aus SQLite** nach — Kandidaten-Scan unter einem Read-Lock (parallele
+  Anfragen, auch gefiltert), Nachbewertung in **einer** Anweisung
+  (`id IN (SELECT value FROM json_each(?))`) und die Treffertexte danach — beides im
+  **selben** Lese-Snapshot. Darunter, oder wenn
+  k ≥ Zeilenzahl: exakter Scan (2a). Fachfilter maskieren die Index-Slots **vor** der
+  Kandidatenwahl (Vorauswahl) und werden in der Nachbewertungs-Anweisung **erneut**
+  angewandt — so passen Filter, Vektor und Text immer zum selben Snapshot, auch wenn eine
+  andere Verbindung die Fachdaten dazwischen ändert.
+  **Abweichung vom ursprünglichen Plan (int8 als Default):** gemessen ohne SIMD-Assembler
+  (200k Vektoren, ein Kern, aarch64): exakt float32 160 ms, int8 + Nachbewertung 95 ms,
+  **1 Bit + Nachbewertung 10 ms** (1000 Kandidaten, Recall@10 0,99) — hochgerechnet auf
+  2 Mio wäre int8 rund 950 ms. int8 bleibt eine Option für eine spätere SIMD-Stufe.
 - **Embedding-Cache (optional)**: wortgleiche Texte innerhalb **eines** Stores nur einmal
   einbetten; Artikel und Positionen bleiben getrennte Stores.
 - **Fachfilter**: Erweiterung von `Search` um Filter (ID-Menge oder SQL-Join), angewandt
@@ -194,13 +206,19 @@ Treffer übrig):
 - **Transaktionen**: `AddBatch` bleibt vollständig atomar; das bestehende
   `RollbackIfOpen`-Muster übernehmen (mORMots `Commit` löscht das Transaktionsflag
   auch bei Commit-Fehlern).
-- **Cache-Invalidierung (v1)**: Generationszähler im Prozess, erhöht **unter
-  derselben Sperre wie der Commit** und erst nach dessen Erfolg. Rollback/Commit-
-  Fehler veröffentlichen nichts. Beim Neustart Cache verwerfen.
-  Voraussetzung: **ein koordinierter Schreibpfad je Datenbank** (stärker als „ein
-  Prozess" — auch zwei Store-Instanzen auf derselben DB brechen das). Wird diese
-  Annahme später verletzt: persistente Generation per Trigger. `PRAGMA data_version`
-  allein reicht nicht (erkennt eigene Commits nicht, nur je Connection vergleichbar).
+- **Cache-Invalidierung (umgesetzt in 2b)**: ein **persistenter** Generationszähler in
+  `<space>_meta`, den Trigger bei jedem INSERT/UPDATE/DELETE auf `<space>_items` erhöhen —
+  egal welche Verbindung schreibt. Eigene Schreibvorgänge lesen die Generation in ihrer
+  IMMEDIATE-Transaktion vor und nach den Anweisungen und **patchen** den RAM-Index nach
+  dem Commit, sofern er genau auf dem Vorher-Stand war; sonst (fremder Schreiber
+  dazwischen) wird er verworfen. Jede Suche vergleicht die Generation und lädt den Index
+  bei Abweichung neu (nur die Codes). Rollback/Commit-Fehler veröffentlichen nichts.
+  Damit ist die frühere Einschränkung „ein koordinierter Schreibpfad je Datenbank"
+  für die **Konsistenz** aufgehoben; WAL bleibt Voraussetzung (siehe unten).
+  **Latenz-Grenze:** jede fremde Änderung erzwingt ein Voll-Neuladen der Codes (2,8–11 s
+  bei 2 Mio, je nach Dateicache) unter der Verbindungssperre. Ein zweiter Prozess, der
+  laufend schreibt, macht damit jede Suche langsam — Schreiben gehört in den Prozess, der
+  auch sucht (dann wird der Index nur gepatcht), oder Massenimporte laufen vor dem Start.
 - **Speicher**: float32 nur persistent (Wahrheit), im RAM nur die quantisierte Kopie —
   bei 2 Mio × 1024 sind float32 7,6 GiB, int8 1,9 GiB, 1-bit 244 MiB. Recall der
   Quantisierung gegen den exakten Scan messen. Cache mit Speicherlimit/LRU, nicht alle
@@ -474,14 +492,35 @@ Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 |---|---|---|---|
 | 1 ✓ | Referenzvertrag: Modell-Hash, Runtime-Version, Token-Flags, Kontextgrenze, Metrik, **deutscher Testkorpus** — **erledigt 2026-10-13**, siehe „Referenzvertrag v1" | 1–2 Tage | festgelegt und dokumentiert |
 | 2a ✓ | Nativer Store, exakte Suche: float32-BLOB je Vektorraum, Vertrag persistiert + erzwungen, Fachfilter (`IFilteredVectorStore.SearchWhere`, read-only SQL auf Fachtabellen derselben Datei, vor Top-k), mehrere Räume je Datei, Eingabeprüfung — **erledigt 2026-10-13** (`mormot.ai.vectorstore.native`, Tests `test.llm.vectorstore.native`) | – | **Parität: alle 58 Referenzanfragen liefern die Top-20 der Referenz (Score je Rang ± 1e-5, Dokument je Rang identisch außer bei Beinahe-Gleichstand < 1e-6)**; FTS5-Schlüsselabfragen (Hybridsuche) funktionieren; Atomarität, Fehlerfälle, Neustart, Raumtrennung getestet |
-| 2 | Nativer Store, schnell: quantisierte Kopie (int8/1-bit) im RAM + Nachbewertung mit float32, Multithread-Scan, Benchmark 2 Mio × 1024 | ~1 Woche | Recall@10 ≥ 0,95 gegen den exakten Modus; Gate-5-Zahlen |
-| 2b | IVF-Partitionierung (v2) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
+| 2b ✓ | Nativer Store, schnell: 1-Bit-Index im RAM + exakte float32-Nachbewertung, Generationszähler, parallele Anfragen, Benchmark `demos/rag/vector-bench.lpr` — **erledigt 2026-10-13** | – | über den Index mit voller Nachbewertung **identisch** zur Referenz; Recall@10 mit nur 20 von 262 Kandidaten **0,929** (echte bge-m3-Vektoren); Gate 5 s. u. |
+| 2c | IVF-Partitionierung (nur bei Bedarf, s. Gate-5-Ergebnis) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
 | 3 | GGUF-Reader + UGM-Tokenizer | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-/Sondertoken-Fällen; beschädigte Dateien sicher abgelehnt |
 | 4 | Encoder: skalare Referenz, dann Blocking/SIMD | mehrere Wochen | Cosine ≥ 0,999 je Fall, korrekte Normen, Batch = Einzel; nDCG@10 höchstens 1 Prozentpunkt unter lembed |
 | 5 | Messung auf Zielhardware | – | ≥ 80 % lembed-Durchsatz, ≤ 125 % Peak-RSS; Store-p95 ≤ 100 ms bei **2 Mio × 1024**, k = 10, vier Clients; Recall@10 ≥ 0,95 gegen exakten Scan; Store-RAM im konfigurierten Budget (Richtwert 2–4 GiB, Consumer-Hardware mit 32/64 GB); Erstindizierungs-Durchsatz für 2 Mio Texte ermittelt — sonst optimieren oder D stoppen |
 | 6 | Integration: FPC 3.2.2/3.2.4 + Delphi 13; Extension-Download beim Konsumenten je Provider trennen | 2–3 Tage | danach Default „native", lembed bleibt expliziter Fallback |
 
 Die Gate-Zahlen sind **Vorschläge**, noch nicht abgestimmt.
+
+### Gate-5-Messung des Stores (2026-10-13)
+
+2 Mio synthetische 1024-dim-Vektoren (aus den echten bge-m3-Referenzvektoren gemischt
++ Rauschen, normiert), Datei 9,2 GB, WAL, Snapdragon X unter WSL (aarch64 — **ohne**
+Hardware-Popcount in mORMot; x86_64 mit POPCNT ist noch nicht gemessen):
+
+| Kandidaten | Recall@10 vs. exakt | p95 1 Client | p95 4 Clients |
+|---|---|---|---|
+| 1000 | 0,94 | 81 ms | 89 ms |
+| **2000 (Default)** | **0,97** | **88 ms** | **105 ms** |
+| 4000 | 0,99 | 118 ms | 166 ms |
+
+Methode: Recall über die ersten **10** Referenzanfragen (Auflösung 0,01); Latenz aus den
+58 Referenzanfragen je Client (1 Client: 58 Proben, 4 Clients: 232), Cache warm, gleiche
+Reihenfolge — die Werte schwanken zwischen Läufen um einige ms. Einfügen 7 473 Zeilen/s
+(2 Mio in 4,5 min), Index laden 2,8–11 s je nach Dateicache (244 MiB; `WarmUp` beim
+Serverstart aufrufen), exakter Scan zum Vergleich 5,4 s je Anfrage. Recall-Gate (≥ 0,95)
+erfüllt, Latenz-Gate (p95 ≤ 100 ms bei 4 Clients) um wenige ms verfehlt — der
+Hamming-Scan dominiert. Nächste Hebel, falls nötig: Scan einer Anfrage über mehrere Kerne, NEON-/POPCNT-
+Kernel, IVF (2c) zur Verkleinerung der gescannten Menge.
 
 ## Offene Fragen (vor dem Start zu klären)
 

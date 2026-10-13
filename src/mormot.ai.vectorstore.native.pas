@@ -6,8 +6,18 @@
 //   Pascal over that column. Because the data is a plain table, the search
 //   engine stays replaceable (quantised in-memory index, IVF, sqlite-vector)
 //   without migrating data - see docs/native-embeddings.md
-// - this unit is stage 2a: EXACT search, streamed from SQLite (no in-memory
-//   index yet) - the correctness reference for the faster stages that follow
+// - search (stage 2b): every row also stores a 1-bit SIGN code of its vector
+//   (dim/8 bytes). Above IndexMinRows rows, a search scans these codes in RAM
+//   (Hamming distance, popcount) to pick Oversample candidates, then rescores
+//   them EXACTLY with their float32 vectors from SQLite - measured at 2M x 1024
+//   (aarch64/WSL, WAL, 2000 candidates): p95 88 ms with one client, 105 ms
+//   with four concurrent clients, recall@10 0.97 against the exact scan
+//   (docs/native-embeddings.md, demos/rag/vector-bench.lpr). Stores below
+//   IndexMinRows use the exact streamed scan (stage 2a)
+// - the RAM index follows the table through a generation counter that triggers
+//   bump on every change: this store's own writes patch the index in place, a
+//   change made by any other connection makes the next search reload it (only
+//   the sign codes: 128 bytes per 1024-dim row)
 // - every store is bound to a TVectorContract (model, dimension, metric ...),
 //   persisted next to its table; opening it with a different contract fails, so
 //   vectors of two models can never be mixed silently. Several "spaces" (one per
@@ -70,7 +80,8 @@ type
   // - owns its connection; aDbPath may be the application database itself, so
   //   SearchWhere filters can join domain tables of that file
   // - does NOT change the journal mode of the file - that stays the owner's call
-  // - thread-safe: every access holds the connection lock (like TVec0Store)
+  // - thread-safe: database access holds the connection lock; the RAM index has
+  //   its own read/write lock, so concurrent searches scan it in parallel
   TNativeVectorStore = class(TInterfacedObject, IVectorStore, IFilteredVectorStore)
   protected
     fDB: TSqlDataBase;
@@ -79,15 +90,45 @@ type
     fMeta: RawUtf8;
     fContract: TVectorContract;
     fBlobSize: integer;
+    fSignWords: integer;
     fJournalMode: RawUtf8;
+    fIndex: TObject; // TSignIndex, private to the implementation
+    fIndexMinRows: integer;
+    fOversample: integer;
+    fLastAdded: Int64;
     /// validate (dimension, finite, non-zero) and scale to unit length
     function UnitVector(const aVec: TLlmEmbedding; const aWhat: RawUtf8): TLlmEmbedding;
     function RowIdOfKey(const aId: RawUtf8): Int64;
     procedure OpenSpace;
     /// the key query of SearchWhere must be one read-only, one-column statement
     procedure CheckKeySql(const aKeySql: RawUtf8);
-    /// the exact scan shared by Search and SearchWhere
-    function Scan(const aQuery: TLlmEmbedding; aTopK: integer;
+    /// the exact streamed scan (small stores, and the reference for the index)
+    function Scan(const q: TLlmEmbedding; aTopK: integer;
+      const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
+    /// the 1-bit code of a unit vector, as stored in the sign column
+    function SignCode(const q: TLlmEmbedding): RawByteString;
+    /// current generation (bumped by triggers on every change of the items)
+    function ReadGen: Int64;
+    /// (re)load the RAM index when its generation is not the table's
+    procedure EnsureIndex;
+    /// patch the RAM index after a committed write of this store
+    // - aGenBefore/aGenAfter: generation read inside the write transaction
+    //   before/after the statements; if the index was not at aGenBefore (a
+    //   foreign write slipped in), it is marked stale instead of patched
+    procedure IndexApply(aGenBefore, aGenAfter: Int64;
+      const aRowIds: TInt64DynArray; const aCodes: TRawByteStringDynArray;
+      aDeleted: boolean);
+    /// row ids whose external key is returned by a key query, ascending
+    function KeyRowIds(const aKeySql: RawUtf8;
+      const aParams: array of const): TInt64DynArray;
+    /// the index-backed search: Hamming candidates, exact float32 rescoring
+    function IndexSearch(const q: TLlmEmbedding; aTopK: integer;
+      const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
+    /// text + key of the winners, inside the caller's read snapshot
+    function FetchHits(const aRowIds: array of Int64;
+      const aScores: array of double; aCount: integer): TRagHitDynArray;
+    /// shared entry of Search and SearchWhere
+    function DoSearch(const aQuery: TLlmEmbedding; aTopK: integer;
       const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
   public
     /// open or create the vector space aSpace in aDbPath (':memory:' allowed)
@@ -116,6 +157,24 @@ type
     // 'memory' ...) - anything but 'wal' (or 'memory') is unsafe when another
     // connection writes the same file concurrently, see the unit header
     property JournalMode: RawUtf8 read fJournalMode;
+    /// below this many rows the exact streamed scan is used (default 20000)
+    // - 0 uses the index whenever it can help, i.e. unless aTopK >= rows (then
+    //   the exact scan returns every row anyway) - used by the tests
+    property IndexMinRows: integer read fIndexMinRows write fIndexMinRows;
+    /// candidates taken from the 1-bit index and rescored exactly (default 2000)
+    // - higher = better recall, slower; at least aTopK is always used
+    // - capped at NATIVE_MAX_OVERSAMPLE (100000) per search: the candidates
+    //   travel as one JSON array into the rescoring statement
+    // - measured at 2M x 1024 (gate 5): 1000 -> recall@10 0.94, 2000 -> 0.97,
+    //   4000 -> 0.99 (docs/native-embeddings.md)
+    property Oversample: integer read fOversample write fOversample;
+    /// rows currently held by the RAM index (0 before the first search)
+    function IndexedRows: integer;
+    /// load the RAM index now instead of on the first search
+    // - call it at server start: loading takes seconds for millions of rows
+    //   (2.8-11 s for 2M x 1024 measured, depending on the file cache) and
+    //   blocks the store meanwhile
+    procedure WarmUp;
   end;
 
 /// build a contract value
@@ -134,10 +193,13 @@ implementation
 
 const
   /// version of the on-disk layout and of the contract text
-  NATIVE_FORMAT = 1;
+  // - 2: sign column + generation triggers (stage 2b)
+  NATIVE_FORMAT = 2;
   /// largest accepted dimension - far above any real embedding model, but keeps
   // the BLOB size check and the per-row arithmetic away from overflow
   NATIVE_MAX_DIM = 65536;
+  /// upper bound of the Oversample setting actually used by one search
+  NATIVE_MAX_OVERSAMPLE = 100000;
   /// IEEE-754 single: all exponent bits set = NaN or +-Inf
   SINGLE_EXP_MASK = $7F800000;
   /// IEEE-754 double: the same test for a computed score
@@ -255,6 +317,228 @@ begin
 end;
 
 
+{ TSignIndex: the in-memory 1-bit index of one store }
+
+type
+  TQWordDynArray = array of QWord;
+
+  /// sign codes of all rows, slot = position in rowid order
+  // - rowids are AUTOINCREMENT, so appending keeps RowIds sorted and a slot is
+  //   found by binary search; deleted rows become dead slots until Compact
+  // - guarded by Lock: searches hold ReadLock while scanning, writes hold
+  //   WriteLock while patching - never WriteLock inside a ReadLock
+  // - TRWLightLock spins (with SwitchToThread) while it waits: a write waits
+  //   for running scans (tens of ms at millions of rows). Acceptable for the
+  //   expected write rate (embeddings arrive at a few per second); a lock-free
+  //   scan would need copy-on-write arrays instead of in-place patching
+  TSignIndex = class
+  public
+    Lock: TRWLightLock;
+    Words: integer;
+    RowIds: TInt64DynArray;
+    Alive: TBooleanDynArray;
+    Codes: TQWordDynArray;
+    Count, AliveCount: integer;
+    Gen: Int64;
+    Loaded: boolean;
+    constructor Create(aWords: integer);
+    procedure Clear;
+    function SlotOf(aRowId: Int64): integer;
+    /// append a row; false if aRowId is not above the last one (= reload)
+    function Append(aRowId: Int64; aCode: pointer): boolean;
+    procedure SetCode(aSlot: integer; aCode: pointer);
+    procedure Kill(aSlot: integer);
+    /// drop dead slots once they are a quarter of the index
+    procedure CompactIfNeeded;
+    /// the aWant best slots by Hamming distance to aQuery (ties: lower slot),
+    // restricted to aMask when given; returns their rowids in slot order
+    function Candidates(aQuery: PQWordArray; aWant: integer;
+      const aMask: TBooleanDynArray): TInt64DynArray;
+  end;
+
+constructor TSignIndex.Create(aWords: integer);
+begin
+  inherited Create;
+  Lock.Init;
+  Words := aWords;
+end;
+
+procedure TSignIndex.Clear;
+begin
+  RowIds := nil;
+  Alive := nil;
+  Codes := nil;
+  Count := 0;
+  AliveCount := 0;
+  Loaded := false;
+end;
+
+function TSignIndex.SlotOf(aRowId: Int64): integer;
+var
+  lo, hi, mid: integer;
+begin
+  lo := 0;
+  hi := Count - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if RowIds[mid] < aRowId then
+      lo := mid + 1
+    else if RowIds[mid] > aRowId then
+      hi := mid - 1
+    else
+      exit(mid);
+  end;
+  result := -1;
+end;
+
+function TSignIndex.Append(aRowId: Int64; aCode: pointer): boolean;
+begin
+  result := (Count = 0) or (aRowId > RowIds[Count - 1]);
+  if not result then
+    exit;
+  if Count = length(RowIds) then
+  begin
+    SetLength(RowIds, NextGrow(Count));
+    SetLength(Alive, length(RowIds));
+    SetLength(Codes, length(RowIds) * Words);
+  end;
+  RowIds[Count] := aRowId;
+  Alive[Count] := true;
+  MoveFast(aCode^, Codes[Count * Words], Words * SizeOf(QWord));
+  inc(Count);
+  inc(AliveCount);
+end;
+
+procedure TSignIndex.SetCode(aSlot: integer; aCode: pointer);
+begin
+  MoveFast(aCode^, Codes[aSlot * Words], Words * SizeOf(QWord));
+end;
+
+procedure TSignIndex.Kill(aSlot: integer);
+begin
+  if Alive[aSlot] then
+  begin
+    Alive[aSlot] := false;
+    dec(AliveCount);
+  end;
+end;
+
+procedure TSignIndex.CompactIfNeeded;
+var
+  i, n: integer;
+begin
+  if (Count - AliveCount) * 4 < Count then
+    exit;
+  n := 0;
+  for i := 0 to Count - 1 do
+    if Alive[i] then
+    begin
+      if n <> i then
+      begin
+        RowIds[n] := RowIds[i];
+        Alive[n] := true;
+        MoveFast(Codes[i * Words], Codes[n * Words], Words * SizeOf(QWord));
+      end;
+      inc(n);
+    end;
+  Count := n;
+end;
+
+function PopCount64(v: QWord): integer;
+  {$ifdef HASINLINE} inline; {$endif}
+begin
+  // mORMot's popcount: SSE4.2 POPCNT on x86_64, its fast pure-pascal version
+  // elsewhere (measured 3x faster than FPC's PopCnt() on aarch64)
+  {$ifdef CPU64}
+  result := GetBitsCountPtrInt(PtrInt(v));
+  {$else}
+  result := GetBitsCountPtrInt(PtrInt(cardinal(v))) +
+            GetBitsCountPtrInt(PtrInt(cardinal(v shr 32)));
+  {$endif CPU64}
+end;
+
+function TSignIndex.Candidates(aQuery: PQWordArray; aWant: integer;
+  const aMask: TBooleanDynArray): TInt64DynArray;
+var
+  dist, hist: TIntegerDynArray;
+  i, w, d, bits, valid, threshold, atThreshold, n, sum: integer;
+  code: PQWordArray;
+begin
+  result := nil;
+  if (Count = 0) or (aWant <= 0) then
+    exit;
+  bits := Words * 64;
+  // pass 1: distance of every live (and allowed) slot + its histogram; -1
+  // marks a skipped slot - integers, so neither the marker nor a distance of
+  // 65536 (possible with padding) can collide with a real value
+  SetLength(dist, Count);
+  SetLength(hist, bits + 1);
+  valid := 0;
+  for i := 0 to Count - 1 do
+  begin
+    if not Alive[i] or ((aMask <> nil) and not aMask[i]) then
+    begin
+      dist[i] := -1;
+      continue;
+    end;
+    code := @Codes[i * Words];
+    d := 0;
+    for w := 0 to Words - 1 do
+      inc(d, PopCount64(code^[w] xor aQuery^[w]));
+    dist[i] := d;
+    inc(hist[d]);
+    inc(valid);
+  end;
+  if valid = 0 then
+    exit;
+  if aWant >= valid then
+  begin
+    // fewer valid slots than wanted: every valid slot is a candidate
+    threshold := bits;
+    atThreshold := MaxInt;
+  end
+  else
+  begin
+    // the threshold distance: everything below it is taken, at it only as
+    // many as still fit (in slot = rowid order, so ties are deterministic) -
+    // a counting sort instead of keeping a sorted candidate list
+    sum := 0;
+    threshold := bits;
+    for d := 0 to bits do
+    begin
+      if sum + hist[d] >= aWant then
+      begin
+        threshold := d;
+        break;
+      end;
+      inc(sum, hist[d]);
+    end;
+    atThreshold := aWant - sum;
+  end;
+  SetLength(result, MinPtrInt(aWant, valid));
+  n := 0;
+  for i := 0 to Count - 1 do
+  begin
+    d := dist[i];
+    if (d < 0) or (d > threshold) then
+      continue; // skipped slot, or beyond the threshold
+    if d = threshold then
+      if atThreshold > 0 then
+        dec(atThreshold)
+      else
+        continue;
+    // invariant: at most MinPtrInt(aWant, valid) slots pass the tests above -
+    // checked anyway, a buffer overrun must never depend on that arithmetic
+    if n = length(result) then
+      break;
+    result[n] := RowIds[i];
+    inc(n);
+  end;
+  SetLength(result, n);
+end;
+
+
 { TNativeVectorStore }
 
 constructor TNativeVectorStore.Create(const aDbPath, aSpace: RawUtf8;
@@ -275,6 +559,10 @@ begin
   // a record assigned directly bypasses VectorContract(): normalise here too
   fContract.ModelSha256 := LowerCase(aContract.ModelSha256);
   fBlobSize := aContract.Dim * SizeOf(single);
+  fSignWords := (aContract.Dim + 63) shr 6;
+  fIndex := TSignIndex.Create(fSignWords);
+  fIndexMinRows := 20000;
+  fOversample := 2000;
   fDB := TSqlDataBase.Create(Utf8ToString(aDbPath), '');
   // mORMot sets no busy timeout: a lock held by another connection (the
   // application writing its domain tables) would fail at once with SQLITE_BUSY
@@ -286,7 +574,23 @@ end;
 destructor TNativeVectorStore.Destroy;
 begin
   fDB.Free;
+  fIndex.Free;
   inherited Destroy;
+end;
+
+procedure TNativeVectorStore.WarmUp;
+begin
+  EnsureIndex;
+end;
+
+function TNativeVectorStore.IndexedRows: integer;
+begin
+  TSignIndex(fIndex).Lock.ReadLock;
+  try
+    result := TSignIndex(fIndex).AliveCount;
+  finally
+    TSignIndex(fIndex).Lock.ReadUnLock;
+  end;
 end;
 
 procedure TNativeVectorStore.OpenSpace;
@@ -346,13 +650,30 @@ begin
       // ext_id: optional stable external key (Upsert/Delete rows), NULL for
       // anonymous Add rows; the partial UNIQUE index maps an id to at most one row
       // the CHECK makes a wrong-sized vector impossible at the storage level too
+      // sign: the 1-bit code of the vector (bit i = component i > 0), stored so
+      // the RAM index loads dim/8 bytes per row instead of the float32 vector
       fDB.Execute(FormatUtf8('CREATE TABLE IF NOT EXISTS %(' +
         'id INTEGER PRIMARY KEY AUTOINCREMENT, ext_id TEXT, ' +
         'content TEXT NOT NULL, embedding BLOB NOT NULL ' +
-        'CHECK (typeof(embedding) = ''blob'' AND length(embedding) = %));',
-        [fItems, fBlobSize]));
+        'CHECK (typeof(embedding) = ''blob'' AND length(embedding) = %), ' +
+        'sign BLOB NOT NULL ' +
+        'CHECK (typeof(sign) = ''blob'' AND length(sign) = %));',
+        [fItems, fBlobSize, fSignWords * 8]));
       fDB.Execute(FormatUtf8('CREATE UNIQUE INDEX IF NOT EXISTS %_ext_id ' +
         'ON %(ext_id) WHERE ext_id IS NOT NULL;', [fItems, fItems]));
+      // generation: bumped by trigger on EVERY change of the items, whoever
+      // writes - the RAM index compares it to know whether it is current
+      fDB.Execute(FormatUtf8('INSERT OR IGNORE INTO %(key, value) ' +
+        'VALUES (''gen'', ''0'');', [fMeta]));
+      fDB.Execute(FormatUtf8('CREATE TRIGGER IF NOT EXISTS %_gen_ins AFTER INSERT ' +
+        'ON % BEGIN UPDATE % SET value = CAST(value AS INTEGER) + 1 ' +
+        'WHERE key = ''gen''; END;', [fItems, fItems, fMeta]));
+      fDB.Execute(FormatUtf8('CREATE TRIGGER IF NOT EXISTS %_gen_upd AFTER UPDATE ' +
+        'ON % BEGIN UPDATE % SET value = CAST(value AS INTEGER) + 1 ' +
+        'WHERE key = ''gen''; END;', [fItems, fItems, fMeta]));
+      fDB.Execute(FormatUtf8('CREATE TRIGGER IF NOT EXISTS %_gen_del AFTER DELETE ' +
+        'ON % BEGIN UPDATE % SET value = CAST(value AS INTEGER) + 1 ' +
+        'WHERE key = ''gen''; END;', [fItems, fItems, fMeta]));
       fDB.Commit;
     except
       RollbackIfOpen(fDB);
@@ -393,6 +714,51 @@ begin
     result[i] := aVec[i] * scale;
 end;
 
+function TNativeVectorStore.SignCode(const q: TLlmEmbedding): RawByteString;
+var
+  i: PtrInt;
+  p: PQWordArray;
+begin
+  result := '';
+  SetLength(result, fSignWords * 8);
+  p := pointer(result);
+  FillCharFast(p^, fSignWords * 8, 0);
+  // bit test, not "> 0": no float compare (NaN-safe), and -0.0 counts as 0
+  for i := 0 to high(q) do
+    if (PCardinal(@q[i])^ and $80000000 = 0) and (PCardinal(@q[i])^ <> 0) then
+      p^[i shr 6] := p^[i shr 6] or (QWord(1) shl (i and 63));
+end;
+
+function TNativeVectorStore.ReadGen: Int64;
+var
+  r: TSqlRequest;
+  found: boolean;
+begin
+  result := 0;
+  found := false;
+  fDB.Lock; // reentrant: callers inside a transaction already hold it
+  try
+    r.Prepare(fDB.DB, FormatUtf8('SELECT CAST(value AS INTEGER) FROM % ' +
+      'WHERE key = ''gen'';', [fMeta]));
+    try
+      if r.Step = SQLITE_ROW then
+      begin
+        result := r.FieldInt(0);
+        found := true;
+      end;
+    finally
+      r.Close;
+    end;
+  finally
+    fDB.UnLock;
+  end;
+  // without the row the triggers bump nothing: the index could never notice a
+  // foreign change again - refuse instead of trusting a constant generation
+  if not found then
+    EVectorStore.RaiseUtf8('%: generation row missing in % - the store ' +
+      'metadata was damaged', [self, fMeta]);
+end;
+
 function TNativeVectorStore.RowIdOfKey(const aId: RawUtf8): Int64;
 var
   r: TSqlRequest;
@@ -416,23 +782,19 @@ end;
 function TNativeVectorStore.Add(const aText: RawUtf8;
   const aVector: TLlmEmbedding): Int64;
 var
-  r: TSqlRequest;
-  blob: RawByteString;
+  texts: TRawUtf8DynArray;
+  vecs: TLlmEmbeddingDynArray;
 begin
-  blob := VectorToBlob(UnitVector(aVector, 'vector'));
-  fDB.Lock;
+  // one code path for all inserts: the index delta and the generation
+  // bookkeeping live in AddBatch
+  SetLength(texts, 1);
+  SetLength(vecs, 1);
+  texts[0] := aText;
+  vecs[0] := aVector;
+  fDB.Lock; // keep fLastAdded ours until it is read
   try
-    r.Prepare(fDB.DB, FormatUtf8(
-      'INSERT INTO %(content, embedding) VALUES (?, ?);', [fItems]));
-    try
-      r.Bind(1, aText);
-      r.BindBlob(2, blob);
-      r.Step;
-    finally
-      r.Close;
-    end;
-    // read under the same lock: LastInsertRowID is per connection
-    result := fDB.LastInsertRowID;
+    AddBatch(texts, vecs);
+    result := fLastAdded;
   finally
     fDB.UnLock;
   end;
@@ -443,7 +805,10 @@ function TNativeVectorStore.AddBatch(const aTexts: TRawUtf8DynArray;
 var
   i: PtrInt;
   r: TSqlRequest;
-  blobs: TRawByteStringDynArray;
+  blobs, signs: TRawByteStringDynArray;
+  rowids: TInt64DynArray;
+  u: TLlmEmbedding;
+  genBefore, genAfter: Int64;
 begin
   result := 0;
   if length(aTexts) <> length(aVectors) then
@@ -454,32 +819,43 @@ begin
   // validate + normalise EVERYTHING before the transaction opens: one bad vector
   // fails the whole batch without writing anything
   SetLength(blobs, length(aVectors));
+  SetLength(signs, length(aVectors));
+  SetLength(rowids, length(aVectors));
   for i := 0 to high(aVectors) do
-    blobs[i] := VectorToBlob(UnitVector(aVectors[i],
-      FormatUtf8('vector #%', [i])));
+  begin
+    u := UnitVector(aVectors[i], FormatUtf8('vector #%', [i]));
+    blobs[i] := VectorToBlob(u);
+    signs[i] := SignCode(u);
+  end;
   fDB.Lock;
   try
     fDB.TransactionBegin(tbImmediate); // see OpenSpace
     try
+      genBefore := ReadGen;
       r.Prepare(fDB.DB, FormatUtf8(
-        'INSERT INTO %(content, embedding) VALUES (?, ?);', [fItems]));
+        'INSERT INTO %(content, embedding, sign) VALUES (?, ?, ?);', [fItems]));
       try
         for i := 0 to high(aTexts) do
         begin
           r.Bind(1, aTexts[i]);
           r.BindBlob(2, blobs[i]);
+          r.BindBlob(3, signs[i]);
           r.Step;
           r.Reset;
+          rowids[i] := fDB.LastInsertRowID; // per connection: under our lock
         end;
       finally
         r.Close;
       end;
+      genAfter := ReadGen;
       fDB.Commit;
       result := length(aTexts);
+      fLastAdded := rowids[high(rowids)];
     except
       RollbackIfOpen(fDB);
       raise;
     end;
+    IndexApply(genBefore, genAfter, rowids, signs, false);
   finally
     fDB.UnLock;
   end;
@@ -489,28 +865,38 @@ procedure TNativeVectorStore.Upsert(const aId, aText: RawUtf8;
   const aVector: TLlmEmbedding);
 var
   r: TSqlRequest;
+  u: TLlmEmbedding;
   blob: RawByteString;
-  rowid: Int64;
+  rowids: TInt64DynArray;
+  signs: TRawByteStringDynArray;
+  genBefore, genAfter: Int64;
 begin
   if aId = '' then
     EVectorStore.RaiseUtf8('%.Upsert: empty id', [self]);
-  blob := VectorToBlob(UnitVector(aVector, 'vector'));
+  u := UnitVector(aVector, 'vector');
+  blob := VectorToBlob(u);
+  SetLength(signs, 1);
+  signs[0] := SignCode(u);
+  SetLength(rowids, 1);
   fDB.Lock;
   try
     // IMMEDIATE: RowIdOfKey reads before the write - see OpenSpace
     fDB.TransactionBegin(tbImmediate);
     try
-      rowid := RowIdOfKey(aId);
-      if rowid <> 0 then
+      genBefore := ReadGen;
+      rowids[0] := RowIdOfKey(aId);
+      if rowids[0] <> 0 then
       begin
         // in place: one row holds text and vector, so the replace is atomic and
         // the id -> row mapping stays stable
         r.Prepare(fDB.DB, FormatUtf8(
-          'UPDATE % SET content = ?, embedding = ? WHERE id = ?;', [fItems]));
+          'UPDATE % SET content = ?, embedding = ?, sign = ? WHERE id = ?;',
+          [fItems]));
         try
           r.Bind(1, aText);
           r.BindBlob(2, blob);
-          r.Bind(3, rowid);
+          r.BindBlob(3, signs[0]);
+          r.Bind(4, rowids[0]);
           r.Step;
         finally
           r.Close;
@@ -519,21 +905,26 @@ begin
       else
       begin
         r.Prepare(fDB.DB, FormatUtf8(
-          'INSERT INTO %(ext_id, content, embedding) VALUES (?, ?, ?);', [fItems]));
+          'INSERT INTO %(ext_id, content, embedding, sign) VALUES (?, ?, ?, ?);',
+          [fItems]));
         try
           r.Bind(1, aId);
           r.Bind(2, aText);
           r.BindBlob(3, blob);
+          r.BindBlob(4, signs[0]);
           r.Step;
         finally
           r.Close;
         end;
+        rowids[0] := fDB.LastInsertRowID;
       end;
+      genAfter := ReadGen;
       fDB.Commit;
     except
       RollbackIfOpen(fDB);
       raise;
     end;
+    IndexApply(genBefore, genAfter, rowids, signs, false);
   finally
     fDB.UnLock;
   end;
@@ -542,19 +933,79 @@ end;
 procedure TNativeVectorStore.Delete(const aId: RawUtf8);
 var
   r: TSqlRequest;
+  rowids: TInt64DynArray;
+  genBefore, genAfter: Int64;
 begin
+  SetLength(rowids, 1);
   fDB.Lock;
   try
-    // one statement on one row: atomic by itself, absent id = no-op
-    r.Prepare(fDB.DB, FormatUtf8('DELETE FROM % WHERE ext_id = ?;', [fItems]));
+    fDB.TransactionBegin(tbImmediate); // see OpenSpace
     try
-      r.Bind(1, aId);
-      r.Step;
-    finally
-      r.Close;
+      genBefore := ReadGen;
+      rowids[0] := RowIdOfKey(aId);
+      if rowids[0] <> 0 then // absent id = no-op
+      begin
+        r.Prepare(fDB.DB, FormatUtf8('DELETE FROM % WHERE id = ?;', [fItems]));
+        try
+          r.Bind(1, rowids[0]);
+          r.Step;
+        finally
+          r.Close;
+        end;
+      end;
+      genAfter := ReadGen;
+      fDB.Commit;
+    except
+      RollbackIfOpen(fDB);
+      raise;
     end;
+    if rowids[0] <> 0 then
+      IndexApply(genBefore, genAfter, rowids, nil, true);
   finally
     fDB.UnLock;
+  end;
+end;
+
+procedure TNativeVectorStore.IndexApply(aGenBefore, aGenAfter: Int64;
+  const aRowIds: TInt64DynArray; const aCodes: TRawByteStringDynArray;
+  aDeleted: boolean);
+var
+  idx: TSignIndex;
+  i, slot: integer;
+begin
+  idx := TSignIndex(fIndex);
+  // called under fDB.Lock (lock order: database, then index - never reversed)
+  idx.Lock.WriteLock;
+  try
+    if not idx.Loaded then
+      exit; // nothing loaded yet: the first search loads the current state
+    if idx.Gen <> aGenBefore then
+    begin
+      // another connection changed the table in between: patching would mix
+      // states - let the next search reload instead
+      idx.Loaded := false;
+      exit;
+    end;
+    for i := 0 to high(aRowIds) do
+    begin
+      slot := idx.SlotOf(aRowIds[i]);
+      if aDeleted then
+      begin
+        if slot >= 0 then
+          idx.Kill(slot);
+      end
+      else if slot >= 0 then
+        idx.SetCode(slot, pointer(aCodes[i]))
+      else if not idx.Append(aRowIds[i], pointer(aCodes[i])) then
+      begin
+        idx.Loaded := false; // out-of-order rowid: cannot happen with
+        exit;                // AUTOINCREMENT, but never guess - reload
+      end;
+    end;
+    idx.CompactIfNeeded;
+    idx.Gen := aGenAfter;
+  finally
+    idx.Lock.WriteUnLock;
   end;
 end;
 
@@ -575,12 +1026,6 @@ begin
   finally
     fDB.UnLock;
   end;
-end;
-
-function TNativeVectorStore.Search(const aQuery: TLlmEmbedding;
-  aTopK: integer): TRagHitDynArray;
-begin
-  result := Scan(aQuery, aTopK, '', []);
 end;
 
 const
@@ -680,33 +1125,341 @@ function TNativeVectorStore.SearchWhere(const aQuery: TLlmEmbedding;
   aTopK: integer; const aKeySql: RawUtf8;
   const aParams: array of const): TRagHitDynArray;
 begin
+  // the connection lock only for the validation: the search itself takes it
+  // where it needs the database, so filtered searches also scan in parallel
   fDB.Lock;
   try
     CheckKeySql(aKeySql);
-    result := Scan(aQuery, aTopK, aKeySql, aParams);
   finally
     fDB.UnLock;
   end;
+  result := DoSearch(aQuery, aTopK, aKeySql, aParams);
 end;
 
-function TNativeVectorStore.Scan(const aQuery: TLlmEmbedding; aTopK: integer;
+function TNativeVectorStore.Search(const aQuery: TLlmEmbedding;
+  aTopK: integer): TRagHitDynArray;
+begin
+  result := DoSearch(aQuery, aTopK, '', []);
+end;
+
+function TNativeVectorStore.DoSearch(const aQuery: TLlmEmbedding; aTopK: integer;
   const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
 var
   q: TLlmEmbedding;
-  r: TSqlRequest;
-  top: TTopK;
-  sql: RawUtf8;
-  stmt: TSqlite3Statement;
-  row: pointer;
-  i: integer;
-  score: double;
-  fpu: cardinal;
+  rows: integer;
 begin
   result := nil;
   q := UnitVector(aQuery, 'query');
   // non-positive TopK = no results requested (same contract as TVec0Store)
   if aTopK <= 0 then
     exit;
+  EnsureIndex;
+  rows := IndexedRows;
+  // the exact streamed scan when the index cannot help: a small store, or a
+  // request for every row (aTopK >= rows) - fetching all rows through the
+  // candidate list would only add work to the plain stream
+  if (rows < fIndexMinRows) or (aTopK >= rows) then
+    result := Scan(q, aTopK, aKeySql, aParams)
+  else
+    result := IndexSearch(q, aTopK, aKeySql, aParams);
+end;
+
+procedure TNativeVectorStore.EnsureIndex;
+var
+  idx: TSignIndex;
+  gen: Int64;
+  current: boolean;
+  r: TSqlRequest;
+  stmt: TSqlite3Statement;
+  fresh: TSignIndex;
+begin
+  idx := TSignIndex(fIndex);
+  fDB.Lock; // lock order: database, then index
+  try
+    gen := ReadGen;
+    idx.Lock.ReadLock;
+    try
+      current := idx.Loaded and (idx.Gen = gen);
+    finally
+      idx.Lock.ReadUnLock;
+    end;
+    if current then
+      exit;
+    // (re)load: only the sign codes, in rowid order, plus the generation they
+    // belong to - both inside ONE read snapshot. Built aside, swapped in under
+    // the write lock, so running searches keep their consistent old index
+    fresh := TSignIndex.Create(fSignWords);
+    try
+      fDB.TransactionBegin(tbDeferred);
+      try
+        gen := ReadGen;
+        r.Prepare(fDB.DB, FormatUtf8('SELECT id, sign FROM % ORDER BY id;',
+          [fItems]));
+        try
+          stmt := r.Request;
+          while r.Step = SQLITE_ROW do
+          begin
+            if sqlite3.column_bytes(stmt, 1) <> fSignWords * 8 then
+              EVectorStore.RaiseUtf8('%: row % has a corrupt sign code',
+                [self, sqlite3.column_int64(stmt, 0)]);
+            fresh.Append(sqlite3.column_int64(stmt, 0), sqlite3.column_blob(stmt, 1));
+          end;
+        finally
+          r.Close;
+        end;
+        fDB.Commit;
+      except
+        RollbackIfOpen(fDB);
+        raise;
+      end;
+      idx.Lock.WriteLock;
+      try
+        idx.RowIds := fresh.RowIds;
+        idx.Alive := fresh.Alive;
+        idx.Codes := fresh.Codes;
+        idx.Count := fresh.Count;
+        idx.AliveCount := fresh.AliveCount;
+        idx.Gen := gen;
+        idx.Loaded := true;
+      finally
+        idx.Lock.WriteUnLock;
+      end;
+    finally
+      fresh.Free;
+    end;
+  finally
+    fDB.UnLock;
+  end;
+end;
+
+/// re-raise a SQLITE_AUTH failure as EVectorStore (the read-only authorizer
+// refused something only visible at Step time, e.g. a pragma function)
+procedure RaiseIfAuth(aStore: TObject; E: Exception);
+begin
+  if (E is ESqlite3Exception) and
+     (ESqlite3Exception(E).ErrorCode = SQLITE_AUTH) then
+    EVectorStore.RaiseUtf8('%.SearchWhere: key query uses a forbidden ' +
+      'operation (only reading is allowed): %', [aStore, E.Message]);
+end;
+
+function TNativeVectorStore.KeyRowIds(const aKeySql: RawUtf8;
+  const aParams: array of const): TInt64DynArray;
+var
+  r: TSqlRequest;
+  n: integer;
+begin
+  result := nil;
+  n := 0;
+  fDB.Lock;
+  try
+    fDB.TransactionBegin(tbDeferred);
+    try
+      // same guards as the exact scan: authorizer for prepare AND step
+      sqlite3.set_authorizer(fDB.DB, KeySqlAuthorizer, nil);
+      try
+        r.Prepare(fDB.DB, FormatUtf8('SELECT id FROM % WHERE ext_id IN (%' +
+          #10 + ') ORDER BY id', [fItems, aKeySql]));
+        try
+          if sqlite3.stmt_readonly(r.Request) = 0 then
+            EVectorStore.RaiseUtf8('%.SearchWhere: key query is not read-only',
+              [self]);
+          if r.ParamCount <> length(aParams) then
+            EVectorStore.RaiseUtf8('%.SearchWhere: key query has % placeholders ' +
+              'but % params were given', [self, r.ParamCount, length(aParams)]);
+          if length(aParams) > 0 then
+            r.Bind(aParams);
+          while r.Step = SQLITE_ROW do
+          begin
+            if n = length(result) then
+              SetLength(result, NextGrow(n));
+            result[n] := r.FieldInt(0);
+            inc(n);
+          end;
+        finally
+          r.Close;
+        end;
+      finally
+        sqlite3.set_authorizer(fDB.DB, nil, nil);
+      end;
+      fDB.Commit;
+    except
+      on E: Exception do
+      begin
+        RollbackIfOpen(fDB);
+        RaiseIfAuth(self, E);
+        raise;
+      end;
+    end;
+  finally
+    fDB.UnLock;
+  end;
+  SetLength(result, n);
+end;
+
+function TNativeVectorStore.IndexSearch(const q: TLlmEmbedding; aTopK: integer;
+  const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
+var
+  idx: TSignIndex;
+  code: RawByteString;
+  allowed, cands: TInt64DynArray;
+  mask: TBooleanDynArray;
+  a, slot: integer;
+  top: TTopK;
+  r: TSqlRequest;
+  stmt: TSqlite3Statement;
+  sql, json: RawUtf8;
+  score: double;
+  fpu: cardinal;
+begin
+  result := nil;
+  idx := TSignIndex(fIndex);
+  code := SignCode(q);
+  if aKeySql <> '' then
+  begin
+    // only a PRE-selection for the mask: the filter is applied again below,
+    // inside the snapshot that also yields the vectors and texts
+    allowed := KeyRowIds(aKeySql, aParams); // ascending rowids
+    if allowed = nil then
+      exit;
+  end;
+  // 1. candidates from the 1-bit index - under the READ lock only, without the
+  //    database lock: concurrent searches scan in parallel
+  idx.Lock.ReadLock;
+  try
+    mask := nil;
+    if allowed <> nil then
+    begin
+      // allowed and RowIds are both ascending: one merge walk marks the slots
+      SetLength(mask, idx.Count);
+      a := 0;
+      for slot := 0 to idx.Count - 1 do
+      begin
+        while (a < length(allowed)) and (allowed[a] < idx.RowIds[slot]) do
+          inc(a);
+        if a = length(allowed) then
+          break;
+        mask[slot] := allowed[a] = idx.RowIds[slot];
+      end;
+    end;
+    cands := idx.Candidates(pointer(code), MaxPtrInt(MinPtrInt(fOversample,
+      NATIVE_MAX_OVERSAMPLE), aTopK), mask);
+  finally
+    idx.Lock.ReadUnLock;
+  end;
+  if cands = nil then
+    exit;
+  // 2. exact rescoring + the winners' text in ONE read snapshot, through ONE
+  //    statement: the candidates come as a JSON array, and the business filter
+  //    is applied AGAIN here - the pre-selection above ran in an earlier
+  //    snapshot, so a row whose filter attributes changed meanwhile must not
+  //    slip through. The index only proposes; this snapshot decides.
+  json := Int64DynArrayToCsv(pointer(cands), length(cands), '[', ']');
+  sql := FormatUtf8('SELECT id, embedding FROM % WHERE ', [fItems]);
+  if aKeySql <> '' then
+    // key query first: its placeholders are 1..n, the JSON array is n+1
+    sql := FormatUtf8('%ext_id IN (%' + #10 + ') AND ', [sql, aKeySql]);
+  sql := sql + 'id IN (SELECT value FROM json_each(?))';
+  top.Init(aTopK);
+  fDB.Lock;
+  try
+    fDB.TransactionBegin(tbDeferred);
+    try
+      if aKeySql <> '' then
+        sqlite3.set_authorizer(fDB.DB, KeySqlAuthorizer, nil); // see Scan
+      try
+        r.Prepare(fDB.DB, sql);
+        try
+          stmt := r.Request;
+          if sqlite3.stmt_readonly(stmt) = 0 then
+            EVectorStore.RaiseUtf8('%.SearchWhere: key query is not read-only',
+              [self]);
+          if r.ParamCount <> length(aParams) + 1 then
+            EVectorStore.RaiseUtf8('%.SearchWhere: key query has % placeholders ' +
+              'but % params were given', [self, r.ParamCount - 1, length(aParams)]);
+          if length(aParams) > 0 then
+            r.Bind(aParams);
+          r.Bind(length(aParams) + 1, json);
+          fpu := SetFpuFlags(ffLibrary); // see Scan: corrupt rows must not trap
+          try
+            while r.Step = SQLITE_ROW do
+            begin
+              if sqlite3.column_bytes(stmt, 1) <> fBlobSize then
+                EVectorStore.RaiseUtf8('%: row % has a corrupt embedding',
+                  [self, sqlite3.column_int64(stmt, 0)]);
+              score := DotRow(pointer(q), pointer(sqlite3.column_blob(stmt, 1)),
+                fContract.Dim);
+              if PInt64(@score)^ and DOUBLE_EXP_MASK = DOUBLE_EXP_MASK then
+                EVectorStore.RaiseUtf8('%: row % has a corrupt embedding ' +
+                  '(non-finite values)', [self, sqlite3.column_int64(stmt, 0)]);
+              top.Offer(score, sqlite3.column_int64(stmt, 0));
+            end;
+          finally
+            ResetFpuFlags(fpu);
+          end;
+        finally
+          r.Close;
+        end;
+      finally
+        if aKeySql <> '' then
+          sqlite3.set_authorizer(fDB.DB, nil, nil);
+      end;
+      result := FetchHits(top.RowId, top.Score, top.Count);
+      fDB.Commit;
+    except
+      on E: Exception do
+      begin
+        RollbackIfOpen(fDB);
+        RaiseIfAuth(self, E);
+        raise;
+      end;
+    end;
+  finally
+    fDB.UnLock;
+  end;
+end;
+
+function TNativeVectorStore.FetchHits(const aRowIds: array of Int64;
+  const aScores: array of double; aCount: integer): TRagHitDynArray;
+var
+  r: TSqlRequest;
+  i: integer;
+begin
+  // text + key for the winners only - called inside the caller's read snapshot
+  SetLength(result, aCount);
+  if aCount = 0 then
+    exit;
+  r.Prepare(fDB.DB, FormatUtf8(
+    'SELECT content, ext_id FROM % WHERE id = ?;', [fItems]));
+  try
+    for i := 0 to aCount - 1 do
+    begin
+      r.Bind(1, aRowIds[i]);
+      if r.Step = SQLITE_ROW then
+      begin
+        r.FieldUtf8(0, result[i].Text);
+        r.FieldUtf8(1, result[i].Key); // NULL ext_id -> '' (anonymous row)
+      end;
+      r.Reset;
+      result[i].DocId := aRowIds[i];
+      result[i].Distance := 1 - aScores[i];
+    end;
+  finally
+    r.Close;
+  end;
+end;
+
+function TNativeVectorStore.Scan(const q: TLlmEmbedding; aTopK: integer;
+  const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
+var
+  r: TSqlRequest;
+  top: TTopK;
+  sql: RawUtf8;
+  stmt: TSqlite3Statement;
+  row: pointer;
+  score: double;
+  fpu: cardinal;
+begin
+  result := nil;
   top.Init(aTopK);
   sql := FormatUtf8('SELECT id, embedding FROM %', [fItems]);
   if aKeySql <> '' then
@@ -772,40 +1525,13 @@ begin
       if aKeySql <> '' then
         sqlite3.set_authorizer(fDB.DB, nil, nil);
     end;
-    // fetch text + key for the winners only - the scan never touches them
-    SetLength(result, top.Count);
-    if top.Count > 0 then
-    begin
-      r.Prepare(fDB.DB, FormatUtf8(
-        'SELECT content, ext_id FROM % WHERE id = ?;', [fItems]));
-      try
-        for i := 0 to top.Count - 1 do
-        begin
-          r.Bind(1, top.RowId[i]);
-          if r.Step = SQLITE_ROW then
-          begin
-            r.FieldUtf8(0, result[i].Text);
-            r.FieldUtf8(1, result[i].Key); // NULL ext_id -> '' (anonymous row)
-          end;
-          r.Reset;
-          result[i].DocId := top.RowId[i];
-          result[i].Distance := 1 - top.Score[i];
-        end;
-      finally
-        r.Close;
-      end;
-    end;
+    result := FetchHits(top.RowId, top.Score, top.Count);
     fDB.Commit; // ends the read snapshot
   except
     on E: Exception do
     begin
       RollbackIfOpen(fDB);
-      // the read-only authorizer refused something only visible at Step time
-      // (e.g. a pragma table-valued function): report it like CheckKeySql does
-      if (E is ESqlite3Exception) and
-         (ESqlite3Exception(E).ErrorCode = SQLITE_AUTH) then
-        EVectorStore.RaiseUtf8('%.SearchWhere: key query uses a forbidden ' +
-          'operation (only reading is allowed): %', [self, E.Message]);
+      RaiseIfAuth(self, E);
       raise;
     end;
   end;

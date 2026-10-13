@@ -90,7 +90,7 @@ kein SQLite) wollte, schleppte die statische SQLite-Abhängigkeit mit.
 mormot.ai.vectorstore           ✓ NUR IVectorStore/IFilteredVectorStore + TRagHit + Vektor-Helfer (SQLite-frei)
 mormot.ai.sqlite                ✓ RollbackIfOpen + Extension-Loader (geteilt von vec0, lembed, nativ)
 mormot.ai.vectorstore.sqlitevec ✓ TVec0Store (sqlite-vec) [static SQLite hier isoliert]
-mormot.ai.vectorstore.native    ◐ TNativeVectorStore: BLOB je Vektorraum + Pascal-Suche, filterbar, ohne Extension — 2a (exakt) ✓, int8/IVF offen (§5)
+mormot.ai.vectorstore.native    ✓ TNativeVectorStore: BLOB je Vektorraum + Pascal-Suche, filterbar, ohne Extension — exakt (2a) + 1-Bit-RAM-Index mit exakter Nachbewertung (2b); IVF nur bei Bedarf (§5)
 mormot.ai.vectorstore.pgvector  ○ TPgVectorStore (IVectorStore) auf mormot.db.pgvector.* (Merge §4)
 mormot.ai.embeddings            ✓ NUR IEmbedder (zieht nicht mehr den LLM-Client)
 mormot.ai.embed.provider        ✓ TProviderEmbedder (OpenAI-Wire)

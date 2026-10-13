@@ -32,6 +32,10 @@ type
     fTempFiles: TFileNameDynArray;
     function TempDb: TFileName;
     procedure CleanUp; override;
+    /// load the committed bge-m3 reference into a store and compare every
+    // query's top-N with the manifest (mismatches) + recall@10
+    procedure ReferenceCheck(aIndexMinRows, aOversample: integer;
+      out aMismatches: integer; out aRecall10: double; out aQueries: integer);
   published
     procedure KeyedOps;
     procedure ContractIsPersistedAndEnforced;
@@ -45,9 +49,20 @@ type
     procedure CorruptForeignRowsAreReported;
     procedure SpacesAreIsolated;
     procedure ReferenceParity;
+    procedure ReferenceParityViaIndex;
+    procedure ReferenceRecallViaIndex;
+    procedure IndexFollowsOwnWrites;
+    procedure IndexFollowsForeignWrites;
+    procedure SearchWhereViaIndex;
+    procedure IndexCandidatesAtMaximumDistance;
+    procedure MissingGenerationIsRefused;
   end;
 
 implementation
+
+const
+  /// minimum recall@10 of the 1-bit index with 20 candidates on the reference
+  RECALL_GATE = 0.9;
 
 function V4(a, b, c, d: single): TLlmEmbedding;
 begin
@@ -490,8 +505,8 @@ begin
   store.Upsert('ok', 'ok', V4(1, 0, 0, 0));
   app := TSqlDataBase.Create(fn, '');
   try
-    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''bad'', ' +
-      '''nan'', X''0000C07F0000C07F0000C07F0000C07F'');');
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding, sign) VALUES (''bad'', ' +
+      '''nan'', X''0000C07F0000C07F0000C07F0000C07F'', X''0000000000000000'');');
   finally
     app.Free;
   end;
@@ -507,8 +522,8 @@ begin
   // x86_64 unless the scan masks the FPU - and a signalling NaN traps always
   app := TSqlDataBase.Create(fn, '');
   try
-    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''inf'', ' +
-      '''inf'', X''0000803F0000807F0000807F0000807F'');');
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding, sign) VALUES (''inf'', ' +
+      '''inf'', X''0000803F0000807F0000807F0000807F'', X''0000000000000000'');');
   finally
     app.Free;
   end;
@@ -522,8 +537,8 @@ begin
   store.Delete('inf');
   app := TSqlDataBase.Create(fn, '');
   try
-    app.Execute('INSERT INTO cr_items(ext_id, content, embedding) VALUES (''snan'', ' +
-      '''snan'', X''0100807F0100807F0100807F0100807F'');');
+    app.Execute('INSERT INTO cr_items(ext_id, content, embedding, sign) VALUES (''snan'', ' +
+      '''snan'', X''0100807F0100807F0100807F0100807F'', X''0000000000000000'');');
   finally
     app.Free;
   end;
@@ -575,28 +590,34 @@ begin
   end;
 end;
 
-procedure TTestVectorStoreNative.ReferenceParity;
+procedure TTestVectorStoreNative.ReferenceCheck(aIndexMinRows, aOversample: integer;
+  out aMismatches: integer; out aRecall10: double; out aQueries: integer);
 var
   refdir: TFileName;
   manifest, queries, top: TDocVariantData;
   corpusLines: TRawUtf8DynArray;
   ids: TRawUtf8DynArray;
   docs, qblob: RawByteString;
-  store: IVectorStore;
+  store: TNativeVectorStore;
+  istore: IVectorStore;
   vec, q: TLlmEmbedding;
   hits: TRagHitDynArray;
   doc: TDocVariantData;
-  dim, n, i, j, mism: integer;
+  dim, n, i, j, h, found: integer;
   qid: RawUtf8;
   c: TVectorContract;
   expect, hit: PDocVariantData;
   expIds: TRawUtf8DynArray;
   expScores: TDoubleDynArray;
+  recallSum: double;
 const
   /// scores closer than this count as a tie (the reference's smallest real
   // gap between neighbours is ~2e-7, the store's re-normalisation shifts ~6e-7)
   NEAR_TIE = 1e-6;
 begin
+  aMismatches := -1;
+  aRecall10 := 0;
+  aQueries := 0;
   refdir := FindReferenceDir;
   if CheckFailed(refdir <> '', 'reference data tests/data/embed-de found') then
     exit;
@@ -623,24 +644,28 @@ begin
   qblob := StringFromFile(refdir + 'queries.f32');
   CheckEqual(length(docs), length(ids) * dim * SizeOf(single), 'docs.f32 size');
   store := TNativeVectorStore.Create(':memory:', 'ref', c);
+  istore := store; // ARC owns it from here
+  store.IndexMinRows := aIndexMinRows;
+  store.Oversample := aOversample;
   SetLength(vec, dim);
   for i := 0 to high(ids) do
   begin
     MoveFast(PByteArray(docs)^[i * dim * SizeOf(single)], vec[0], dim * SizeOf(single));
-    store.Upsert(ids[i], ids[i], vec);
+    istore.Upsert(ids[i], ids[i], vec);
   end;
-  CheckEqual(store.Count, length(ids), 'all reference docs stored');
+  CheckEqual(istore.Count, length(ids), 'all reference docs stored');
   queries.InitCopy(variant(manifest.O['queries']^), JSON_FAST_FLOAT);
   CheckEqual(length(qblob), queries.Count * dim * SizeOf(single), 'queries.f32 size');
   SetLength(q, dim);
-  mism := 0;
+  aMismatches := 0;
+  recallSum := 0;
   for i := 0 to queries.Count - 1 do
   begin
     qid := queries.Names[i];
     MoveFast(PByteArray(qblob)^[i * dim * SizeOf(single)], q[0], dim * SizeOf(single));
     expect := queries.O[qid];
     top.InitCopy(variant(expect^.A['top']^), JSON_FAST_FLOAT);
-    hits := store.Search(q, top.Count);
+    hits := istore.Search(q, top.Count);
     CheckEqual(length(hits), top.Count, 'top-N length');
     n := MinPtrInt(length(hits), top.Count);
     // read the expected ranking once
@@ -658,22 +683,224 @@ begin
       // the score at every rank must match the reference (float32 rows summed
       // in double; the store re-normalises, which moves scores by <1e-6)
       if abs((1 - hits[j].Distance) - expScores[j]) > 1e-5 then
-        inc(mism)
+        inc(aMismatches)
       // the document at every rank must match too - EXCEPT inside a near-tie:
       // two reference scores closer than NEAR_TIE may swap under another
-      // rounding path (Delphi, FMA, the coming SIMD/int8 stages) without any
-      // retrieval meaning; such a swap is accepted, a real reordering is not
+      // rounding path (Delphi, FMA, SIMD) without any retrieval meaning; such
+      // a swap is accepted, a real reordering is not
       else if hits[j].Key <> expIds[j] then
         if not (((j > 0) and (abs(expScores[j] - expScores[j - 1]) < NEAR_TIE) and
                  (hits[j].Key = expIds[j - 1])) or
                 ((j < n - 1) and (abs(expScores[j] - expScores[j + 1]) < NEAR_TIE) and
                  (hits[j].Key = expIds[j + 1]))) then
-          inc(mism);
+          inc(aMismatches);
     end;
+    // recall@10 against the exact reference top-10
+    found := 0;
+    for j := 0 to MinPtrInt(10, n) - 1 do
+      for h := 0 to MinPtrInt(10, length(hits)) - 1 do
+        if hits[h].Key = expIds[j] then
+        begin
+          inc(found);
+          break;
+        end;
+    recallSum := recallSum + found / MinPtrInt(10, n);
     top.Clear;
   end;
-  CheckEqual(mism, 0, FormatUtf8('% queries: exact top-N identical to the ' +
-    'reference (rank + score)', [queries.Count]));
+  aQueries := queries.Count;
+  if aQueries > 0 then
+    aRecall10 := recallSum / aQueries;
 end;
+
+procedure TTestVectorStoreNative.ReferenceParity;
+var
+  mism, nq: integer;
+  rec: double;
+begin
+  // default settings: 262 rows < IndexMinRows -> the exact streamed scan
+  ReferenceCheck(20000, 1000, mism, rec, nq);
+  CheckEqual(mism, 0, FormatUtf8('exact scan: % queries identical to the ' +
+    'reference (rank + score)', [nq]));
+end;
+
+procedure TTestVectorStoreNative.ReferenceParityViaIndex;
+var
+  mism, nq: integer;
+  rec: double;
+begin
+  // index forced, but Oversample >= rows: every row is a candidate and rescored
+  // exactly - the result must be the exact one, through the index code path
+  ReferenceCheck(0, 1000, mism, rec, nq);
+  CheckEqual(mism, 0, FormatUtf8('index path, full rescoring: % queries ' +
+    'identical to the reference', [nq]));
+end;
+
+procedure TTestVectorStoreNative.ReferenceRecallViaIndex;
+var
+  mism, nq: integer;
+  rec: double;
+begin
+  // index forced with a SMALL candidate set (20 of 262 rows): the 1-bit
+  // Hamming pre-selection must still find almost all of the exact top-10
+  ReferenceCheck(0, 20, mism, rec, nq);
+  AddConsole(FormatString('recall@10 with 20 candidates: %', [rec]));
+  Check(rec >= RECALL_GATE, FormatString('recall@10 % >= % (1-bit, 20 candidates)',
+    [rec, RECALL_GATE]));
+end;
+
+procedure TTestVectorStoreNative.IndexFollowsOwnWrites;
+var
+  store: TNativeVectorStore;
+  istore: IVectorStore;
+  hits: TRagHitDynArray;
+begin
+  store := TNativeVectorStore.Create(':memory:', 'ow', C4);
+  istore := store;
+  store.IndexMinRows := 0; // index for every search
+  store.Oversample := 2;   // tight: the index must really rank
+  istore.Upsert('a', 'a', V4(1, 0, 0, 0));
+  istore.Upsert('b', 'b', V4(0, 1, 0, 0));
+  istore.Upsert('c', 'c', V4(0, 0, 1, 0));
+  hits := istore.Search(V4(1, 0, 0, 0), 1); // loads the index
+  CheckEqual(hits[0].Key, 'a', 'index search');
+  CheckEqual(store.IndexedRows, 3, 'index loaded');
+  // own writes patch the loaded index in place (no reload needed)
+  istore.Upsert('d', 'd', V4(0, 0, 0, 1));
+  CheckEqual(store.IndexedRows, 4, 'insert appended to the index');
+  CheckEqual(istore.Search(V4(0, 0, 0, 1), 1)[0].Key, 'd', 'new row found');
+  istore.Upsert('a', 'a2', V4(0, -1, 0, 0)); // moves a to another region
+  hits := istore.Search(V4(0, -1, 0, 0), 1);
+  CheckEqual(hits[0].Key, 'a', 'updated code used');
+  CheckEqual(hits[0].Text, 'a2', 'updated text');
+  istore.Delete('b');
+  CheckEqual(store.IndexedRows, 3, 'delete removed from the index');
+  Check(not HasKey(istore.Search(V4(0, 1, 0, 0), 3), 'b'), 'deleted row gone');
+  Check(istore.Add('anon', V4(1, 1, 0, 0)) > 0, 'Add appends');
+  CheckEqual(store.IndexedRows, 4, 'anonymous row indexed');
+end;
+
+procedure TTestVectorStoreNative.IndexFollowsForeignWrites;
+var
+  fn: TFileName;
+  reader, writer: TNativeVectorStore;
+  ireader, iwriter: IVectorStore;
+begin
+  // two store instances = two connections on one file (e.g. two processes):
+  // the reader's index must notice the writer's changes via the generation
+  fn := TempDb;
+  reader := TNativeVectorStore.Create(StringToUtf8(fn), 'fw', C4);
+  ireader := reader;
+  reader.IndexMinRows := 0;
+  reader.Oversample := 1;
+  writer := TNativeVectorStore.Create(StringToUtf8(fn), 'fw', C4);
+  iwriter := writer;
+  iwriter.Upsert('a', 'a', V4(1, 0, 0, 0));
+  CheckEqual(ireader.Search(V4(1, 0, 0, 0), 1)[0].Key, 'a', 'reader sees a');
+  iwriter.Upsert('z', 'z', V4(0, 0, 0, 1));
+  CheckEqual(ireader.Search(V4(0, 0, 0, 1), 1)[0].Key, 'z',
+    'reader reloads after a foreign insert');
+  CheckEqual(reader.IndexedRows, 2, 'reloaded index has both rows');
+  iwriter.Delete('z');
+  Check(not HasKey(ireader.Search(V4(0, 0, 0, 1), 2), 'z'),
+    'reader sees the foreign delete');
+  // discriminating: the rescoring snapshot alone would also hide z - the index
+  // itself must have been reloaded
+  CheckEqual(reader.IndexedRows, 1, 'index reloaded after the foreign delete');
+  // the reader's OWN write after a foreign one must not patch a stale index
+  iwriter.Upsert('y', 'y', V4(0, 1, 0, 0));
+  ireader.Upsert('x', 'x', V4(0, 0, 1, 0));
+  CheckEqual(ireader.Search(V4(0, 1, 0, 0), 1)[0].Key, 'y', 'foreign row kept');
+  CheckEqual(ireader.Search(V4(0, 0, 1, 0), 1)[0].Key, 'x', 'own row kept');
+  CheckEqual(reader.IndexedRows, 3, 'index consistent after mixed writes');
+end;
+
+procedure TTestVectorStoreNative.IndexCandidatesAtMaximumDistance;
+var
+  store: TNativeVectorStore;
+  istore: IVectorStore;
+  v, q: TLlmEmbedding;
+  i, r: integer;
+begin
+  // 64 dims = one code word without padding: a row whose signs are the exact
+  // opposite of the query has the MAXIMUM Hamming distance (64). With fewer
+  // valid rows than wanted, every row must become a candidate - an off-by-
+  // the-histogram threshold used to keep only one of them
+  store := TNativeVectorStore.Create(':memory:', 'md',
+    VectorContract('test/model-64d', '', 64));
+  istore := store;
+  store.IndexMinRows := 0;
+  store.Oversample := 4; // > the 3 rows, so the index path keeps all of them
+  SetLength(q, 64);
+  SetLength(v, 64);
+  for i := 0 to 63 do
+    q[i] := 1;
+  for r := 1 to 3 do
+  begin
+    for i := 0 to 63 do
+      v[i] := -1 - r * (i mod 3); // all negative, different directions
+    istore.Upsert(FormatUtf8('neg%', [r]), 'neg', v);
+  end;
+  // k = 2 < 3 rows: the index path (not the "every row" fallback)
+  CheckEqual(length(istore.Search(q, 2)), 2, 'both requested hits returned');
+end;
+
+procedure TTestVectorStoreNative.MissingGenerationIsRefused;
+var
+  fn: TFileName;
+  app: TSqlDataBase;
+  istore: IVectorStore;
+begin
+  // without its generation row the triggers bump nothing and the index could
+  // never notice foreign changes: the store must refuse, not trust it
+  fn := TempDb;
+  istore := TNativeVectorStore.Create(StringToUtf8(fn), 'mg', C4);
+  istore.Upsert('a', 'a', V4(1, 0, 0, 0));
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('DELETE FROM mg_meta WHERE key = ''gen'';');
+  finally
+    app.Free;
+  end;
+  try
+    istore.Search(V4(1, 0, 0, 0), 1);
+    Check(false, 'missing generation refused');
+  except
+    on E: EVectorStore do
+      Check(true, 'missing generation refused');
+  end;
+end;
+
+procedure TTestVectorStoreNative.SearchWhereViaIndex;
+var
+  fn: TFileName;
+  app: TSqlDataBase;
+  store: TNativeVectorStore;
+  istore: IFilteredVectorStore;
+  hits: TRagHitDynArray;
+begin
+  fn := TempDb;
+  store := TNativeVectorStore.Create(StringToUtf8(fn), 'pi', C4);
+  istore := store;
+  store.IndexMinRows := 0;
+  store.Oversample := 1; // filter must apply BEFORE the candidate selection
+  app := TSqlDataBase.Create(fn, '');
+  try
+    app.Execute('CREATE TABLE positions(id TEXT PRIMARY KEY, tenant INT);');
+    app.Execute('INSERT INTO positions VALUES (''p1'', 1), (''p2'', 2), (''p3'', 1);');
+  finally
+    app.Free;
+  end;
+  istore.Upsert('p1', 'p1', V4(1, 1, 0, 0));
+  istore.Upsert('p2', 'p2', V4(1, 0, 0, 0)); // nearest, but other tenant
+  istore.Upsert('p3', 'p3', V4(0, 0, 1, 0));
+  hits := istore.SearchWhere(V4(1, 0, 0, 0), 1,
+    'SELECT id FROM positions WHERE tenant = ?', [1]);
+  CheckEqual(length(hits), 1, 'one hit');
+  CheckEqual(hits[0].Key, 'p1', 'best allowed row, masked in the index');
+  hits := istore.SearchWhere(V4(1, 0, 0, 0), 5,
+    'SELECT id FROM positions WHERE tenant = ?', [3]);
+  CheckEqual(length(hits), 0, 'empty filter');
+end;
+
 
 end.
