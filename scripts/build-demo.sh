@@ -45,7 +45,8 @@ else
          jsonrpc/demo.mcp.jsonrpc.lpr streamable/demo.mcp.streamable.lpr \
          llm/llm-chat.lpr llm/llm-agent.lpr llm/llm-structured.lpr \
          llm/llm-embed.lpr llm/llm-vision.lpr llm/llm-anthropic.lpr \
-         rag/rag-spike.lpr rag/rag-chat.lpr rag/rag-agent.lpr)
+         rag/rag-spike.lpr rag/rag-chat.lpr rag/rag-agent.lpr \
+         rag/embed-reference.lpr)
 fi
 
 build_one() {

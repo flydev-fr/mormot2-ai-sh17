@@ -15,3 +15,11 @@
 # in jeder Zeile an, und die Zusage "verbatim copy" in NOTICE/README waere
 # schlicht falsch. -text = nicht anfassen (Diff bleibt normal lesbar).
 docs/specs/** -text
+
+# Embedding-Testkorpus + Referenz: byte-genau halten. Das Manifest speichert die
+# SHA-256 von corpus.jsonl/queries.jsonl - ein CRLF-Checkout unter Windows wuerde
+# sie ungueltig machen. Die Vektordateien sind rohe float32-Bytes: jede
+# Zeilenende-Umwandlung zerstoert sie.
+tests/data/**/*.jsonl text eol=lf
+tests/data/**/*.json text eol=lf
+*.f32 binary

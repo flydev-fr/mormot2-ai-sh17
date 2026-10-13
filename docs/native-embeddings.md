@@ -372,11 +372,89 @@ Tokenizer-Problem nicht automatisch und erzwingt einen Modellwechsel.
 
 ---
 
+## Referenzvertrag v1 (Schritt 1, 2026-10-13)
+
+Der Vertrag beschreibt, **was ein Vektor in einem Store bedeutet**. Jeder Store speichert
+ihn in seinen Metadaten; ein Embedder, der nicht exakt dazu passt, darf in diesen Store
+weder schreiben noch mit ihm suchen. Änderung eines Feldes = neuer Vektorraum =
+Neuindizierung.
+
+| Feld | Wert v1 | Herkunft |
+|---|---|---|
+| Modell | `BAAI/bge-m3` | Nutzerentscheidung |
+| Modelldatei | `bge-m3-q8_0.gguf`, **SHA-256 im Manifest** | `vendor/models/` |
+| Laufzeit (Orakel) | sqlite-lembed `v0.0.1-alpha.8-landrix.1` (llama.cpp), SQLite 3.51.2 | gemessen |
+| Dimension | 1024 | gemessen |
+| Pooling | CLS | GGUF `bert.pooling_type = 2` |
+| Normierung | L2 (Einheitsvektoren) | gemessen: Norm 1 ± 1e-6 |
+| Metrik | **Cosinus** = Skalarprodukt auf Einheitsvektoren; Distanz `1 − dot` | Entscheidung |
+| Max. Tokens | **512 inkl. `<s>`/`</s>`** | gemessen (llama.cpp-Default-Kontext) |
+| Präfixe | keine (weder Query noch Dokument) | bge-m3-Modellkarte |
+| Eingabetext | der Text unverändert (Kurztext + `\n` + Langtext) | Entscheidung |
+| Sondertokens | `add_special = true`; `parse_special`: Orakel `true`, nativ **`false`** | gemessen / Entscheidung |
+
+**Metrik**: vec0 rechnete bisher L2. Weil alle Vektoren Einheitslänge haben, ist das
+Ranking nach L2 und nach Cosinus **identisch** (`‖a−b‖² = 2 − 2·a·b`); nur die Zahlenwerte
+unterscheiden sich. Der native Store rechnet daher mit dem Skalarprodukt — das ist die
+billigste Operation und passt direkt zu int8-Quantisierung.
+
+### Befunde am Orakel (gemessen)
+
+- **Lange Texte**: lembed **verweigert** Eingaben über 512 Tokens mit einem SQL-Fehler
+  („Input too large: 548 tokens exceeds model context size of 512") statt zu kürzen. Wird
+  `n_ctx` über `lembed_context_options('n_ctx', 8192)` angehoben, **bricht der Prozess ab**
+  (`GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")`) —
+  lembed lässt `n_ubatch` nicht setzen. ⇒ Der Aufrufer muss **vorher** auf 512 Tokens
+  kürzen; `n_ctx` darf in Produktion **nie** angehoben werden. Lange GAEB-Langtexte
+  brauchen eine Kürzungsregel (v1: abschneiden; Chunking erst bei Bedarf).
+- **Tokenizer**: mehrfache Leerzeichen werden zusammengefasst; Unicode-Normalisierung über
+  die Charsmap ist aktiv (NFD-„Größe" ergibt dieselben IDs wie NFC, Vollbreite/Ligaturen
+  werden gefaltet). `lembed_tokenize_json` liefert die Token-IDs — **Orakel für Schritt 3**.
+- **Sondertokens im Nutzertext**: lembed tokenisiert mit `parse_special = true`, d. h.
+  `</s>`, `<s>`, `<pad>` in einem Positionstext werden zu echten Steuertokens (IDs 2, 0, 1)
+  und verfälschen das Embedding. Der native Tokenizer behandelt Nutzertext als Text
+  (`parse_special = false`); der Testkorpus enthält diese Zeichenfolgen bewusst nicht.
+- **Determinismus**: zweimal derselbe Text ⇒ Cosinus 1,0; zwei getrennte Generatorläufe
+  liefern **bitgleiche** Vektordateien.
+- **Durchsatz** (Snapdragon X, WSL aarch64, serialisiert, stark längenabhängig):
+  **~25 Texte/s** bei ~15 Tokens, **~4,7 Texte/s** beim Korpus (⌀ 51 Tokens, max. 234).
+  Hochgerechnet auf 2 Mio Artikel ≈ **22 h** (kurze Texte) bis **> 100 h** (Positionslänge)
+  Erstindizierung — bestätigt: die Erzeugung ist der Engpass; IONOS oder ein schnellerer
+  lokaler Pfad ist für Großbestände Pflicht. Auf x86_64 noch nicht gemessen.
+
+### Referenzdaten
+
+- Korpus: [`tests/data/embed-de/`](../tests/data/embed-de/) — selbst verfasste deutsche
+  Handwerkspositionen und Artikel mit bewerteten Anfragen (Grad 2 = gleiche Leistung,
+  1 = verwandt), inkl. harter Negative und Dimensionsvarianten.
+- Generator: `demos/rag/embed-reference.lpr`, Aufruf `scripts/embed-reference.sh`
+  (braucht die gitignorten `vendor/`-Artefakte). Er prüft den Vertrag (Tokenlimit,
+  Einheitsnorm, Dimension, bekannte IDs) und schreibt `reference/manifest.json`
+  (Vertrag, SHA-256 von Modell und Korpus, Statistik, Metriken, exakte Top-20 je Anfrage)
+  sowie `docs.f32`/`queries.f32` (float32 little-endian, Dateireihenfolge).
+- Die Referenz wird **eingecheckt**: Paritäts- und Qualitätstests der folgenden Schritte
+  laufen damit ohne lembed (Delphi, CI ohne `vendor/`).
+- Korpusumfang: **262 Dokumente** (221 Positionen, 41 Artikel; 61 mit Langtext), **58
+  Anfragen** (knapp, LV-Stil, umgangssprachlich), 164 Grad-2- und 104 Grad-1-Paare,
+  ~55 Konzepte über 10 Gewerke, 11 harte Negative ohne eigene Anfrage.
+
+### Basis-Metriken des Orakels (lembed + bge-m3 q8, Stand 2026-10-13)
+
+| nDCG@10 | Recall@10 (Grad 2) | MRR (volle Rangliste) |
+|---|---|---|
+| **0,896** | **0,974** | **0,928** |
+
+Das ist die Messlatte für Gate 4/5 (nativer Encoder: nDCG@10 höchstens 1 Prozentpunkt
+darunter) und das Referenz-Ranking für Gate 2 (nativer Store im exakten Modus: identische
+Top-20 bis auf Gleichstände). Die schwächsten Anfragen sind die erwartbar schweren:
+umgangssprachliche Kundenmails („Bad soll neue Fliesen an der Wand bekommen") und Wand- vs.
+Bodenfliesen — der Korpus trennt also, ist nicht trivial.
+
 ## Plan mit Prüfpunkten
 
 | # | Schritt | Umfang | Freigabe nur wenn |
 |---|---|---|---|
-| 1 | Referenzvertrag: Modell-Hash, Runtime-Version, Token-Flags, Kontextgrenze, Metrik, **deutscher Testkorpus** | 1–2 Tage | festgelegt und dokumentiert |
+| 1 ✓ | Referenzvertrag: Modell-Hash, Runtime-Version, Token-Flags, Kontextgrenze, Metrik, **deutscher Testkorpus** — **erledigt 2026-10-13**, siehe „Referenzvertrag v1" | 1–2 Tage | festgelegt und dokumentiert |
 | 2 | Nativer Vektor-Store v1 (Teil A): float32-BLOB + quantisierte Kopie (int8/1-bit) + Nachbewertung, Multithread-Scan, Fachfilter, Indexvertrag + paralleler Neuaufbau | 1–2 Wochen | exakter Modus = Referenz-Ranking; Atomarität, Fehlerfälle, Neustart, Mandantentrennung getestet |
 | 2b | IVF-Partitionierung (v2) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
 | 3 | GGUF-Reader + UGM-Tokenizer | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-/Sondertoken-Fällen; beschädigte Dateien sicher abgelehnt |
