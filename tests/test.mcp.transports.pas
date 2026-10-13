@@ -578,7 +578,10 @@ begin
     port := StartHttpTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
     status := McpPost(client, '/mcp', '{');
-    CheckEqual(status, HTTP_SUCCESS);
+    // 400 like every other body that is not a request (an array, trailing data):
+    // a -32600/-32700 answer carries 400 via McpHttpStatus, so a mounted route
+    // and this transport agree. It used to be 200 here and 400 for an array.
+    CheckEqual(status, HTTP_BADREQUEST);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
     errVar := doc^.GetValueOrNull('error');
@@ -1726,6 +1729,38 @@ begin
       'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
       'Mcp-Method: tools/list');
     CheckEqual(status, HTTP_BADREQUEST, 'array body -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+
+    // a complete request followed by trailing data: InitJson accepted the
+    // prefix and the transport dispatched it. The control post shows the body
+    // itself is valid, so the 400 below can only come from the trailing data.
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_SUCCESS, 'control: the same body without trailing data');
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}garbage', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'trailing data -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    // an embedded #0 through the real transport: the preflight parses into a
+    // local TDocVariantData record, the path a variant-based test cannot reach
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}' + #0 + 'garbage', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'embedded #0 -> 400');
     CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
 
     // a request that IS dispatchable still streams as before

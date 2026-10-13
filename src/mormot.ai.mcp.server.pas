@@ -758,9 +758,11 @@ begin
   // the spec's backward-compatibility probe treats a 400 whose body is "not a
   // recognized modern JSON-RPC error" as evidence of a legacy server, and would
   // downgrade to the removed initialize handshake against this very server.
+  // McpInitJsonComplete, not InitJson: trailing data after the object must
+  // fail here too, or this transport would dispatch a body the core rejects
   body := Ctxt.InContent;
-  doc.InitJson(body, JSON_FAST);
-  if not doc.IsObject then
+  if not McpInitJsonComplete(doc, body, JSON_FAST) or
+     not doc.IsObject then
     exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
       Null, JSONRPC_INVALID_REQUEST,
       'Request body must be a single JSON-RPC object ' +

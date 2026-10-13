@@ -920,6 +920,28 @@ in Ordnung" galt anfangs nur im Test. Codex hat das in der dritten von vier Rund
 der Claude-Review danach den `ChatStructured`-Seiteneffekt und den leergelaufenen
 Loader-Regressionstest.
 
+### Vollständiger Parse der Client-Bodies (2026-10, MCP **1012** grün, FPC und Delphi 13)
+
+`InitJson` prüft nur, ob der Text mit einem gültigen Wert **beginnt**: `{"jsonrpc":"2.0",…}garbage`
+lief als Request durch, und der Parser hält an einem eingebetteten `#0` an. Neu ist
+`McpInitJsonComplete` (`mormot.ai.mcp`): Nach dem Wert ist nur Leerraum erlaubt. Jedes Steuerzeichen
+außer TAB/LF/CR macht den Text ungültig (RFC 8259); mORMots Parser hält an `#0` an und überspringt
+`#1..#31` wie Leerraum. Bei Misserfolg wird das Dokument geleert, vorher aber initialisiert: Aufrufer
+übergeben meist ein nie initialisiertes lokales Record, und `Clear` liest dessen `VType` (unter Delphi
+`EVariantBadVarTypeError`). Alle Eingänge für Client-Bodies nutzen ihn:
+`ParseRequest` (und damit HTTP, stdio, Legacy-Brücke), `McpValidateRequestHeaders` und der Preflight
+des HTTP-Transports. Ein Host, der den Server als Route einhängt, sollte für seine eigene
+Vorab-Prüfung denselben Helfer nehmen. Sonst läuft ein Body mit Rest dort in die Header-Prüfung und
+bekommt `-32020` statt `-32600`. Er muss außerdem wie der Transport `PreflightRequest` vor
+`ExecuteRequest` aufrufen und dessen Status senden. Nur so bekommt ein Request ohne Pflicht-`_meta`
+die von der Spec verlangte 400 (`-32602`): Aus der fertigen Antwort ist das nicht abzuleiten, weil
+`-32602` auch für ein unbekanntes Werkzeug steht (200).
+
+`McpHttpStatus` ordnet jetzt auch `-32600`/`-32700` HTTP 400 zu. Die Spec legt dafür keinen Status
+fest, aber der Preflight des eigenen Transports antwortet ohnehin mit 400. Eine eingehängte Route
+kennt nur die fertige Antwort und bekam bisher 200. Auch im Transport war es uneinheitlich: Der
+Body `{` bekam 200, ein Array-Body 400.
+
 ## Lizenz / Veröffentlichung
 
 > **Überholt (2026-07-29):** Ein Synopse-PR ist **nicht** mehr das Ziel — LandrixAI

@@ -892,6 +892,7 @@ var
   jsonrpc: RawUtf8;
   v: variant;
   okFlag: boolean;
+  rejected: TDocVariantData;
 begin
   proc := TMcpJsonRpcProcessor.Create('TestServer', '1.0');
   try
@@ -900,6 +901,28 @@ begin
     Check(ok);
     CheckEqual(method, 'ping');
     Check(VariantToIntegerDef(requestId, 0) = 1);
+
+    // a valid object followed by anything but whitespace is not a request:
+    // InitJson alone accepted the prefix and dispatched it
+    Check(proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"ping"}' + #13#10#9,
+      method, params, requestId), 'trailing whitespace is fine');
+    Check(not proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"ping"}garbage',
+      method, params, requestId), 'trailing text');
+    Check(not proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"ping"}[]',
+      method, params, requestId), 'trailing array');
+    Check(not proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"ping"}' + #0 + 'x',
+      method, params, requestId), 'embedded #0 hides the rest from the parser');
+    // the parser skips #1..#31 like whitespace; JSON only knows space/TAB/LF/CR
+    Check(not proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"ping"}' + #1,
+      method, params, requestId), 'trailing control character');
+    Check(not proc.ParseRequest('{"jsonrpc":"2.0","id":1,"method":"pi' + #1 + 'ng"}',
+      method, params, requestId), 'raw control character inside a string');
+    // a rejected text leaves even a never-initialized record defined: $FF makes
+    // the garbage VType deterministic (without Init, Clear would read it)
+    FillChar(rejected, SizeOf(rejected), $FF);
+    Check(not McpInitJsonComplete(rejected, '{}' + #0, JSON_FAST), 'NUL');
+    Check(rejected.Count = 0, 'cleared');
+    Check(not rejected.IsObject, 'no object');
 
     v := _ObjFast(['ok', true]);
     response := proc.CreateSuccessResponse(requestId, v);
@@ -1903,6 +1926,12 @@ begin
     CheckEqual(McpHttpStatus('{"jsonrpc":"2.0","id":1,"result":{}}'), 200,
       'an ordinary result is 200');
     CheckEqual(McpHttpStatus(''), 200, 'a notification leaves the status alone');
+    // a body that is no request at all: the transport's preflight answers 400,
+    // so a mounted route deriving the status from the response must too
+    CheckEqual(McpHttpStatus('{"jsonrpc":"2.0","id":null,"error":{"code":-32600,' +
+      '"message":"Invalid JSON-RPC request"}}'), 400, '-32600 is an HTTP 400');
+    CheckEqual(McpHttpStatus('{"jsonrpc":"2.0","id":null,"error":{"code":-32700,' +
+      '"message":"Parse error"}}'), 400, '-32700 is an HTTP 400');
 
     // a client declaring a DIFFERENT capability is still missing this one
     CheckErrorResponse(ExecCaps(server,

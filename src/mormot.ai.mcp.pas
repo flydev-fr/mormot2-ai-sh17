@@ -866,6 +866,11 @@ function McpBearerToken(const aAuthorizationHeader: RawUtf8): RawUtf8;
 //   those can only be decided AFTER a handler ran (-32021 depends on what the
 //   handler turned out to need), so a transport cannot rely on the preflight
 //   alone: it has to look at the response it is about to send.
+// - a body that is not a request at all (-32600, -32700) is a 400 as well: the
+//   spec pins no status to it, but this unit's own HTTP transport answers its
+//   preflight with 400, and a server mounted as a route on a foreign HTTP host
+//   (which only has the finished response) must not answer the same body
+//   differently
 // - every other outcome, including an application-level -32602 or -32603, is a
 //   perfectly ordinary 200 carrying a JSON-RPC error
 function McpHttpStatus(const aResponseJson: RawUtf8): integer;
@@ -1580,6 +1585,21 @@ function McpDecodeHeaderValue(const aValue: RawUtf8): RawUtf8;
 // - returns '' when the header is absent
 function McpHeaderValue(const aHeaders, aName: RawUtf8): RawUtf8;
 
+/// parse a complete JSON document received from a client
+// - like TDocVariantData.InitJson, but returns false when anything other than
+//   JSON whitespace follows the value, or when the text contains a control
+//   character other than TAB, LF and CR (RFC 8259: the only whitespace, and
+//   control characters inside strings must be escaped)
+// - InitJson only checks that the text STARTS with a valid value:
+//   '{"jsonrpc":"2.0",...}garbage' would otherwise be dispatched as if the
+//   garbage were not there; the parser also stops at an embedded #0 and skips
+//   every #1..#31 as if it were whitespace
+// - on failure aDoc is cleared, so a caller ignoring the result sees no object
+// - every entry point taking a client body uses it (ParseRequest, the header
+//   check, the HTTP transport), so all of them share one notion of "valid"
+function McpInitJsonComplete(var aDoc: TDocVariantData; const aJson: RawUtf8;
+  aOptions: TDocVariantOptions): boolean;
+
 /// validate the standard MCP request headers against the request body
 // - checks MCP-Protocol-Version, Mcp-Method, Mcp-Name and the tool's own
 //   Mcp-Param-<Name> mirrors; on failure aErrorMsg names the offending header
@@ -1814,7 +1834,9 @@ begin
   case code of
     MCP_ERROR_HEADER_MISMATCH,
     MCP_ERROR_MISSING_CLIENT_CAPABILITY,
-    MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION:
+    MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION,
+    JSONRPC_INVALID_REQUEST,
+    JSONRPC_PARSE_ERROR:
       result := HTTP_MCP_BAD_REQUEST;
     JSONRPC_METHOD_NOT_FOUND:
       result := HTTP_MCP_NOT_FOUND;
@@ -2379,15 +2401,18 @@ begin
   aParams := Null;
   aRequestId := Null;
 
-  // Parse JSON (invalid JSON yields a non-object -> rejected below)
-  // _JsonFastFloat, like every other entry point taking foreign JSON: the
+  // Parse JSON (invalid JSON or trailing data -> rejected below)
+  // JSON_FAST_FLOAT, like every other entry point taking foreign JSON: the
   // default options keep floats in currency and store what they cannot hold as
   // TEXT, so a tool argument of 0.12345678 would be passed on as the STRING
   // "0.12345678". A typed tool recovers (RecordLoadJson is tolerant and
   // converts through mORMot's own, locale-independent parser), but one that
   // reads the raw variant - or echoes it into structuredContent - sees a
   // string where its own published schema says number.
-  request := _JsonFastFloat(aJson);
+  // Complete parse: trailing data after the object makes the whole body
+  // invalid instead of being silently ignored (McpInitJsonComplete)
+  if not McpInitJsonComplete(TDocVariantData(request), aJson, JSON_FAST_FLOAT) then
+    exit;
   doc := _Safe(request);
   if not doc.IsObject then
     exit;
@@ -5062,6 +5087,47 @@ begin
   end;
 end;
 
+function HasNonJsonControlChar(const aJson: RawUtf8): boolean;
+var
+  p: PUtf8Char;
+  i: PtrInt;
+begin
+  result := true;
+  p := pointer(aJson);
+  for i := 0 to length(aJson) - 1 do
+    if (p[i] < ' ') and not (p[i] in [#9, #10, #13]) then
+      exit;
+  result := false;
+end;
+
+function McpInitJsonComplete(var aDoc: TDocVariantData; const aJson: RawUtf8;
+  aOptions: TDocVariantOptions): boolean;
+var
+  tmp: TSynTempBuffer;
+  endOfJson: AnsiChar;
+begin
+  result := false;
+  if HasNonJsonControlChar(aJson) then
+    // callers typically pass a never-initialized local record: give it a
+    // defined state before Clear below reads VType (as InitJson would have)
+    aDoc.Init(aOptions)
+  else
+  begin
+    // InitJsonInPlace modifies its buffer - parse a private copy, as InitJson
+    // does; aEndOfObject receives the first non-blank char after the value
+    tmp.Init(aJson);
+    try
+      endOfJson := #0;
+      result := (aDoc.InitJsonInPlace(tmp.buf, aOptions, @endOfJson) <> nil) and
+                (endOfJson = #0);
+    finally
+      tmp.Done;
+    end;
+  end;
+  if not result then
+    aDoc.Clear;
+end;
+
 function McpValidateRequestHeaders(const aHeaders, aBody: RawUtf8;
   aServer: TMcpServer; out aErrorMsg: RawUtf8): boolean;
 var
@@ -5071,7 +5137,9 @@ var
 begin
   result := false;
   aErrorMsg := '';
-  doc.InitJson(aBody, JSON_FAST);
+  // the same complete parse as ParseRequest: headers are compared against the
+  // body that will actually be executed, not against a valid prefix of it
+  McpInitJsonComplete(doc, aBody, JSON_FAST);
 
   // MCP-Protocol-Version: REQUIRED, and must equal the _meta value. We only
   // check presence/equality here — whether we *speak* that version is decided
