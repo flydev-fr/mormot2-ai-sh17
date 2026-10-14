@@ -1,66 +1,129 @@
 # mormot2-ai — the `mormot.ai.*` extension for mORMot2 (FPC · Delphi 7 … 13)
 
-A **mORMot-native** AI/LLM extension for **Free Pascal** and **Delphi 7 to 13** — the
-same compiler range as mORMot2: an MCP server, LLM clients,
-embeddings, vector stores and RAG. Built on mORMot2 — its HTTP stack, JSON, RTTI and
-crypto are the foundation, not a dependency we tolerate.
+A **mORMot-native** AI extension for **Free Pascal** and **Delphi 7 to 13** — the same
+compiler range as mORMot2. It covers the Model Context Protocol, LLM clients, embeddings,
+vector search and RAG, and it brings **its own inference engine in plain Object Pascal**:
+no Python, no llama.cpp, no foreign `.so`/`.dll` at run time. mORMot2's HTTP stack, JSON,
+RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
-> **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
-> (stateless) and only that one — plus a temporary stdio bridge for the legacy `initialize`
-> handshake, marked for removal. As of 2026-10-14 both suites are green — **1253–1257
-> assertions** MCP, **647–659** LLM (depending on compiler and whether the `vec0` test runs) —
-> on aarch64-linux (FPC 3.2.4/3.2.2), aarch64-darwin, x86_64-win64 (FPC 3.2.2), Win64
-> (Delphi 13) and **Win32 (Delphi 7)**; aarch64-win64 (FPC 3.3.1) needs an external
-> `sqlite3-64.dll`. Per-platform table:
-> [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests).
-> All 14 demos build with FPC and Delphi 13; Delphi has no demo build script yet. Open: phase E
-> (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
+> **Status, 2026-10-14:** MCP, LLM clients, agent loop, RAG and the native vector store
+> are done and in use. The native inference engine runs BGE-M3 embeddings from the same
+> GGUF file as `lembed`, with the same quality and **about twice its speed on x86_64**;
+> before it becomes the default it still has to pass a run on Linux x86_64 and a long
+> indexing run. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
 
-## Why a standalone extension
+## What it does
 
-- **Not an upstream mORMot PR** (decided 2026-07-29). mORMot2 stays the **foundation**,
-  not the delivery target: an own repository keeps our own pace and platform goals
-  (native inference engine, CUDA) and lets MCP follow the 2026-07-28 spec alone.
-  Rationale: [CONCEPT.md §1](CONCEPT.md).
-- **FPC and Delphi 7 to 13** — the same compiler range as mORMot2. FPC is the reference
-  compiler and the gate; Delphi 13 (Win64) and Delphi 7 (Win32), the two ends of the
-  range, build the library and run both test suites.
-  Parts that only exist under FPC — the POSIX process launcher in `vendor/` — stay behind
-  `{$ifdef FPC}` instead of being duplicated. The library needs no generics: the MCP
-  registries are `TSynDictionary`, typed tools build on `TMcpRecordTool`, and the generic
-  `TMcpToolBase<T>` is only a shorthand where the compiler has generics.
-- **Written like mORMot2** — unit headers, `{ ****** section }` layout, `RawUtf8`,
-  `TDocVariantData`, `ESynException`, `f` field prefix, `///` docs. Stricter than mORMot2
-  where Delphi 7 or readability needs it: a non-generic core (generics only as an optional
-  typed shell under `HASGENERICS`), no anonymous methods, no inline variables, no
-  `exit(value)`, no `with`, and an `a` prefix on our own parameters. The full rule set
-  is in [CONCEPT.md §1](CONCEPT.md).
-- **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
-  provider wires) rather than chasing another library's changes.
-- **License MPL/GPL/LGPL** (the mORMot three-license, confirmed 2026-10-14 — also for the
-  native inference engine) — the adopted MCP units require it, and it composes with
-  MIT-licensed ported code and LGPL-with-linking-exception.
+| Area | Units | In short |
+|---|---|---|
+| **MCP server** | `mormot.ai.mcp[.server/.stdio/.tools]` | protocol revision **2026-07-28** (stateless); tools from typed records, input schema generated from RTTI; stdio, HTTP, Streamable HTTP, in-process; OAuth 2.1 resource server (opt-in) |
+| **LLM clients** | `mormot.ai.llm[.openai/.anthropic/.sse/.structured]` | OpenAI wire as lingua franca (OpenAI, LiteLLM, Ollama-compatible), native Anthropic driver; streaming, tool calls, structured output, vision |
+| **Agent** | `mormot.ai.agent[.mcp]` | tool-calling loop; MCP tools usable by the agent |
+| **Embeddings** | `mormot.ai.embeddings`, `.embed.{native,provider,lembed}` | one `IEmbedder` seam: the native engine, any OpenAI-compatible API, or sqlite-lembed |
+| **Vector search** | `mormot.ai.vectorstore[.native/.sqlitevec]` | native store in mORMot's SQLite: float32 rows as the truth, 1-bit RAM index with exact rescoring, SQL key filters — measured at 2 million × 1024 |
+| **RAG** | `mormot.ai.rag[.tool]` | strict, atomic ingestion; retrieval; RAG as an MCP/agent tool |
+| **Native inference** | `src/infer/mormot.ai.infer.*` | GGUF and safetensors loaders, Q8_0, SentencePiece/Unigram tokenizer, XLM-RoBERTa encoder, CPU backend with NEON and AVX2 kernels and its own thread pool |
 
-## Layout
+## Where it runs
 
+Number of assertions per suite, every one passing; each row with numbers ran on 2026-10-14:
+
+| Platform | Compiler | MCP | LLM | Inference |
+|---|---|---|---|---|
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 656 | 1215 |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 656 | 821 ¹ |
+| Windows x64 | Delphi 13 | 1257 | 659 | 1205 |
+| Windows x86 | **Delphi 7** | 1253 | 647 | 669 |
+| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 | not yet run |
+| Windows ARM64 | FPC 3.3.1 | 1257 | green ² | not yet run |
+| Linux x86_64 | FPC 3.2.2 | — | — | pending ³ |
+
+¹ Without the converted FP32 reference model on that machine; those tests skip.
+² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
+that target.
+³ The production target (Docker). sqlite-vec and lembed are verified there; the SIMD
+kernels are built for the System V convention but have not run on hardware yet.
+
+Counts differ by compiler because some tests only exist where a feature does (the `vec0`
+extension has no 32-bit build, so Delphi 7 skips that test).
+
+## Native inference
+
+The engine replaces `lembed` (llama.cpp inside SQLite) and, later, every other foreign
+library. It is written from published specs and MIT-licensed templates (llama2.c, ggml,
+calm); Apache-2.0 sources (transformers, tokenizers) are only read, never copied. It
+targets mORMot2's compiler range — Delphi 7 as a correctness tier without a speed goal;
+the tested configurations are listed under [Where it runs](#where-it-runs).
+
+```pascal
+program embed;
+
+{$I mormot.defines.inc}
+
+uses
+  {$I mormot.uses.inc}
+  mormot.ai.llm.types, mormot.ai.embeddings, mormot.ai.embed.native;
+
+var
+  emb: IEmbedder;
+  v: TLlmEmbedding;
+begin
+  // one shared embedder per logical model name: the first call decides the
+  // model path and the thread count
+  emb := SharedNativeEmbedder('vendor/models/bge-m3-q8_0.gguf', 'bge-m3');
+  v := emb.Embed('Abdichtung eines Flachdachs');
+  // v: 1024 floats, L2-normalised - ready for TNativeVectorStore
+end.
 ```
-mormot2-ai/
-  src/
-    mormot.ai.mcp[.server|.stdio|.tools]     MCP: core, transports, sample tools
-    mormot.ai.llm[.types|.openai|.anthropic]  LLM clients (+ .sse, .structured)
-    mormot.ai.agent[.mcp]                     agent / tool-calling loop
-    mormot.ai.embeddings, .embed.{provider,lembed}
-    mormot.ai.vectorstore[.sqlitevec|.native]
-    mormot.ai.sqlite                          SQLite helpers, extension loader
-    mormot.ai.rag[.tool]
-  tests/    mcp.tests.lpr · llm.tests.lpr (mORMot TSynTests)
-  demos/    stdio · http · jsonrpc · streamable · llm/* · rag/*
-  docs/specs/mcp-2026-07-28/   verbatim copy of the protocol spec (see below)
-  vendor/   mormot.ext.os (adopted) · models, sqlite-ext (gitignored, not in git)
-  scripts/  run-fpc-tests.sh · run-fpc-llm-tests.sh · build-demo.sh · x64-ext-verify.sh
-            fpc-env.sh (compiler pin) · run-delphi-tests.ps1
-  CONCEPT.md  DESIGN.md  LICENSE  NOTICE  SECURITY.md  UPSTREAM_BASE
-```
+
+**How it is checked.** Every layer is compared against a fixed Python reference
+(`tools/infer-ref/`, data under `tests/data/infer-ref/`); token ids match lembed on all
+1318 cases without special-token literals (those are deliberately treated as text and
+checked against SentencePiece instead); on a German retrieval corpus the embeddings reach
+nDCG@10 **0.9004** (lembed 0.8963) with a cosine of at least 0.9991 against lembed's
+vectors. The backend has two arithmetic contracts: `Exact = true` is bit-identical to the
+scalar double reference on all cores; the default computes in float lanes like ggml and
+is tested against the reference with stated tolerances.
+
+### Measured throughput
+
+BGE-M3 (`bge-m3-q8_0.gguf`, the file lembed uses) on the embed-de corpus: 320 texts,
+16268 tokens, mean 51 tokens per text, one text at a time. `demos/infer/embed-bench`
+runs both engines over the same loop (`embed-bench [gguf] all [threads|lembed]`); runs
+alternate between the engines so that heat and background load hit both alike.
+
+**x86_64, AVX2** — Intel Core i9-14900K (8 P-cores with HT + 16 E-cores, 32 threads),
+Windows 11, FPC 3.2.2 win64, 2026-10-14:
+
+| | lembed | native | native / lembed |
+|---|---|---|---|
+| default threads, run 1 / 2 | 524 / 525 tokens/s | 1039 / 1027 tokens/s (22 threads) | 1.98x / 1.96x |
+| native with 8 / 16 / 24 / 32 threads | | 739 / 954 / 1040 / 959 tokens/s | |
+| peak working set | 514 MB | 377 MB | 0.73x |
+
+Started over SSH, both engines ran at about half that speed on this machine (lembed 187,
+native 417 tokens/s): Windows power throttling slowed the windowless process down.
+Switching off execution-speed throttling for the process
+(`SetProcessInformation(ProcessPowerThrottling)`) restored the numbers above;
+`embed-bench` does so unless `LAI_THROTTLE` is set. A Windows service doing bulk
+embedding may want the same.
+
+**aarch64, NEON dot product** — Snapdragon X (12 cores), WSL2, FPC 3.2.4, model on the
+Linux file system, 2026-10-14:
+
+| | lembed | native | native / lembed |
+|---|---|---|---|
+| 4 cores (taskset, 4 threads each), run 1 / 2 | 359 / 297 tokens/s | 361 / 341 tokens/s | 1.00x / 1.15x |
+| whole machine, default threads, run 1 / 2 | 336 / 316 tokens/s | 385 / 315 tokens/s (8 threads) | 1.15x / 0.99x |
+| peak RSS | 758 MB | 617 MB | 0.81x |
+
+Peak RSS includes the pages of the mapped model file and moves with the page cache
+(480 to 617 MB for native over several runs). The laptop throttles under sustained load;
+the spread between runs is that, not noise in the engines. The default thread count is
+two thirds of the logical cores.
+
+Plan, phases, gates and the full record: [docs/native-inference.md](docs/native-inference.md)
+(German).
 
 ## A server in thirty lines
 
@@ -164,146 +227,6 @@ shows up with an empty input schema. Register the record once at startup and it 
 Swap `TMcpStdioTransport` for the HTTP or Streamable transport and nothing else changes —
 the server and its tools do not know which transport they are behind. Full examples in
 [`demos/`](demos/).
-
-## Build & test
-
-```bash
-# from this repo, on Linux/WSL:
-bash scripts/run-fpc-tests.sh        # MCP suite
-bash scripts/run-fpc-llm-tests.sh    # LLM suite
-bash scripts/run-fpc-infer-tests.sh  # native inference suite (reference data, no model needed)
-LAI_INFER_GATE=1 bash scripts/run-fpc-infer-tests.sh  # + BGE-M3 Q8 corpus gate (nDCG@10, ~1 h scalar)
-bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agent.lpr)
-# VERBOSE=1 for the full compiler/test log; logs land in bin/fpc/
-```
-
-```powershell
-# Delphi 13, on Windows:
-.\scripts\run-delphi-tests.ps1               # MCP, LLM and inference suites (-Suite mcp|llm|infer, -ShowAll)
-# logs and binaries land in bin\delphi\
-# Delphi 7 (Win32):
-.\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
-```
-
-**Requirements:** a mORMot2 source tree, plus
-- **FPC 3.2.4** (currently the release candidate) for the bash scripts. They pin it
-  (`scripts/fpc-env.sh`: a `fpc324` wrapper if one is on the PATH, else `fpc`) and stop on
-  any other version, because a machine with several FPCs otherwise builds with whichever one
-  the shell finds first. Override deliberately with `FPC=<compiler>`; `FPC_EXPECT=<version>`
-  still insists on a version. Unit caches live under `lib/<fpc version>`, so builds with
-  different compilers never share `.ppu` files.
-- **Delphi 13** (`dcc64`, compiler 37.0) for `run-delphi-tests.ps1`; override with
-  `-Dcc <path>`. On ARM64 Windows the x64 test programs run under emulation.
-
-- **Delphi 7** (`dcc32`) for `run-delphi7-tests.ps1`: `-Delphi7 <install dir>` (or
-  `DELPHI7`) and `-FastMM4 <dir with FastMM4.pas>` (or `FASTMM4`) — mORMot2 uses FastMM4
-  as memory manager on Delphi 7, and it is a separate library. The `vec0` test is skipped
-  there (no 32-bit build of the extension); the script says so.
-
-Verified on aarch64-linux and x86_64-linux (FPC), Win64 (Delphi 13) and Win32 (Delphi 7). Lazarus is
-optional; `.lpi` files exist for the test projects, the scripts do not need the IDE.
-
-The two native extensions used by RAG (`sqlite-vec`, `lembed`) are **optional**: without
-them the vector-store tests skip and everything else runs.
-
-## Using it in your own project
-
-There is no package file to install — add two source directories and mORMot2's, and use
-the units. This is what the build scripts do; the flags below are lifted from
-[`scripts/run-fpc-tests.sh`](scripts/run-fpc-tests.sh):
-
-```bash
-MORMOT2=/path/to/mORMot2
-LAI=/path/to/mormot2-ai
-
-fpc -MDelphi -Sci -Ci -O2 \
-  -Fi"$MORMOT2/src;$MORMOT2/src/core;$MORMOT2/src/net" \
-  -Fu"$LAI/src;$MORMOT2/src/app;$MORMOT2/src/core;$MORMOT2/src/crypt;$MORMOT2/src/db;$MORMOT2/src/lib;$MORMOT2/src/net;$MORMOT2/src/orm;$MORMOT2/src/rest;$MORMOT2/src/soa" \
-  -Fl"$MORMOT2/static/$(fpc -iTP)-linux" \
-  your-program.lpr
-```
-
-`-MDelphi` is not optional — the sources use Delphi-mode syntax, as mORMot2 itself does.
-`-Fl` points at mORMot2's static libraries (the bundled SQLite among them); drop it only if
-you use no unit that needs them.
-
-In Lazarus, add `$(LAI)/src` to the project's *Other unit files* and mORMot2 per its own
-instructions. Consuming this repository as a **git submodule** is the arrangement the
-default paths assume — see "Locating mORMot2" above.
-
-## Maturity
-
-Not everything here carries the same weight. "Live" means it was run against a real
-provider or runtime, not only against tests.
-
-| Area | State | Notes |
-|---|---|---|
-| MCP core, JSON-RPC, tool/resource registry | **stable** | 1012 assertions in the MCP suite (2026-10-14), hardened over five review rounds |
-| Transports: stdio, HTTP, Streamable HTTP, in-process | **stable** | concurrency covered (parallel clients, keep-alive reuse) |
-| MCP authorization (resource server) | **stable** | opt-in per spec (`OPTIONAL`), closed once a verifier is set; the verifier itself is supplied by the consumer |
-| LLM client, OpenAI wire | **stable, live** | also covers LiteLLM and Ollama-compatible endpoints |
-| Anthropic driver | **stable, live** | streaming and tool loop verified against a real model |
-| Agent / tool-calling loop, structured output, vision | **stable, live** | |
-| Embeddings via provider API | **stable** | |
-| Embeddings via `lembed` (local GGUF) | **works, needs a native library** | process-wide singleton per model; not re-entrant, calls are serialised |
-| Vector store `sqlite-vec` | **works, needs a native library** | real-extension test is env-gated (`SQLITE_EXT_DIR`) |
-| Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
-| RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
-| pgvector backend | **not built** | phase E — the `IVectorStore` seam exists, the implementation does not |
-| Ollama embedder | **not built** | phase E |
-| Native inference engine (embeddings, then LLMs) | **in progress** | own Pascal engine, replaces `lembed` and every foreign `.so`; BGE-M3 runs from the same Q8 GGUF as lembed and passes its gates; about twice lembed's throughput on x86_64 (AVX2), on par or faster on aarch64 (not the default yet, see below) — [docs/native-inference.md](docs/native-inference.md) |
-
-### Native inference: measured throughput
-
-BGE-M3 (`bge-m3-q8_0.gguf`, the file lembed uses) on the embed-de corpus: 320 texts,
-16268 tokens, mean 51 tokens per text, one text at a time. `demos/infer/embed-bench`
-runs both engines over the same loop (`embed-bench [gguf] all [threads|lembed]`); runs
-alternate between the engines so that heat and background load hit both alike.
-Quality is the same on every platform: cosine against the lembed vectors >= 0.9991,
-nDCG@10 0.9004 (lembed 0.8963).
-
-**x86_64, AVX2** — Intel Core i9-14900K (8 P-cores with HT + 16 E-cores, 32 threads),
-Windows 11, FPC 3.2.2 win64, 2026-10-14:
-
-| | lembed | native | native / lembed |
-|---|---|---|---|
-| default threads, run 1 / 2 | 524 / 525 tokens/s | 1039 / 1027 tokens/s (22 threads) | 1.98x / 1.96x |
-| native with 8 / 16 / 24 / 32 threads | | 739 / 954 / 1040 / 959 tokens/s | |
-| peak working set | 514 MB | 377 MB | 0.73x |
-
-Without a visible window (started over SSH, or as a service) Windows throttles a
-process after a few seconds (EcoQoS): both engines then lose about half their speed —
-lembed 187, native 417 tokens/s on the same machine. The benchmark opts out with
-`SetProcessInformation(ProcessPowerThrottling)` (set `LAI_THROTTLE=1` to keep it); a
-Windows service doing bulk embedding should do the same. On Linux x86_64 the same
-kernels are built for the System V calling convention; that build has not run on
-hardware yet.
-
-**aarch64, NEON dot product** — Snapdragon X (12 cores), WSL2, FPC 3.2.4, model on the
-Linux file system, 2026-10-14:
-
-| | lembed | native | native / lembed |
-|---|---|---|---|
-| 4 cores (taskset, 4 threads each), run 1 / 2 | 359 / 297 tokens/s | 361 / 341 tokens/s | 1.00x / 1.15x |
-| whole machine, default threads, run 1 / 2 | 336 / 316 tokens/s | 385 / 315 tokens/s (8 threads) | 1.15x / 0.99x |
-| peak RSS | 758 MB | 617 MB | 0.81x |
-
-Peak RSS includes the pages of the mapped model file and moves with the page cache
-(480 to 617 MB for native over several runs).
-The laptop throttles under sustained load; the spread between runs is that, not noise
-in the engines. The default thread count is two thirds of the logical cores.
-
-Two things follow from the "needs a native library" rows: those features are **optional at
-runtime** (missing library ⇒ skip, never crash), and the libraries are **not in git** —
-`vendor/models` and `vendor/sqlite-ext` are ignored and have to be provided locally.
-
-**Locating mORMot2:** the scripts expect a mORMot2 source tree (`src/`, `static/`). With
-no configuration they assume the submodule case — `<consumer>/shared/delphi/libs/_git_Synopse2`,
-three levels above this repo. For a **standalone clone**, point at it explicitly:
-
-```bash
-MORMOT2_ROOT=/path/to/mORMot2 bash scripts/run-fpc-tests.sh
-```
 
 ## MCP — revision 2026-07-28, and only that one
 
@@ -415,6 +338,189 @@ bin/fpc/demos/llm-anthropic
 same `TLlmAgent` and toolbox, only `TAnthropicClient` instead of `TLlmClient` — which is
 what makes the lingua-franca seam a claim you can check rather than one you have to believe.
 
+## Build & test
+
+```bash
+# from this repo, on Linux/WSL:
+bash scripts/run-fpc-tests.sh        # MCP suite
+bash scripts/run-fpc-llm-tests.sh    # LLM suite
+bash scripts/run-fpc-infer-tests.sh  # native inference suite (reference data, no model needed)
+LAI_INFER_GATE=1 bash scripts/run-fpc-infer-tests.sh  # + BGE-M3 Q8 corpus gate (nDCG@10, ~1 h scalar)
+bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agent.lpr)
+# VERBOSE=1 for the full compiler/test log; logs land in bin/fpc/
+```
+
+```powershell
+# Delphi 13, on Windows:
+.\scripts\run-delphi-tests.ps1               # MCP, LLM and inference suites (-Suite mcp|llm|infer, -ShowAll)
+# logs and binaries land in bin\delphi\
+# Delphi 7 (Win32):
+.\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
+```
+
+**Requirements:** a mORMot2 source tree, plus
+- **FPC 3.2.4** (currently the release candidate) for the bash scripts. They pin it
+  (`scripts/fpc-env.sh`: a `fpc324` wrapper if one is on the PATH, else `fpc`) and stop on
+  any other version, because a machine with several FPCs otherwise builds with whichever one
+  the shell finds first. Override deliberately with `FPC=<compiler>`; `FPC_EXPECT=<version>`
+  still insists on a version. Unit caches live under `lib/<fpc version>`, so builds with
+  different compilers never share `.ppu` files.
+- **Delphi 13** (`dcc64`, compiler 37.0) for `run-delphi-tests.ps1`; override with
+  `-Dcc <path>`. On ARM64 Windows the x64 test programs run under emulation.
+
+- **Delphi 7** (`dcc32`) for `run-delphi7-tests.ps1`: `-Delphi7 <install dir>` (or
+  `DELPHI7`) and `-FastMM4 <dir with FastMM4.pas>` (or `FASTMM4`) — mORMot2 uses FastMM4
+  as memory manager on Delphi 7, and it is a separate library. The `vec0` test is skipped
+  there (no 32-bit build of the extension); the script says so.
+
+Which compiler ran which suite on which platform: [Where it runs](#where-it-runs). Lazarus
+is optional; `.lpi` files exist for the test projects, the scripts do not need the IDE.
+
+The two native extensions (`sqlite-vec`, `lembed`) are **optional**: the tests that need
+them skip without them; everything else, the native vector store and engine included,
+runs.
+
+**Locating mORMot2:** the scripts expect a mORMot2 source tree (`src/`, `static/`). With
+no configuration they assume the submodule case — `<consumer>/shared/delphi/libs/_git_Synopse2`,
+three levels above this repo. For a **standalone clone**, point at it explicitly:
+
+```bash
+MORMOT2_ROOT=/path/to/mORMot2 bash scripts/run-fpc-tests.sh
+```
+
+## Using it in your own project
+
+There is no package file to install — add this repository's `src` (and `src/infer` for
+native inference) plus mORMot2's source directories, and use the units. This is what the build scripts do; the flags below are lifted from
+[`scripts/run-fpc-tests.sh`](scripts/run-fpc-tests.sh):
+
+```bash
+MORMOT2=/path/to/mORMot2
+LAI=/path/to/mormot2-ai
+
+fpc -MDelphi -Sci -Ci -O2 \
+  -Fi"$MORMOT2/src;$MORMOT2/src/core;$MORMOT2/src/net" \
+  -Fu"$LAI/src;$LAI/src/infer;$MORMOT2/src/app;$MORMOT2/src/core;$MORMOT2/src/crypt;$MORMOT2/src/db;$MORMOT2/src/lib;$MORMOT2/src/net;$MORMOT2/src/orm;$MORMOT2/src/rest;$MORMOT2/src/soa" \
+  -Fl"$MORMOT2/static/$(fpc -iTP)-linux" \
+  your-program.lpr
+```
+
+`-MDelphi` is not optional — the sources use Delphi-mode syntax, as mORMot2 itself does.
+Start the program as mORMot2 programs do, with `{$I mormot.defines.inc}` and
+`uses {$I mormot.uses.inc} ...`: on POSIX that brings in `cthreads`, which the MCP
+transports and the native engine's thread pool need.
+`-Fl` points at mORMot2's static libraries (the bundled SQLite among them); drop it only if
+you use no unit that needs them.
+
+In Lazarus, add `$(LAI)/src` and `$(LAI)/src/infer` to the project's *Other unit files* and mORMot2 per its own
+instructions. Consuming this repository as a **git submodule** is the arrangement the
+default paths assume — see "Locating mORMot2" under Build & test.
+
+## Layout
+
+```
+mormot2-ai/
+  src/
+    mormot.ai.mcp[.server|.stdio|.tools|.legacy]  MCP: core, transports, sample tools
+    mormot.ai.llm[.types|.openai|.anthropic]      LLM clients (+ .sse, .structured)
+    mormot.ai.agent[.mcp]                         agent / tool-calling loop
+    mormot.ai.embeddings, .embed.{native,provider,lembed}
+    mormot.ai.vectorstore[.native|.sqlitevec]
+    mormot.ai.sqlite                              SQLite helpers, extension loader
+    mormot.ai.rag[.tool]
+    infer/mormot.ai.infer.*                       the native inference engine:
+      tensor, memory, loader.{gguf,safetensors}, tokenizer.ugm, model.xlmr,
+      backend[.cpu], kernels (NEON, AVX2), threads, pipeline.embed
+  tests/    mcp.tests · llm.tests · infer.tests (mORMot TSynTests), data/ (reference data)
+  demos/    stdio · http · jsonrpc · streamable · llm/* · rag/* · infer/embed-bench
+  tools/    infer-ref (Python reference for the engine, not needed to build)
+  docs/     native-inference.md · native-embeddings.md · specs/mcp-2026-07-28/
+  vendor/   mormot.ext.os (adopted) · models, sqlite-ext (gitignored, not in git)
+  scripts/  run-fpc-{tests,llm-tests,infer-tests}.sh · build-demo.sh · fpc-env.sh
+            run-delphi-tests.ps1 · run-delphi7-tests.ps1 · x64-ext-verify.sh
+  CONCEPT.md  DESIGN.md  LICENSE  NOTICE  SECURITY.md  UPSTREAM_BASE
+```
+
+## Maturity
+
+Not everything here carries the same weight. "Live" means it was run against a real
+provider or runtime, not only against tests.
+
+| Area | State | Notes |
+|---|---|---|
+| MCP core, JSON-RPC, tool/resource registry | **stable** | hardened over five review rounds; a real consumer registers its tools and supplies the token verifier |
+| Transports: stdio, HTTP, Streamable HTTP, in-process | **stable** | concurrency covered (parallel clients, keep-alive reuse) |
+| MCP authorization (resource server) | **stable** | opt-in per spec (`OPTIONAL`), closed once a verifier is set; the verifier itself is supplied by the consumer |
+| LLM client, OpenAI wire | **stable, live** | also covers LiteLLM and Ollama-compatible endpoints |
+| Anthropic driver | **stable, live** | streaming, tool loop and structured output verified against a real model |
+| Agent / tool-calling loop, structured output, vision | **stable, live** | |
+| Embeddings via provider API | **stable** | |
+| Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
+| RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
+| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates; AVX2 and NEON kernels; waits for the Linux x86_64 run and a long indexing run |
+| Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
+| Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
+| pgvector backend, Ollama embedder | **not built** | the `IVectorStore` / `IEmbedder` seams exist; built when a deployment needs them |
+
+The "needs a native library" rows are **optional dependencies**: an application that
+selects one of these adapters has to provide its library (or handle the error its
+constructor raises without it); the tests that need one are skipped when it is missing.
+The libraries are **not in git** — `vendor/models` and `vendor/sqlite-ext` are ignored
+and have to be provided locally.
+
+## Roadmap
+
+Done:
+- ✓ **MCP** — server adopted and renamed into `mormot.ai.*`, moved to revision 2026-07-28
+  (stateless) with the removed machinery deleted, used by a real consumer.
+- ✓ **LLM** — clean-room client: OpenAI wire and Anthropic, agent/tool loop, structured
+  output, vision, embeddings, RAG.
+- ✓ **Compiler range of mORMot2** — FPC and Delphi 7 to 13, non-generic core.
+- ✓ **Native vector store** — replaces sqlite-vec.
+- ✓ **Native inference, phases 0 to 1b and the speed work of 1c** — reference data,
+  BGE-M3 in FP32 and from the Q8_0 GGUF, NEON and AVX2 kernels, measured against lembed.
+
+Next, in this order:
+1. **Native embeddings by default** — run the suite on Linux x86_64, a long run for a
+   first indexing of 2 million texts, then switch the default; lembed stays as fallback.
+2. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
+   `ILlmClient` as `mormot.ai.llm.native`, with streaming and tool calls; gate: greedy
+   output token-identical to `transformers` in FP32.
+3. **Quantisation and speed** — Q4_0, later K-quants, sampling (temperature, top-k,
+   top-p), benchmarks per platform.
+4. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
+5. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
+   Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
+
+Alongside: agent loop limits (cancellation, deadlines, context budget), token-based
+chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
+the single source of truth for open points.
+
+## Why a standalone extension
+
+- **Not an upstream mORMot PR** (decided 2026-07-29). mORMot2 stays the **foundation**,
+  not the delivery target: an own repository keeps our own pace and platform goals
+  (native inference engine, CUDA) and lets MCP follow the 2026-07-28 spec alone.
+  Rationale: [CONCEPT.md §1](CONCEPT.md).
+- **FPC and Delphi 7 to 13** — the same compiler range as mORMot2. FPC is the reference
+  compiler and the gate; Delphi 13 (Win64) and Delphi 7 (Win32), the two ends of the
+  range, build the library and run all test suites.
+  Parts that only exist under FPC — the POSIX process launcher in `vendor/` — stay behind
+  `{$ifdef FPC}` instead of being duplicated. The library needs no generics: the MCP
+  registries are `TSynDictionary`, typed tools build on `TMcpRecordTool`, and the generic
+  `TMcpToolBase<T>` is only a shorthand where the compiler has generics.
+- **Written like mORMot2** — unit headers, `{ ****** section }` layout, `RawUtf8`,
+  `TDocVariantData`, `ESynException`, `f` field prefix, `///` docs. Stricter than mORMot2
+  where Delphi 7 or readability needs it: a non-generic core (generics only as an optional
+  typed shell under `HASGENERICS`), no anonymous methods, no inline variables, no
+  `exit(value)`, no `with`, and an `a` prefix on our own parameters. The full rule set
+  is in [CONCEPT.md §1](CONCEPT.md).
+- **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
+  provider wires) rather than chasing another library's changes.
+- **License MPL/GPL/LGPL** (the mORMot three-license, confirmed 2026-10-14 — also for the
+  native inference engine) — the adopted MCP units require it, and it composes with
+  MIT-licensed ported code and LGPL-with-linking-exception.
+
 ## Origin and license
 
 The MCP server units were **adopted** from
@@ -427,30 +533,20 @@ covered by the three-license above — it keeps its own upstream license alongsi
 
 ### Relationship to flydev — code adoption, not a fork
 
-From [flydev-fr/mormot.ai](https://github.com/flydev-fr/mormot.ai) we adopt **code only**:
-no fork, no shared repository, no upstream PRs. Our `mormot.ai.*` namespace **stays** even
-where it collides with theirs — harmless, because the repositories are independent.
-
-So that their later changes remain mergeable by diff, their commit is **pinned** in
-[UPSTREAM_BASE](UPSTREAM_BASE).
+Our adoption from flydev so far comes from `mormot2-extensions`: the MCP units, their
+tests and demos, and `mormot.ext.os`. From
+[flydev-fr/mormot.ai](https://github.com/flydev-fr/mormot.ai) we may adopt **code only**,
+selectively (pgvector, if a deployment needs it): no fork, no shared repository, no
+upstream PRs. Its evaluation baseline is **pinned** in [UPSTREAM_BASE](UPSTREAM_BASE) so
+that a later adoption can work from a diff; nothing from it is in this repository yet.
+Both projects use the `mormot.ai.*` namespace — fine while they are used separately; a
+program combining both has to mind the overlapping unit names.
 
 > **Rule: whoever ports from upstream bumps `UPSTREAM_BASE` in the same commit.** Without
 > it the diff base is lost and the next round has to guess. The same file records the
 > templates of the native inference engine, the model revision and file hashes behind its
 > reference data, the Python environment that produced them, and the mORMot2 commit the
 > suites last ran against.
-
-## Roadmap
-
-Only **phase E** is open — layering, the flydev merge and backend binding. See
-[CONCEPT.md](CONCEPT.md), the single source of truth for open points.
-
-- ✓ **Phase A** — MCP server adopted, namespace aligned, build/tests/demos green.
-- ✓ **Phase B** — a real consumer on the registry: Landrix registers its tools and supplies
-  the `IMcpTokenVerifier`. The binding lives outside this repo.
-- ✓ **Phase C** — protocol moved to 2026-07-28 (stateless); removed machinery deleted.
-- ✓ **Phase D** — clean-room LLM client: OpenAI wire + Anthropic, agent/tool loop,
-  embeddings/RAG, vision.
 
 ## A note on the documentation language
 

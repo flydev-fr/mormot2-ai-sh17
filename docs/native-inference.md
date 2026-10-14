@@ -445,17 +445,17 @@ Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding, MoE.
 
 ## Plattformen und Tests
 
-### Messung am 2026-10-14 (heutiger Code, ohne Engine)
+### Messung am 2026-10-14
 
 | Plattform | Compiler | Ergebnis |
 |---|---|---|
-| WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, alle Demos) |
+| WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, Inferenz 1215, alle Demos) |
 | macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen) |
 | Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
-| Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659) |
+| Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659, Inferenz 1205) |
 | Windows x64 unter Prism | FPC 3.2.2 | nur Kompatibilitätsprobe, nicht für Leistungsaussagen |
-| Windows 11 x64, i9-14900K, 96 GB, RTX 5090 (32 GB, Treiber 616.64), per SSH (`rtx5090`) | FPC 3.2.2 (fpcupdeluxe) | grün **vor** dem Delphi-7-Umbau: MCP 1012, LLM 647, **nativ** (ohne Prism); danach nicht erneut gemessen (Rechner aus). Delphi 13 ist installiert, CUDA-Toolkit (`nvcc`) nicht. |
-| Windows x86 | **Delphi 7** | grün nach dem Umbau (MCP 1253, LLM 647; vec0 übersprungen, es gibt kein 32-Bit-Bundle), siehe unten |
+| Windows 11 x64, i9-14900K, 96 GB, RTX 5090 (32 GB, Treiber 616.64), per SSH (`ai-rtx5090`) | FPC 3.2.2 win64 (lokal übersetzt, nativ ausgeführt) | grün, Stand `bfd2507` + README-Umbau: MCP 1257, LLM 656 (mit vec0), Inferenz 821 (ohne konvertiertes FP32-Modell, dessen Tests überspringen); das Delphi-13-Testbinary dort ebenfalls grün (Inferenz 818 vor den letzten Tests). Delphi 13 ist installiert, CUDA-Toolkit (`nvcc`) nicht. |
+| Windows x86 | **Delphi 7** | grün nach dem Umbau (MCP 1253, LLM 647, Inferenz 669; vec0 übersprungen, es gibt kein 32-Bit-Bundle), siehe unten |
 
 ### Rollen im Testplan
 
