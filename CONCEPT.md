@@ -51,10 +51,10 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
 > von flydev **nur Code übernehmen** und kein gemeinsames Repo betreiben (§4), ist die
 > Kollision folgenlos. **Lizenz bleibt MPL/GPL/LGPL**
 > (wie mORMot): die adoptierten MCP-Units verlangen es, und es ist mit MIT
-> (flydev-pgvector) wie mit LGPL-2.1+Linking-Exception verträglich. **Offen
-> (2026-10-14):** `LICENSE` nennt die Dreifachlizenz noch „intended"; der Plan zur
-> nativen Inferenz schlägt MIT vor. Vor dem ersten portierten Fremdcode entscheiden
-> ([docs/native-inference.md](docs/native-inference.md#offene-entscheidungen)).
+> (flydev-pgvector) wie mit LGPL-2.1+Linking-Exception verträglich. **Entschieden
+> (2026-10-14):** Die Dreifachlizenz gilt endgültig für das ganze Repo, auch für die
+> native Inferenz-Engine; `LICENSE` ist entsprechend gefasst. Portierter Fremdcode
+> kommt nur aus MIT-Quellen ([docs/native-inference.md](docs/native-inference.md#vorlagen-und-lizenzen)).
 
 ## 2. Schichtenmodell (die Kernregel)
 
@@ -242,8 +242,8 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 **Reihenfolge:**
 1. Referenzvertrag und deutscher Testkorpus ✓
 2. nativer Store ✓ (ersetzt vec0)
-3. Engine Phase 0, Python-Referenz:
-   - Lizenz klären;
+3. Delphi-7-Portierung des bestehenden Codes (§9 Punkt 9), **vor** dem Engine-Code;
+   danach Engine Phase 0, Python-Referenz:
    - festgelegte FP32-Referenz pro Layer;
    - winzige Fixtures.
 4. Phase 1a, BGE-M3 FP32

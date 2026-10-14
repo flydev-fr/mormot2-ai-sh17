@@ -1,15 +1,23 @@
-LandrixAI — proposed mormot.ai.* extension for the Synopse mORMot 2 framework.
-
-Intended license: the mORMot three-license
-    MPL 1.1  /  GPL 2.0  /  LGPL 2.1
-(same terms as mORMot 2 — see the mORMot LICENSE.md). This alignment is a
-prerequisite for upstream contribution.
-
-Final licensing and any Contributor terms are to be confirmed with
-Synopse Informatique (Arnaud Bouchez) and flydev as part of upstreaming.
+LandrixAI — mormot.ai.* extension for the Synopse mORMot 2 framework.
 
 Copyright (c) 2026 Landrix / Sven Harazim and contributors.
 
+License: the mORMot three-license (decided 2026-10-14).
+This work - source code, tests, demos, scripts, test data and its own
+documentation - is released under a disjunctive three-license giving the user
+the choice of one of the three following sets of licensing terms:
+  - Mozilla Public License, version 1.1 or later (MPL);
+  - GNU General Public License, version 2.0 or later (GPL);
+  - GNU Lesser General Public License, version 2.1 or later (LGPL), with the
+    linking exception of the FPC modified LGPL.
+The three licenses and the text of the linking exception are those stated in
+the "MPL 1.1/GPL 2.0/LGPL 2.1 three-license" section of mORMot 2's LICENCE.md:
+https://github.com/synopse/mORMot2/blob/master/LICENCE.md
+(The separate GPL 3.0 terms that mORMot applies to its own documentation do
+not apply here.)
+
 This project adopts mORMot-licensed code from flydev-fr/mormot2-extensions (see
-NOTICE); all other parts are original work. No code from any other third-party
-library is included.
+NOTICE); all other parts are original work. Code ported from third-party
+projects must come from MIT-licensed sources and keep their copyright notice
+(see NOTICE and docs/native-inference.md). The vendored MCP specification under
+docs/specs/ is not part of this work and keeps its own license.

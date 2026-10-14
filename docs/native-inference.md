@@ -72,6 +72,27 @@ und bge-m3 lokal sind nur dann austauschbar, wenn ihre Vektoren den Paritätstes
 die Referenz bestehen. Sonst muss neu indiziert werden. Im Konsumenten fehlt heute noch
 die Auswahl `provider` für Embeddings (die Backend-Fabrik kennt nur `none`/`lembed`).
 
+### Was die Engine hinter `ILlmClient` leisten muss
+
+Alles, was heute auf `ILlmClient` und `IEmbedder` aufsetzt, bleibt unverändert und
+funktioniert mit der Engine, **sobald** sie die jeweilige Fähigkeit liefert:
+- Agent-Loop `TLlmAgent`;
+- MCP-Brücke `mormot.ai.agent.mcp`;
+- Structured Output `ChatStructured`;
+- RAG `TLlmRag` und das MCP-Tool `search_docs`;
+- nativer Store.
+
+Die Fähigkeit selbst muss die Engine erbringen. Ein Cloud-Anbieter liefert sie über sein
+API mit:
+
+| Fähigkeit | über einen Anbieter | nativ |
+|---|---|---|
+| Chat + Streaming | ✓ | Phase 2: Tokens gehen direkt aus der Dekodier-Schleife an den Streaming-Callback |
+| Tool-Calls (Agent-Loop, MCP-Tools) | ✓ | Phase 2. Was die Engine dafür leisten muss:<br>• das Tool-Schema ins Chat-Template legen<br>• die Tool-Call-Ausgabe des Modells (bei Qwen3 JSON in `<tool_call>`) in `TLlmToolCall` übersetzen<br>Der Agent-Loop bleibt gleich. |
+| Structured Output | ✓ (`response_format`) | erst Prompt + Validierung. **Garantiert** nur mit eingeschränktem Dekodieren (JSON-Schema → Grammatik → Maske über die Logits), eigener Schritt nach Phase 2. |
+| Vision | ✓ | nicht geplant (bräuchte einen Bild-Encoder, etwa Qwen-VL) |
+| Embeddings für RAG | ✓ (`TProviderEmbedder`) | Phase 1 (`TNativeEmbedder`) |
+
 ### Designentscheidungen
 
 **Konfigurierbare Blöcke statt einer Klasse je Modell.** Ein Transformer-Block wird aus
@@ -133,8 +154,8 @@ erste Gewinn nicht hinter dem größten Umfang wartet.
 
 ### Phase 0 — Fundament
 
-- **Lizenz** festlegen (siehe „Offene Entscheidungen"). Das muss vor dem ersten
-  übernommenen Code geschehen.
+- ~~Lizenz festlegen~~ — **entschieden 2026-10-14**: mORMot-Dreifachlizenz
+  (MPL 1.1 / GPL 2.0 / LGPL 2.1) für das ganze Repo, auch für `src/infer/`.
 - Python-Referenzskript mit `transformers`, eingecheckt unter `tools/`. Folgendes wird
   festgelegt: Python- und Paketversionen, Modell-Revision und Hashes, FP32,
   `eval()`-Modus, Attention-Implementierung, Tokenizer-Einstellungen. Die verbindliche
@@ -358,7 +379,7 @@ einige Tage.
 **Pflichten:**
 - Bei Portierung den Copyright-Hinweis der Vorlage mitführen und die Herkunft je Datei
   festhalten.
-- Apache-2.0-Code wird **nicht** übernommen: Er ist mit GPLv2, einem Zweig der geplanten
+- Apache-2.0-Code wird **nicht** übernommen: Er ist mit GPLv2, einem Zweig der
   Dreifachlizenz, unverträglich und lässt sich nicht einfach umetikettieren.
 - Vor jeder Übernahme die aktuelle LICENSE-Datei der Vorlage prüfen. (Keine
   Rechtsberatung.)
@@ -376,13 +397,10 @@ einige Tage.
 
 ## Offene Entscheidungen
 
-1. **Lizenz:** `LICENSE` nennt die mORMot-Dreifachlizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1)
-   als **beabsichtigt**; die übernommenen MCP-Units verlangen sie. Der Entwurf schlägt MIT
-   als einfachste Lösung vor. Zu entscheiden ist, ob die Engine-Units (`src/infer/`) die
-   Dreifachlizenz des Repos erben oder ob das Repo insgesamt neu lizenziert wird. Die
-   MIT-Vorlagen passen zu beiden Varianten. Die Entscheidung muss vor dem ersten
-   portierten Code fallen.
-2. **Delphi-7-Portierung:** wann? Sie ist unabhängig von der Engine und dauert einige
-   Tage.
+1. ~~Lizenz~~ — **entschieden 2026-10-14**: mORMot-Dreifachlizenz für das ganze Repo,
+   auch für die Engine (`LICENSE`).
+2. ~~Zeitpunkt der Delphi-7-Portierung~~ — **entschieden 2026-10-14**: bald, **vor** dem
+   ersten Engine-Code. Dann entsteht die Engine von Anfang an unter dem
+   Delphi-7-Testskript, und niemand muss sie später zurückportieren.
 3. **Maximale Kontextlänge** für Embeddings: 512 Tokens wie im Vertrag v1, oder mehr? Das
    bestimmt den Speicherbedarf der Attention.

@@ -1485,7 +1485,15 @@ begin
     dv := _JsonFast(server.SubscriptionEndResponse(tools));
     doc := _Safe(dv);
     CheckEqual(VariantToUtf8(doc^.GetValueOrNull('id')), '1', 'correlated by id');
-    Check(doc^.GetValueIndex('result') >= 0, 'carries an (empty) result');
+    Check(doc^.GetAsDocVariant('result', params), 'carries a result');
+    // resultType is REQUIRED on every result (2026-07-28), the closing one too
+    CheckEqual(params^.U['resultType'], MCP_RESULT_COMPLETE,
+      'completion result carries resultType');
+    Check(params^.GetAsDocVariant('_meta', meta), 'result _meta');
+    CheckEqual(VariantToUtf8(meta^.GetValueOrNull(MCP_META_SUBSCRIPTION_ID)), '1',
+      'names the subscription it closes');
+    Check(meta^.GetValueIndex(MCP_META_SERVER_INFO) >= 0,
+      'and the server identity like every other result');
 
     // the cap exists so one client cannot take every HTTP worker thread
     CheckEqual(server.MaxSubscriptions, 8, 'bounded by default');

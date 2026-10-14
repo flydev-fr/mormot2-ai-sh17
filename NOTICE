@@ -26,8 +26,8 @@ Model Context Protocol — specification
   MIT to Apache-2.0 (new specification contributions are Apache-2.0, older
   contributions without relicensing consent remain MIT). The upstream license
   text is kept alongside the copy as docs/specs/mcp-2026-07-28/LICENSE.
-  Copied unmodified from commit db4bfcff3d60f5df01a21bdf6b78f7012cac4634
-  (2026-07-28). https://modelcontextprotocol.io
+  Copied unmodified from commit 3f6e5e17e2a83b47dfb37b20d159e0e27efa316c
+  (2026-09-22; first copy db4bfcff, 2026-07-28). https://modelcontextprotocol.io
   https://github.com/modelcontextprotocol/modelcontextprotocol
 
 JSON-RPC 2.0 — specification

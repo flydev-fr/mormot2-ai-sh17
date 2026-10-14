@@ -3158,8 +3158,10 @@ function TMcpServer.SubscriptionEndResponse(
 var
   res: variant;
 begin
-  // the JSON-RPC response to the long-lived request: an empty result that says
-  // "this ended on purpose", as opposed to a stream that just stops
+  // the JSON-RPC response to the long-lived request: a completion result that
+  // says "this ended on purpose", as opposed to a stream that just stops
+  // (CreateSuccessResponse stamps the mandatory resultType and the
+  // recommended serverInfo)
   res := _ObjFast(['_meta',
     _ObjFast([MCP_META_SUBSCRIPTION_ID, aSubscription.Id])]);
   result := fProcessor.CreateSuccessResponse(aSubscription.Id, res);

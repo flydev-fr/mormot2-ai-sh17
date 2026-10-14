@@ -16,8 +16,8 @@ Protokoll-Sessions, Batching, SSE-Resumability und der HTTP+SSE-Transport sind
 |---|---|
 | Quelle | https://github.com/modelcontextprotocol/modelcontextprotocol |
 | Pfad | `docs/specification/2026-07-28/` |
-| Commit | `db4bfcff3d60f5df01a21bdf6b78f7012cac4634` (2026-07-28) |
-| Geholt am | 2026-08-03 |
+| Commit | `3f6e5e17e2a83b47dfb37b20d159e0e27efa316c` (2026-09-22) |
+| Geholt am | 2026-10-14 (Erstkopie 2026-08-03 von `db4bfcff`; seither upstream nur zwei Klarstellungen: Abschlussergebnis von `subscriptions/listen` in `basic/patterns/subscriptions.mdx`, Tippfehler in `server/resources.mdx`) |
 | Umfang | 31 `.mdx`-Dateien inkl. `schema.mdx` (die vollständige TypeScript-Schema-Referenz) |
 
 ## Lizenz

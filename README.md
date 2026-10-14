@@ -30,9 +30,9 @@ crypto are the foundation, not a dependency we tolerate.
   range as mORMot2, down to **Delphi 7** (not there yet, see the plan).
 - **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
   provider wires) rather than chasing another library's changes.
-- **License MPL/GPL/LGPL** (still marked "intended" in `LICENSE`; the native engine plan
-  reopens the question for its units) — the adopted MCP units require it, and it composes with
-  MIT and LGPL-with-linking-exception.
+- **License MPL/GPL/LGPL** (the mORMot three-license, confirmed 2026-10-14 — also for the
+  native inference engine) — the adopted MCP units require it, and it composes with
+  MIT-licensed ported code and LGPL-with-linking-exception.
 
 ## Layout
 
