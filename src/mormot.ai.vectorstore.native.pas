@@ -1,5 +1,6 @@
 /// LandrixAI - native IVectorStore: plain SQLite tables + search in Pascal
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - replaces sqlite-vec (vec0) without any C extension: vectors are stored as a
 //   float32 BLOB column in an ordinary table (the single source of truth, one
 //   atomic row with text and key), and the nearest-neighbour search runs in
@@ -264,7 +265,8 @@ end;
   into a fixed array beats any heap here }
 
 type
-  TTopK = record
+  // object, not record, where the compiler has no methods on records (Delphi 7)
+  TTopK = {$ifdef USERECORDWITHMETHODS}record{$else}object{$endif}
     Score: array of double;
     RowId: array of Int64;
     Count, Capacity: integer;
@@ -387,7 +389,10 @@ begin
     else if RowIds[mid] > aRowId then
       hi := mid - 1
     else
-      exit(mid);
+    begin
+      result := mid;
+      exit;
+    end;
   end;
   result := -1;
 end;

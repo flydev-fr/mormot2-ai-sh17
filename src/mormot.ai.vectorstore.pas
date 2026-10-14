@@ -1,5 +1,6 @@
 /// LandrixAI - vector store abstraction (backend-neutral)
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - defines ONLY the IVectorStore interface, the TRagHit result and the float32
 //   blob helpers - NO storage backend. The RAG/agent engine depends on this unit
 //   alone, so it never drags in a concrete store's dependencies (e.g. the static

@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - structured (typed) output
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - constrains a completion to a record's JSON-Schema and loads the answer back
 //   into that record, reusing the very RTTI schema generator the MCP tools use
 //   (mormot.ai.mcp) - the same machine describes a tool's input and a model's output

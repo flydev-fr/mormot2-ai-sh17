@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - embeddings abstraction (backend-neutral)
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - defines ONLY the IEmbedder interface, so the RAG engine depends on this unit
 //   without pulling any concrete embedder (and its deps). Implementations live in
 //   sibling units:

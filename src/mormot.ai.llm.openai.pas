@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - provider configuration factories
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the OpenAI Chat Completions wire is canonical, so OpenAI, LiteLLM and Ollama
 //   are the same TLlmClient with a different TLlmProviderConfig
 unit mormot.ai.llm.openai;

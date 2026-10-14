@@ -1,5 +1,6 @@
 /// LandrixAI - local IEmbedder via sqlite-lembed (GGUF model in SQLite)
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - implements IEmbedder by running a GGUF embedding model INSIDE SQLite through
 //   the sqlite-lembed (lembed0) extension. The embedder OWNS a dedicated in-memory
 //   SQLite connection that hosts only lembed0 + the registered model - it is a
@@ -22,6 +23,7 @@ interface
 uses
   sysutils,
   mormot.core.base,
+  mormot.core.unicode, // Utf8ToString
   mormot.core.text, // ESynException
   mormot.core.os,   // TOSLightLock
   mormot.db.raw.sqlite3,

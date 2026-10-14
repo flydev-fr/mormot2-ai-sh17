@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - provider-neutral domain types
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room implementation from public provider API docs (OpenAI/Ollama);
 //   no third-party code, target license MPL/GPL/LGPL (mORMot contribution)
 // - the OpenAI Chat Completions schema is the canonical wire format: LiteLLM and

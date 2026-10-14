@@ -1,5 +1,6 @@
 /// LandrixAI - shared SQLite helpers for the mormot.ai.* SQLite backends
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - RollbackIfOpen: the transaction-recovery rule every SQLite-backed store needs
 //   (mORMot's Commit clears its flag even when COMMIT fails)
 // - run-time extension loading (sqlite-vec / sqlite-lembed): mORMot does not bind

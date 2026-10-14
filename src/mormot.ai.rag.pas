@@ -1,5 +1,6 @@
 /// LandrixAI - Retrieval-Augmented Generation orchestration
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - ties an IEmbedder (provider or local lembed) + an IVectorStore (sqlite-vec)
 //   to the LLM client: ingest chunks the text, embeds and stores it; query
 //   embeds the question, retrieves the nearest chunks and asks the model to

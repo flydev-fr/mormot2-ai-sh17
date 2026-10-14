@@ -24,14 +24,24 @@ type
     text: RawUtf8;
   end;
 
-  TEchoTool = class(TMcpToolBase<TEchoParams>)
+  TEchoToolBase = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TEchoParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+
+  TEchoTool = class(TEchoToolBase)
   protected
     function ExecuteTyped(const aParams: TEchoParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
   // a tool that reports an MCP tool-level failure (result.isError per the spec)
-  TFailTool = class(TMcpToolBase<TEchoParams>)
+  TFailTool = class(TEchoToolBase)
   protected
     function ExecuteTyped(const aParams: TEchoParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -51,6 +61,19 @@ type
 implementation
 
 { TEchoTool }
+
+{ TEchoToolBase }
+
+constructor TEchoToolBase.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TEchoParams), aName, aDescription);
+end;
+
+function TEchoToolBase.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TEchoParams(aParams), aAuthCtx);
+end;
 
 function TEchoTool.ExecuteTyped(const aParams: TEchoParams;
   const aAuthCtx: TMcpAuthContext): variant;

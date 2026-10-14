@@ -33,7 +33,6 @@ uses
   mormot.core.data,
   mormot.core.variants,
   mormot.core.json,
-  mormot.core.collections,
   mormot.core.threads,
   mormot.core.interfaces,
   mormot.core.log, // sllWarning when a foreign token verifier throws
@@ -1059,16 +1058,23 @@ type
   end;
 
 
-{ ************ Generic Tool Base Class }
+{ ************ Typed Tool Base Classes }
 
 type
-  /// Generic base class for strongly-typed MCP tools
-  // - T is the input parameters record type
-  // - automatically generates JSON schema from T's RTTI
-  TMcpToolBase<T: record> = class(TInterfacedObject, IMcpTool)
+  /// base class for MCP tools whose arguments are parsed into a record
+  // - not generic, so it builds on every compiler mORMot 2 supports, Delphi 7
+  //   included; TMcpToolBase<T> below is a thin typed shell over it wherever
+  //   the compiler has generics
+  // - the record is described by its RTTI: the JSON schema, the required and
+  //   type checks and the parsing all come from it. On a compiler without
+  //   extended record RTTI (Delphi 7, FPC 3.2) register the layout once with
+  //   Rtti.RegisterFromText before the first call - otherwise the record has
+  //   no fields to publish or to fill
+  TMcpRecordTool = class(TInterfacedObject, IMcpTool)
   protected
     fName: RawUtf8;
     fDescription: RawUtf8;
+    fParamsInfo: PRttiInfo;
     // property path -> header name, applied on top of the generated schema
     fMirrored: TMcpHeaderParamDynArray;
     // lowercased names of the parameters a caller may omit (MarkOptional)
@@ -1080,11 +1086,22 @@ type
     // - arguments the record does not declare are not judged here: they are
     //   tolerated on purpose (see TypedToolRefusesArgumentsThatDoNotParse)
     function InvalidArguments(aArgs: PDocVariantData): RawUtf8;
-    /// override this to implement tool logic
-    function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+    /// the RTTI of the argument record
+    // - raises EMcpException when the tool was built without CreateTyped (the
+    //   inherited parameterless Create): no record, nothing to publish or parse
+    function ParamsRtti: TRttiCustom;
+    /// override this to implement the tool logic
+    // - aParams is the parsed argument record, of the type given to
+    //   CreateTyped: cast it to that type, e.g. TMyParams(aParams)
+    // - the record is zeroed, filled from the arguments, and finalized again
+    //   after this call - never keep a pointer to it
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
-    /// initialize with tool name and description
-    constructor Create(const aName, aDescription: RawUtf8); virtual;
+    /// initialize with the record type of the arguments, a name and a description
+    // - raises EMcpException if aParamsInfo is not a record type
+    constructor CreateTyped(aParamsInfo: PRttiInfo;
+      const aName, aDescription: RawUtf8);
     /// mirror one parameter into the `Mcp-Param-<aHeaderName>` HTTP request
     /// header, so intermediaries can route on it without parsing the body
     // - aPropertyPath is the dotted path from the schema root ('region', or
@@ -1115,7 +1132,28 @@ type
     function GetDescription: RawUtf8;
     function GetInputSchema: variant;
     function Execute(const aArgs: variant; const aAuthCtx: TMcpAuthContext): variant;
+    /// the record type the arguments are parsed into
+    property ParamsInfo: PRttiInfo
+      read fParamsInfo;
   end;
+
+{$ifdef HASGENERICS}
+  /// Generic base class for strongly-typed MCP tools
+  // - T is the input parameters record type
+  // - automatically generates JSON schema from T's RTTI
+  // - only a typed shell over TMcpRecordTool: everything but the typed
+  //   ExecuteTyped lives there, so both compile the same checks
+  TMcpToolBase<T: record> = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    /// override this to implement tool logic
+    function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    /// initialize with tool name and description
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+{$endif HASGENERICS}
 
 
 { ************ Resource Base Class }
@@ -1145,15 +1183,24 @@ type
 { ************ Main MCP Server with Registry }
 
 type
+  /// value arrays of the TMcpServer registries (TSynDictionary needs their RTTI)
+  TMcpToolDynArray = array of IMcpTool;
+  TMcpResourceDynArray = array of IMcpResource;
+  TMcpPromptDynArray = array of IMcpPrompt;
+  TMcpResourceTemplateDynArray = array of IMcpResourceTemplate;
+
   /// Main MCP server with tool/resource registry
   // - thread-safe registration and execution
   // - processes JSON-RPC requests
   TMcpServer = class(TSynPersistent)
   private
-    fTools: IKeyValue<RawUtf8, IMcpTool>; // name -> IMcpTool
-    fResources: IKeyValue<RawUtf8, IMcpResource>; // uri -> IMcpResource
-    fPrompts: IKeyValue<RawUtf8, IMcpPrompt>; // name -> IMcpPrompt
-    fTemplates: IKeyValue<RawUtf8, IMcpResourceTemplate>; // uriTemplate -> impl
+    // the registries: plain TSynDictionary (keys case-sensitive, one value per
+    // key) instead of generic collections, so the core builds on every
+    // compiler; the values are the matching interface, see the Create
+    fTools: TSynDictionary; // name -> IMcpTool
+    fResources: TSynDictionary; // uri -> IMcpResource
+    fPrompts: TSynDictionary; // name -> IMcpPrompt
+    fTemplates: TSynDictionary; // uriTemplate -> IMcpResourceTemplate
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
@@ -1221,6 +1268,7 @@ type
     function CompleteArgument(const aParams: variant;
       const aAuthCtx: TMcpAuthContext): variant;
     /// sorted key snapshot of a registry, taken under the lock
+    function SortedKeys(aRegistry: TSynDictionary): TRawUtf8DynArray;
     function SortedToolNames: TRawUtf8DynArray;
     function SortedResourceUris: TRawUtf8DynArray;
     function SortedPromptNames: TRawUtf8DynArray;
@@ -1761,7 +1809,10 @@ begin
     // `host/api/v1/mcp/.well-known/oauth-protected-resource`. Two functions that
     // exist to name ONE location must never answer differently — a caller has no
     // way to tell which of them is lying.
-    exit('');
+  begin
+    result := '';
+    exit;
+  end;
   slash := PosEx('/', aResource, slash + 3);
   if slash = 0 then
     result := aResource // scheme://host, no path
@@ -1785,7 +1836,10 @@ begin
     if n = 0 then
       continue;
     if aGranted[i] = aRequired then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
     // a broader scope implies the narrower ones BELOW it: the granted string
     // must be a prefix of the required one AND end exactly on a ':' boundary,
     // or `file` would silently cover `files:write`
@@ -1793,7 +1847,10 @@ begin
        (length(aRequired) > n) and
        (aRequired[n + 1] = ':') and
        CompareMem(pointer(aGranted[i]), pointer(aRequired), n) then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
   end;
 end;
 
@@ -1907,7 +1964,10 @@ begin
   // "an empty string is a valid cursor": it names no position, so the page
   // starts at the beginning — the same place an absent cursor starts.
   if aCursor = '' then
-    exit(true);
+  begin
+    result := true;
+    exit;
+  end;
   plain := Base64uriToBin(aCursor);
   // Base64uriToBin returns '' on anything it cannot decode; combined with the
   // marker check below, a forged or truncated token is rejected rather than
@@ -2137,8 +2197,8 @@ begin
       aMax := 65535;
     roSLong:
       begin
-        aMin := -2147483648;
-        aMax := 2147483647;
+        aMin := Low(integer); // not -2147483648: Delphi 7 negates a literal
+        aMax := High(integer); // 2147483648 and reports an overflow
       end;
     roULong:
       aMax := 4294967295;
@@ -2193,7 +2253,9 @@ begin
     judged := jBoolean
   else if (info = TypeInfo(RawUtf8)) or
           (info = TypeInfo(string)) or
+          {$ifdef HASVARUSTRING}
           (info = TypeInfo(UnicodeString)) or
+          {$endif HASVARUSTRING}
           (info = TypeInfo(WideString)) then
     judged := jString
   else if (info = TypeInfo(Double)) or
@@ -2357,8 +2419,7 @@ end;
 
 function TMcpJsonRpcProcessor.ExtractRequestId(const aRequest: variant): variant;
 begin
-  with _Safe(aRequest)^ do
-    result := GetValueOrNull('id');
+  result := _Safe(aRequest)^.GetValueOrNull('id');
 end;
 
 function TMcpJsonRpcProcessor.CreateResponse(const aRequestId: variant): variant;
@@ -2554,7 +2615,7 @@ begin
   // mistake in the server itself, not something a client did
   if not McpIsValidExtensionId(aId) then
     raise EMcpException.CreateUtf8(
-      '%.RegisterExtension: invalid extension id "%" — an identifier needs a ' +
+      '%.RegisterExtension: invalid extension id "%" - an identifier needs a ' +
       'prefix ("com.example/name"), see the _meta key naming rules', [self, aId]);
   fExtensionsSafe.Lock;
   try
@@ -2634,26 +2695,43 @@ begin
 end;
 
 
-{ ************ TMcpToolBase<T> Implementation }
+{ ************ TMcpRecordTool / TMcpToolBase<T> Implementation }
 
-constructor TMcpToolBase<T>.Create(const aName, aDescription: RawUtf8);
+constructor TMcpRecordTool.CreateTyped(aParamsInfo: PRttiInfo;
+  const aName, aDescription: RawUtf8);
 begin
   inherited Create;
+  // checked here, at wiring time: anything but a record would only fail on the
+  // first call, with a schema that silently published no parameters
+  if (aParamsInfo = nil) or
+     not (aParamsInfo^.Kind in rkRecordTypes) then
+    raise EMcpException.CreateUtf8(
+      '%.CreateTyped("%"): the arguments must be described by a record type',
+      [self, aName]);
+  fParamsInfo := aParamsInfo;
   fName := aName;
   fDescription := aDescription;
 end;
 
-function TMcpToolBase<T>.GetName: RawUtf8;
+function TMcpRecordTool.ParamsRtti: TRttiCustom;
+begin
+  if fParamsInfo = nil then
+    raise EMcpException.CreateUtf8('%("%") was created without CreateTyped: ' +
+      'it has no parameter record', [self, fName]);
+  result := Rtti.RegisterType(fParamsInfo);
+end;
+
+function TMcpRecordTool.GetName: RawUtf8;
 begin
   result := fName;
 end;
 
-function TMcpToolBase<T>.GetDescription: RawUtf8;
+function TMcpRecordTool.GetDescription: RawUtf8;
 begin
   result := fDescription;
 end;
 
-procedure TMcpToolBase<T>.MirrorToHeader(const aPropertyPath, aHeaderName: RawUtf8);
+procedure TMcpRecordTool.MirrorToHeader(const aPropertyPath, aHeaderName: RawUtf8);
 var
   n: PtrInt;
 begin
@@ -2670,14 +2748,14 @@ begin
   GetInputSchema;
 end;
 
-procedure TMcpToolBase<T>.MarkOptional(const aPropertyNames: array of RawUtf8);
+procedure TMcpRecordTool.MarkOptional(const aPropertyNames: array of RawUtf8);
 var
   rc: TRttiCustom;
   i, k: PtrInt;
   name: RawUtf8;
   known: boolean;
 begin
-  rc := Rtti.RegisterType(System.TypeInfo(T));
+  rc := ParamsRtti;
   for i := 0 to high(aPropertyNames) do
   begin
     name := LowerCaseU(aPropertyNames[i]);
@@ -2700,14 +2778,14 @@ begin
   end;
 end;
 
-function TMcpToolBase<T>.MissingRequired(aArgs: PDocVariantData): RawUtf8;
+function TMcpRecordTool.MissingRequired(aArgs: PDocVariantData): RawUtf8;
 var
   rc: TRttiCustom;
   i: PtrInt;
   name: RawUtf8;
 begin
   result := '';
-  rc := Rtti.RegisterType(System.TypeInfo(T));
+  rc := ParamsRtti;
   if rc = nil then
     exit;
   for i := 0 to rc.Props.Count - 1 do
@@ -2727,7 +2805,7 @@ begin
     SetLength(result, length(result) - 2);
 end;
 
-function TMcpToolBase<T>.InvalidArguments(aArgs: PDocVariantData): RawUtf8;
+function TMcpRecordTool.InvalidArguments(aArgs: PDocVariantData): RawUtf8;
 var
   rc: TRttiCustom;
   i, j: PtrInt;
@@ -2737,7 +2815,7 @@ begin
   if (aArgs = nil) or
      not aArgs^.IsObject then
     exit; // not an object at all: RecordLoadJson refuses it below
-  rc := Rtti.RegisterType(System.TypeInfo(T));
+  rc := ParamsRtti;
   if rc = nil then
     exit;
   // walk what was SENT, not what the record declares: the loader matches names
@@ -2759,14 +2837,13 @@ begin
     SetLength(result, length(result) - 2);
 end;
 
-function TMcpToolBase<T>.GetInputSchema: variant;
+function TMcpRecordTool.GetInputSchema: variant;
 var
-  typeInfo: PRttiInfo;
   schema, node: PDocVariantData;
   i, k, idx: PtrInt;
 begin
-  typeInfo := System.TypeInfo(T);
-  result := TMcpSchemaGenerator.GenerateSchema(typeInfo, fOptional, {aToolInput=}true);
+  result := TMcpSchemaGenerator.GenerateSchema(ParamsRtti.Info, fOptional,
+    {aToolInput=}true);
   if fMirrored = nil then
     exit;
   schema := _Safe(result);
@@ -2794,10 +2871,10 @@ begin
   McpCollectHeaderParams(result);
 end;
 
-function TMcpToolBase<T>.Execute(const aArgs: variant; 
+function TMcpRecordTool.Execute(const aArgs: variant;
   const aAuthCtx: TMcpAuthContext): variant;
 var
-  params: T;
+  params: TSynTempBuffer; // the argument record: on the stack up to 4 KB
   doc: PDocVariantData;
   json, missing, invalid: RawUtf8;
 begin
@@ -2857,21 +2934,43 @@ begin
   // (schema.mdx CallToolRequestParams), so a mismatch against the TOOL's own
   // inputSchema is not an envelope violation. Same shape as the rag tool's
   // empty-query refusal.
-  RecordZero(@params, TypeInfo(T));
-  if not RecordLoadJson(params, json, TypeInfo(T)) then
-  begin
-    result := _ObjFast([
-      'content', _Arr([_ObjFast([
-        'type', 'text',
-        'text', 'Invalid arguments: they do not match the input schema ' +
-                'this tool declares. Check the types and send them again.'])]),
-      'isError', true]);
-    exit;
+  // The buffer is zeroed (InitZero) and finalized below whatever happens: the
+  // parser may have filled managed fields (strings, dynamic arrays) before it
+  // failed, and ExecuteRecord may raise.
+  params.InitZero(ParamsRtti.Size);
+  try
+    if not RecordLoadJson(params.buf^, json, fParamsInfo) then
+    begin
+      result := _ObjFast([
+        'content', _Arr([_ObjFast([
+          'type', 'text',
+          'text', 'Invalid arguments: they do not match the input schema ' +
+                  'this tool declares. Check the types and send them again.'])]),
+        'isError', true]);
+      exit;
+    end;
+    // Execute typed implementation
+    result := ExecuteRecord(params.buf^, aAuthCtx);
+  finally
+    FastRecordClear(params.buf, fParamsInfo);
+    params.Done;
   end;
-
-  // Execute typed implementation
-  result := ExecuteTyped(params, aAuthCtx);
 end;
+
+{$ifdef HASGENERICS}
+
+constructor TMcpToolBase<T>.Create(const aName, aDescription: RawUtf8);
+begin
+  CreateTyped(System.TypeInfo(T), aName, aDescription);
+end;
+
+function TMcpToolBase<T>.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(T(aParams), aAuthCtx);
+end;
+
+{$endif HASGENERICS}
 
 
 { ************ TMcpResourceBase Implementation }
@@ -2918,10 +3017,14 @@ begin
   inherited Create;
   fSafe.Init;
   fProcessor := TMcpJsonRpcProcessor.Create(aServerName, aServerVersion);
-  fTools := Collections.NewPlainKeyValue<RawUtf8, IMcpTool>;
-  fResources := Collections.NewPlainKeyValue<RawUtf8, IMcpResource>;
-  fPrompts := Collections.NewPlainKeyValue<RawUtf8, IMcpPrompt>;
-  fTemplates := Collections.NewPlainKeyValue<RawUtf8, IMcpResourceTemplate>;
+  fTools := TSynDictionary.Create(
+    TypeInfo(TRawUtf8DynArray), TypeInfo(TMcpToolDynArray));
+  fResources := TSynDictionary.Create(
+    TypeInfo(TRawUtf8DynArray), TypeInfo(TMcpResourceDynArray));
+  fPrompts := TSynDictionary.Create(
+    TypeInfo(TRawUtf8DynArray), TypeInfo(TMcpPromptDynArray));
+  fTemplates := TSynDictionary.Create(
+    TypeInfo(TRawUtf8DynArray), TypeInfo(TMcpResourceTemplateDynArray));
   fActive := false;
   fListCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
   fReadCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
@@ -3038,6 +3141,7 @@ begin
     for i := 0 to high(fSubscriptions) do
     begin
       sub := fSubscriptions[i];
+      wants := false; // every branch below sets it or raises - for the compiler
       if aNotification = 'notifications/tools/list_changed' then
         wants := sub.Filter.ToolsListChanged
       else if aNotification = 'notifications/prompts/list_changed' then
@@ -3238,8 +3342,10 @@ begin
   finally
     fSubscriptionSafe.UnLock;
   end;
-  fTools := nil;
-  fResources := nil;
+  fTools.Free;
+  fResources.Free;
+  fPrompts.Free;
+  fTemplates.Free;
   fProcessor.Free;
   fSubscriptionSafe.Done;
   fSafe.Done;
@@ -3260,10 +3366,12 @@ begin
   if not McpCheckSchema(aTool.GetInputSchema, fSchemaMaxDepth, fSchemaMaxNodes,
        reason) then
     raise EMcpException.CreateUtf8(
-      '%.RegisterTool("%"): unusable inputSchema — %', [self, name, reason]);
+      '%.RegisterTool("%"): unusable inputSchema - %', [self, name, reason]);
   fSafe.Lock;
   try
-    fTools.Add(name, aTool);
+    if fTools.Add(name, aTool) < 0 then
+      raise EMcpException.CreateUtf8(
+        '%.RegisterTool: a tool named "%" is already registered', [self, name]);
   finally
     fSafe.UnLock;
   end;
@@ -3281,7 +3389,9 @@ begin
   uri := aResource.GetUri;
   fSafe.Lock;
   try
-    fResources.Add(uri, aResource);
+    if fResources.Add(uri, aResource) < 0 then
+      raise EMcpException.CreateUtf8(
+        '%.RegisterResource: "%" is already registered', [self, uri]);
   finally
     fSafe.UnLock;
   end;
@@ -3292,7 +3402,7 @@ function TMcpServer.UnregisterTool(const aName: RawUtf8): boolean;
 begin
   fSafe.Lock;
   try
-    result := fTools.Remove(aName);
+    result := fTools.Delete(aName) >= 0;
   finally
     fSafe.UnLock;
   end;
@@ -3304,7 +3414,7 @@ function TMcpServer.UnregisterResource(const aUri: RawUtf8): boolean;
 begin
   fSafe.Lock;
   try
-    result := fResources.Remove(aUri);
+    result := fResources.Delete(aUri) >= 0;
   finally
     fSafe.UnLock;
   end;
@@ -3321,7 +3431,9 @@ begin
   name := aPrompt.GetName;
   fSafe.Lock;
   try
-    fPrompts.Add(name, aPrompt);
+    if fPrompts.Add(name, aPrompt) < 0 then
+      raise EMcpException.CreateUtf8(
+        '%.RegisterPrompt: a prompt named "%" is already registered', [self, name]);
   finally
     fSafe.UnLock;
   end;
@@ -3332,7 +3444,7 @@ function TMcpServer.UnregisterPrompt(const aName: RawUtf8): boolean;
 begin
   fSafe.Lock;
   try
-    result := fPrompts.Remove(aName);
+    result := fPrompts.Delete(aName) >= 0;
   finally
     fSafe.UnLock;
   end;
@@ -3383,80 +3495,43 @@ begin
   result := fActive;
 end;
 
-function TMcpServer.SortedToolNames: TRawUtf8DynArray;
+function TMcpServer.SortedKeys(aRegistry: TSynDictionary): TRawUtf8DynArray;
 var
-  pair: TPair<RawUtf8, IMcpTool>;
-  n: PtrInt;
+  keys: PRawUtf8Array;
+  i: PtrInt;
 begin
   result := nil;
   fSafe.Lock;
   try
-    SetLength(result, fTools.Count);
-    n := 0;
-    for pair in fTools do
-    begin
-      result[n] := pair.Key;
-      inc(n);
-    end;
+    SetLength(result, aRegistry.Count);
+    keys := aRegistry.Keys.Value^;
+    for i := 0 to high(result) do
+      result[i] := keys[i];
   finally
     fSafe.UnLock;
   end;
-  // A dictionary enumerates in hash order, which is neither stable across
-  // insertions nor the same on two machines. Pagination over that would repeat
-  // some tools and skip others; even unpaginated it would make tools/list a
-  // moving target for caches and diffs. Sorting is the cheapest way to make the
-  // list a well-defined sequence.
+  // sorted, so every listing is a well-defined sequence (see the note below)
   QuickSortRawUtf8(result, length(result));
+end;
+
+function TMcpServer.SortedToolNames: TRawUtf8DynArray;
+begin
+  result := SortedKeys(fTools);
 end;
 
 function TMcpServer.SortedResourceUris: TRawUtf8DynArray;
-var
-  pair: TPair<RawUtf8, IMcpResource>;
-  n: PtrInt;
 begin
-  result := nil;
-  fSafe.Lock;
-  try
-    SetLength(result, fResources.Count);
-    n := 0;
-    for pair in fResources do
-    begin
-      result[n] := pair.Key;
-      inc(n);
-    end;
-  finally
-    fSafe.UnLock;
-  end;
-  QuickSortRawUtf8(result, length(result));
+  result := SortedKeys(fResources);
 end;
 
-// The four Sorted*() below are deliberately four near-identical functions rather
-// than one generic helper: IKeyValue<RawUtf8,T> would need a generic method, and
-// the FPC/Delphi generic surface is exactly where this codebase has to stay
-// boring. What matters is that NONE of them may drop the QuickSortRawUtf8 call —
-// a registry enumerated in hash order breaks pagination (repeats and gaps), and
-// the compiler cannot tell you about it. A fifth registry copied from here must
-// keep both the lock and the sort.
+// Every registry listing goes through SortedKeys: a dictionary enumerates in
+// hash order, which is neither stable across insertions nor the same on two
+// machines. Pagination over that would repeat some entries and skip others;
+// even unpaginated it would make the lists a moving target for caches and diffs.
 
 function TMcpServer.SortedPromptNames: TRawUtf8DynArray;
-var
-  pair: TPair<RawUtf8, IMcpPrompt>;
-  n: PtrInt;
 begin
-  result := nil;
-  fSafe.Lock;
-  try
-    SetLength(result, fPrompts.Count);
-    n := 0;
-    for pair in fPrompts do
-    begin
-      result[n] := pair.Key;
-      inc(n);
-    end;
-  finally
-    fSafe.UnLock;
-  end;
-  QuickSortRawUtf8(result, length(result));
+  result := SortedKeys(fPrompts);
 end;
 
 function TMcpServer.ListPrompts(const aParams: variant): variant;
@@ -3479,7 +3554,7 @@ begin
   begin
     fSafe.Lock;
     try
-      if not fPrompts.TryGetValue(names[i], prompt) then
+      if not fPrompts.FindAndCopy(names[i], prompt) then
         prompt := nil;
     finally
       fSafe.UnLock;
@@ -3535,7 +3610,7 @@ begin
 
   fSafe.Lock;
   try
-    if not fPrompts.TryGetValue(promptName, prompt) then
+    if not fPrompts.FindAndCopy(promptName, prompt) then
       // "Invalid prompt name: -32602" — naming something that does not exist is
       // bad input, not a server failure
       raise EMcpInvalidParams.CreateUtf8('Prompt not found: %', [promptName]);
@@ -3578,7 +3653,9 @@ begin
   uri := aTemplate.GetUriTemplate;
   fSafe.Lock;
   try
-    fTemplates.Add(uri, aTemplate);
+    if fTemplates.Add(uri, aTemplate) < 0 then
+      raise EMcpException.CreateUtf8(
+        '%.RegisterResourceTemplate: "%" is already registered', [self, uri]);
   finally
     fSafe.UnLock;
   end;
@@ -3591,7 +3668,7 @@ function TMcpServer.UnregisterResourceTemplate(const aUriTemplate: RawUtf8): boo
 begin
   fSafe.Lock;
   try
-    result := fTemplates.Remove(aUriTemplate);
+    result := fTemplates.Delete(aUriTemplate) >= 0;
   finally
     fSafe.UnLock;
   end;
@@ -3607,7 +3684,7 @@ begin
   result := nil;
   fSafe.Lock;
   try
-    if not fTools.TryGetValue(aToolName, tool) then
+    if not fTools.FindAndCopy(aToolName, tool) then
       tool := nil;
   finally
     fSafe.UnLock;
@@ -3631,24 +3708,8 @@ begin
 end;
 
 function TMcpServer.SortedTemplateUris: TRawUtf8DynArray;
-var
-  pair: TPair<RawUtf8, IMcpResourceTemplate>;
-  n: PtrInt;
 begin
-  result := nil;
-  fSafe.Lock;
-  try
-    SetLength(result, fTemplates.Count);
-    n := 0;
-    for pair in fTemplates do
-    begin
-      result[n] := pair.Key;
-      inc(n);
-    end;
-  finally
-    fSafe.UnLock;
-  end;
-  QuickSortRawUtf8(result, length(result));
+  result := SortedKeys(fTemplates);
 end;
 
 function TMcpServer.ListResourceTemplates(const aParams: variant): variant;
@@ -3671,7 +3732,7 @@ begin
   begin
     fSafe.Lock;
     try
-      if not fTemplates.TryGetValue(uris[i], tpl) then
+      if not fTemplates.FindAndCopy(uris[i], tpl) then
         tpl := nil;
     finally
       fSafe.UnLock;
@@ -3744,7 +3805,7 @@ begin
     refName := refDoc^.U['name'];
     fSafe.Lock;
     try
-      if not fPrompts.TryGetValue(refName, prompt) then
+      if not fPrompts.FindAndCopy(refName, prompt) then
         prompt := nil;
     finally
       fSafe.UnLock;
@@ -3759,7 +3820,7 @@ begin
     refName := refDoc^.U['uri'];
     fSafe.Lock;
     try
-      if not fTemplates.TryGetValue(refName, tpl) then
+      if not fTemplates.FindAndCopy(refName, tpl) then
         tpl := nil;
     finally
       fSafe.UnLock;
@@ -3821,7 +3882,7 @@ begin
     // snapshot and here simply drops out of this page rather than raising.
     fSafe.Lock;
     try
-      if not fTools.TryGetValue(names[i], tool) then
+      if not fTools.FindAndCopy(names[i], tool) then
         tool := nil;
     finally
       fSafe.UnLock;
@@ -3860,7 +3921,7 @@ begin
   begin
     fSafe.Lock;
     try
-      if not fResources.TryGetValue(uris[i], res) then
+      if not fResources.FindAndCopy(uris[i], res) then
         res := nil;
     finally
       fSafe.UnLock;
@@ -4247,7 +4308,10 @@ begin
   // either. The local also keeps the instance alive for the call.
   verifier := fTokenVerifier;
   if verifier = nil then
-    exit(mtrValid); // authorization is OPTIONAL and not switched on here
+  begin
+    result := mtrValid; // authorization is OPTIONAL and not switched on here
+    exit;
+  end;
   if fAuthResource = '' then
     // Fail CLOSED. Without a canonical URI the audience check is undefined, and
     // "MUST only accept tokens specifically intended for themselves" cannot be
@@ -4255,7 +4319,10 @@ begin
     raise EMcpException.CreateU('AuthResource must be set before a ' +
       'TokenVerifier: there is no audience to validate against otherwise');
   if aToken = '' then
-    exit(mtrMissing);
+  begin
+    result := mtrMissing;
+    exit;
+  end;
   try
     result := verifier.VerifyToken(aToken, fAuthResource, aAuthCtx);
   except
@@ -4343,7 +4410,7 @@ begin
 
   fSafe.Lock;
   try
-    if not fTools.TryGetValue(toolName, tool) then
+    if not fTools.FindAndCopy(toolName, tool) then
       // -32602, not -32603: naming something that does not exist is bad input,
       // not a server failure (and -32002 was removed in 2026-07-28)
       raise EMcpInvalidParams.CreateUtf8('Tool not found: %', [toolName]);
@@ -4377,7 +4444,7 @@ begin
   begin
     fSafe.Lock;
     try
-      if not fTemplates.TryGetValue(uris[i], tpl) then
+      if not fTemplates.FindAndCopy(uris[i], tpl) then
         tpl := nil;
     finally
       fSafe.UnLock;
@@ -4415,7 +4482,7 @@ begin
 
   fSafe.Lock;
   try
-    if not fResources.TryGetValue(uri, resource) then
+    if not fResources.FindAndCopy(uri, resource) then
       resource := nil;
   finally
     fSafe.UnLock;
@@ -4542,7 +4609,8 @@ begin
   if VarIsVoid(aRequestId) then
   begin
     aHttpStatus := HTTP_MCP_SUCCESS;
-    exit(true);
+    result := true;
+    exit;
   end;
 
   // Every request must carry its protocol version and client capabilities:
@@ -4887,7 +4955,10 @@ var
     if aRef = '' then
       exit;
     if aRef[1] = '#' then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
     if (length(aRef) >= 2) and
        (aRef[1] = '/') and
        (aRef[2] = '/') then
@@ -5051,7 +5122,8 @@ begin
       begin
         aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
           mirrored[i].Name + ' was sent but the argument is absent';
-        exit(false);
+        result := false;
+        exit;
       end;
       continue;
     end;
@@ -5059,7 +5131,8 @@ begin
     begin
       aErrorMsg := 'Header mismatch: missing required header ' +
         MCP_PARAM_HEADER_PREFIX + mirrored[i].Name;
-      exit(false);
+      result := false;
+      exit;
     end;
     headerValue := McpDecodeHeaderValue(headerValue);
     if VarIsEmptyOrNull(value) then
@@ -5076,7 +5149,8 @@ begin
         aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
           mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
           bodyValue + '''';
-        exit(false);
+        result := false;
+        exit;
       end;
     end
     else if headerValue <> bodyValue then
@@ -5084,7 +5158,8 @@ begin
       aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
         mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
         bodyValue + '''';
-      exit(false);
+      result := false;
+      exit;
     end;
   end;
 end;

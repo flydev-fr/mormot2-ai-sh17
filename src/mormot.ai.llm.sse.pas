@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - Server-Sent-Events stream parser
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room from the SSE (text/event-stream) and OpenAI streaming specs;
 //   no third-party code, target license MPL/GPL/LGPL (mORMot contribution)
 unit mormot.ai.llm.sse;

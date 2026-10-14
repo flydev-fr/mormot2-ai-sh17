@@ -1,4 +1,4 @@
-﻿/// MCP Transport Layer - HTTP and Streamable HTTP Implementations
+/// MCP Transport Layer - HTTP and Streamable HTTP Implementations
 // - this unit is part of the mormot-mcp-server project
 // - licensed under MPL/GPL/LGPL three license
 // - adopted into the mormot.ai.* namespace for landrix (LandrixAI) from
@@ -336,7 +336,10 @@ begin
   // token yet, so requiring one would make discovery impossible
   Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
   if not fServer.IsProtected then
-    exit(HTTP_NOTFOUND); // nothing to discover on an open server
+  begin
+    result := HTTP_NOTFOUND; // nothing to discover on an open server
+    exit;
+  end;
   result := Ctxt.SetOutJson(fServer.ProtectedResourceMetadata);
 end;
 
@@ -351,7 +354,10 @@ begin
 
   // Handle OPTIONS preflight
   if Ctxt.Method = 'OPTIONS' then
-    exit(HTTP_NOCONTENT);
+  begin
+    result := HTTP_NOCONTENT;
+    exit;
+  end;
 
   // Handle GET for server info
   if Ctxt.Method = 'GET' then
@@ -364,7 +370,8 @@ begin
   if Ctxt.Method <> 'POST' then
   begin
     Ctxt.SetOutJson('{"error":"Only POST method supported"}');
-    exit(HTTP_BADREQUEST);
+    result := HTTP_BADREQUEST;
+    exit;
   end;
 
   // Authorization before the body is even read: "MCP servers MUST validate
@@ -375,7 +382,8 @@ begin
   begin
     Ctxt.SetOutCustomHeader(['WWW-Authenticate', fServer.AuthChallenge(tokenResult)]);
     Ctxt.SetOutJson('{"error":"' + MCP_TOKEN_ERROR[tokenResult] + '"}');
-    exit(fServer.AuthHttpStatus(tokenResult));
+    result := fServer.AuthHttpStatus(tokenResult);
+    exit;
   end;
 
   // Read request body
@@ -393,12 +401,16 @@ begin
     Ctxt.SetOutCustomHeader(['WWW-Authenticate',
       fServer.AuthChallenge(mtrInsufficientScope, scopeChallenge)]);
     Ctxt.SetOutJson(responseBody);
-    exit(HTTP_MCP_FORBIDDEN);
+    result := HTTP_MCP_FORBIDDEN;
+    exit;
   end;
 
   // Send response
   if responseBody = '' then
-    exit(HTTP_NOCONTENT);
+  begin
+    result := HTTP_NOCONTENT;
+    exit;
+  end;
 
   Ctxt.SetOutJson(responseBody);
   // The status comes from the response, not from the fact that we produced one:
@@ -680,13 +692,22 @@ begin
   // dots and dashes, which no Pascal method name can carry.
   Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
   if Ctxt.Method = 'OPTIONS' then
-    exit(HTTP_NOCONTENT);
+  begin
+    result := HTTP_NOCONTENT;
+    exit;
+  end;
   if Ctxt.Method <> 'GET' then
-    exit(HTTP_NOTALLOWED);
+  begin
+    result := HTTP_NOTALLOWED;
+    exit;
+  end;
   if not fServer.IsProtected then
     // nothing to discover: an open server has no authorization server to name,
     // and publishing an empty document would suggest otherwise
-    exit(HTTP_NOTFOUND);
+  begin
+    result := HTTP_NOTFOUND;
+    exit;
+  end;
   result := Ctxt.SetOutJson(fServer.ProtectedResourceMetadata);
 end;
 
@@ -718,18 +739,27 @@ begin
 
   // --- OPTIONS: CORS preflight ---
   if Ctxt.Method = 'OPTIONS' then
-    exit(HTTP_NOCONTENT);
+  begin
+    result := HTTP_NOCONTENT;
+    exit;
+  end;
 
   // --- Only POST is an MCP endpoint method now ---
   // GET (standalone notification stream) and DELETE (session teardown) were
   // removed together with protocol sessions; the spec prescribes 405 for both
   // so an older client can tell "gone" from "never existed".
   if Ctxt.Method <> 'POST' then
-    exit(HTTP_NOTALLOWED);
+  begin
+    result := HTTP_NOTALLOWED;
+    exit;
+  end;
 
   // --- Origin validation (DNS rebinding protection) ---
   if not ValidateOrigin(Ctxt) then
-    exit(HTTP_FORBIDDEN);
+  begin
+    result := HTTP_FORBIDDEN;
+    exit;
+  end;
 
   // --- Authorization, BEFORE anything is parsed or dispatched ---
   // "MCP servers MUST validate access tokens before processing the request,
@@ -740,14 +770,20 @@ begin
   // On an unprotected server this is a no-op returning mtrValid.
   tokenResult := fServer.AuthorizeToken(Ctxt.AuthBearer, authCtx);
   if tokenResult <> mtrValid then
-    exit(SendAuthChallenge(Ctxt, tokenResult));
+  begin
+    result := SendAuthChallenge(Ctxt, tokenResult);
+    exit;
+  end;
 
   // --- Validate Content-Type ---
   // mORMot parses Content-Type out of headers into Ctxt.InContentType
   contentType := LowerCaseU(Ctxt.InContentType);
   if (contentType = '') or
      (PosEx('application/json', contentType) = 0) then
-    exit(415); // Unsupported Media Type
+  begin
+    result := 415; // Unsupported Media Type
+    exit;
+  end;
 
   // --- Parse body ---
   // Use InitJson (not InitJsonInPlace) because InContent may be a shared
@@ -763,15 +799,21 @@ begin
   body := Ctxt.InContent;
   if not McpInitJsonComplete(doc, body, JSON_FAST) or
      not doc.IsObject then
-    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+  begin
+    result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
       Null, JSONRPC_INVALID_REQUEST,
       'Request body must be a single JSON-RPC object ' +
       '(batching is not part of this protocol revision)'),
-      HTTP_MCP_BAD_REQUEST));
+      HTTP_MCP_BAD_REQUEST);
+    exit;
+  end;
   if not doc.GetAsRawUtf8('method', method) then
-    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+  begin
+    result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
       doc.GetValueOrNull('id'), JSONRPC_INVALID_REQUEST,
-      'Missing required member "method"'), HTTP_MCP_BAD_REQUEST));
+      'Missing required member "method"'), HTTP_MCP_BAD_REQUEST);
+    exit;
+  end;
 
   // --- Standard header validation (MUST, -32020 on mismatch) ---
   // Headers mirror body fields so intermediaries can route without parsing;
@@ -779,9 +821,12 @@ begin
   // The check itself lives in the core unit so a server mounted as a route on
   // a foreign HTTP host enforces exactly the same contract as this transport.
   if not McpValidateRequestHeaders(Ctxt.InHeaders, body, fServer, headerError) then
-    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+  begin
+    result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
       doc.GetValueOrNull('id'), MCP_ERROR_HEADER_MISMATCH, headerError),
-      HTTP_MCP_BAD_REQUEST));
+      HTTP_MCP_BAD_REQUEST);
+    exit;
+  end;
 
   // --- Accept header validation skipped ---
   // mORMot's THttpAsyncServer filters standard headers (Accept, Content-Type,
@@ -797,7 +842,10 @@ begin
   // here — and a rejected request is answered as JSON with 400/404, never
   // streamed. It also means no request reaches OnStreamCall unvalidated.
   if not fServer.PreflightRequest(body, errorJson, status) then
-    exit(SendProtocolError(Ctxt, errorJson, status));
+  begin
+    result := SendProtocolError(Ctxt, errorJson, status);
+    exit;
+  end;
 
   // --- Notification (no id): process and return 202 with no body ---
   if VarIsVoid(doc.GetValueOrNull('id')) then
@@ -810,7 +858,8 @@ begin
     // decorative. There is no scope challenge to report: a notification is
     // answered with 202 and no body, whatever the handler decided.
     fServer.ExecuteRequest(body, authCtx);
-    exit(HTTP_ACCEPTED);
+    result := HTTP_ACCEPTED;
+    exit;
   end;
 
   // --- Requests present: defer and stream a chunked SSE response ---
@@ -860,7 +909,10 @@ var
 begin
   // If CORS allows all origins, accept everything
   if fCorsOrigins = '*' then
-    exit(true);
+  begin
+    result := true;
+    exit;
+  end;
   // Extract Origin header — Origin is a custom header that stays in InHeaders
   // (mORMot only filters standard headers like Content-Type, Accept, etc.)
   origin := '';
@@ -871,7 +923,10 @@ begin
     FastSetString(origin, p, len);
   // Missing Origin is accepted (non-browser clients like CLI tools don't send it)
   if origin = '' then
-    exit(true);
+  begin
+    result := true;
+    exit;
+  end;
   // Check against configured origins
   result := origin = fCorsOrigins;
 end;

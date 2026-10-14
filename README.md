@@ -1,17 +1,18 @@
-# mormot2-ai — the `mormot.ai.*` extension for mORMot2 (FPC · Delphi 13)
+# mormot2-ai — the `mormot.ai.*` extension for mORMot2 (FPC · Delphi 7 … 13)
 
-A **mORMot-native** AI/LLM extension for **Free Pascal** — and, as far as the code
-allows, for **Delphi 13**: an MCP server, LLM clients,
+A **mORMot-native** AI/LLM extension for **Free Pascal** and **Delphi 7 to 13** — the
+same compiler range as mORMot2: an MCP server, LLM clients,
 embeddings, vector stores and RAG. Built on mORMot2 — its HTTP stack, JSON, RTTI and
 crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one — plus a temporary stdio bridge for the legacy `initialize`
-> handshake, marked for removal. As of 2026-10-14 both suites are green — **1012
-> assertions** MCP, **647–659** LLM (depending on platform and whether the `vec0` test runs) — on
-> aarch64-linux (FPC 3.2.4/3.2.2), aarch64-darwin, x86_64-win64 (FPC 3.2.2) and Win64
-> (Delphi 13); aarch64-win64 (FPC 3.3.1) needs an external `sqlite3-64.dll`. Per-platform
-> table: [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests).
+> handshake, marked for removal. As of 2026-10-14 both suites are green — **1253–1257
+> assertions** MCP, **647–659** LLM (depending on compiler and whether the `vec0` test runs) —
+> on aarch64-linux (FPC 3.2.4/3.2.2), aarch64-darwin, x86_64-win64 (FPC 3.2.2), Win64
+> (Delphi 13) and **Win32 (Delphi 7)**; aarch64-win64 (FPC 3.3.1) needs an external
+> `sqlite3-64.dll`. Per-platform table:
+> [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests).
 > All 14 demos build with FPC and Delphi 13; Delphi has no demo build script yet. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
@@ -23,11 +24,18 @@ crypto are the foundation, not a dependency we tolerate.
   Rationale: [CONCEPT.md §1](CONCEPT.md). (Since 2026-10-14 neural-api is no longer
   pursued; native inference becomes an own engine — see
   [docs/native-inference.md](docs/native-inference.md).)
-- **FPC first, Delphi 13 where it works** (since 2026-09-10). FPC is the reference
-  compiler and the gate; Delphi 13 (Win64) builds the library and runs both test suites.
+- **FPC first, Delphi 7 to 13 alongside** (Delphi 13 since 2026-09-10, Delphi 7 since
+  2026-10-14). FPC is the reference compiler and the gate; Delphi 13 (Win64) and Delphi 7
+  (Win32) build the library and run both test suites.
   Parts that only exist under FPC — the POSIX process launcher in `vendor/` — stay behind
-  `{$ifdef FPC}` instead of being duplicated. Target since 2026-10-14: the same compiler
-  range as mORMot2, down to **Delphi 7** (not there yet, see the plan).
+  `{$ifdef FPC}` instead of being duplicated. The library needs no generics: the MCP
+  registries are `TSynDictionary`, typed tools build on `TMcpRecordTool`, and the generic
+  `TMcpToolBase<T>` is only a shorthand where the compiler has generics.
+- **Written like mORMot2** — unit headers, `{ ****** section }` layout, `RawUtf8`,
+  `TDocVariantData`, `ESynException`, `f`/`a` prefixes, `///` docs. Stricter than mORMot2
+  where Delphi 7 needs it: a non-generic core (generics only as an optional typed shell
+  under `HASGENERICS`), no anonymous methods, no inline variables, no `exit(value)`, and
+  no `with`. The full rule set is in [CONCEPT.md §1](CONCEPT.md).
 - **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
   provider wires) rather than chasing another library's changes.
 - **License MPL/GPL/LGPL** (the mORMot three-license, confirmed 2026-10-14 — also for the
@@ -88,7 +96,7 @@ var
   transport: TMcpStdioTransport;
   tool: IMcpTool;
 begin
-  // FPC has no RTTI for plain records — declare the fields once, up front.
+  // FPC 3.2 and Delphi 7 have no RTTI for plain records — declare the fields once.
   if not RecordHasFields(TypeInfo(TAddParams)) then
     Rtti.RegisterFromText(TypeInfo(TAddParams), 'a,b:integer');
 
@@ -110,6 +118,44 @@ begin
     server.Free;
   end;
 end.
+```
+
+Without generics (Delphi 7, or by choice) a tool derives from `TMcpRecordTool`, names its
+record once and casts it back — `TMcpToolBase<T>` does exactly this for you. On Delphi 7 a
+record only has `TypeInfo` if it holds a managed field (a string, say), so this one does:
+
+```pascal
+type
+  TGreetParams = record
+    name: RawUtf8;
+    times: integer;
+  end;
+
+  TGreetTool = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  public
+    constructor Create(const aName, aDescription: RawUtf8);
+  end;
+
+constructor TGreetTool.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TGreetParams), aName, aDescription);
+end;
+
+function TGreetTool.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+var
+  p: ^TGreetParams;
+begin
+  p := @aParams; // the parsed record, of the type given to CreateTyped
+  result := _ObjFast(['greeting', 'Hello ' + p^.name, 'times', p^.times]);
+end;
+
+// once, before the first tool is created - FPC 3.2 and Delphi 7 have no field RTTI:
+//   if not RecordHasFields(TypeInfo(TGreetParams)) then
+//     Rtti.RegisterFromText(TypeInfo(TGreetParams), 'name:RawUtf8 times:integer');
 ```
 
 That `Rtti.RegisterFromText` line is the one thing that catches everyone: under FPC a plain
@@ -134,6 +180,8 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 # Delphi 13, on Windows:
 .\scripts\run-delphi-tests.ps1               # MCP + LLM suite (-Suite mcp|llm, -ShowAll)
 # logs and binaries land in bin\delphi\
+# Delphi 7 (Win32):
+.\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
 ```
 
 **Requirements:** a mORMot2 source tree, plus
@@ -146,7 +194,12 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 - **Delphi 13** (`dcc64`, compiler 37.0) for `run-delphi-tests.ps1`; override with
   `-Dcc <path>`. On ARM64 Windows the x64 test programs run under emulation.
 
-Verified on aarch64-linux and x86_64-linux (FPC) and Win64 (Delphi 13). Lazarus is
+- **Delphi 7** (`dcc32`) for `run-delphi7-tests.ps1`: `-Delphi7 <install dir>` (or
+  `DELPHI7`) and `-FastMM4 <dir with FastMM4.pas>` (or `FASTMM4`) — mORMot2 uses FastMM4
+  as memory manager on Delphi 7, and it is a separate library. The `vec0` test is skipped
+  there (no 32-bit build of the extension); the script says so.
+
+Verified on aarch64-linux and x86_64-linux (FPC), Win64 (Delphi 13) and Win32 (Delphi 7). Lazarus is
 optional; `.lpi` files exist for the test projects, the scripts do not need the IDE.
 
 The two native extensions used by RAG (`sqlite-vec`, `lembed`) are **optional**: without

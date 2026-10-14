@@ -38,10 +38,57 @@ type
     Price: Currency;
   end;
 
-  TEdgeTool = class(TMcpToolBase<TEdgeParams>)
+  // The typed test tools derive from TMcpRecordTool through a small base per
+  // parameter record - the pattern a consumer without generics (Delphi 7)
+  // writes. TMcpToolBase<T> is the generic shorthand for the same thing; it is
+  // checked against these in GenericShellMatchesRecordTool.
+  TEdgeToolBase = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TEdgeParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+
+  TEdgeTool = class(TEdgeToolBase)
   protected
     function ExecuteTyped(const aParams: TEdgeParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
+  /// managed fields of every kind a typed tool may declare: a string, dynamic
+  /// arrays and a nested record holding a string. Without extended record RTTI
+  /// (Delphi 7) their layout comes from Rtti.RegisterFromText instead of the
+  /// compiler - the tests pin down what the parsed arguments must be either way
+  TBagTarget = packed record
+    Region: RawUtf8;
+    Count: integer;
+  end;
+  TBagParams = packed record
+    Note: RawUtf8;
+    Tags: TRawUtf8DynArray;
+    Counts: TIntegerDynArray;
+    Target: TBagTarget;
+  end;
+
+  TBagToolBase = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TBagParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+
+  TBagTool = class(TBagToolBase)
+  protected
+    function ExecuteTyped(const aParams: TBagParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); override;
   end;
 
   /// every tool here shares TCalcParams, where A and B are the actual
@@ -50,10 +97,26 @@ type
   /// all four as required AND (since that is now enforced) refuse the calls
   /// these tests make, which is the honest consequence of a contract that
   /// used to be decorative.
-  TCalcToolBase = class(TMcpToolBase<TCalcParams>)
+  TCalcToolBase = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+
+  {$ifdef HASGENERICS}
+  /// TCalcTool again, through the generic shell TMcpToolBase<T>
+  TGenericCalcTool = class(TMcpToolBase<TCalcParams>)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
   public
     constructor Create(const aName, aDescription: RawUtf8); override;
   end;
+  {$endif HASGENERICS}
 
   TCalcTool = class(TCalcToolBase)
   protected
@@ -254,6 +317,7 @@ type
   TTestMcpCore = class(TSynTestCase)
   protected
     procedure EnsureCalcParamsRtti;
+    procedure EnsureBagParamsRtti;
     function VariantToInt64Loose(const V: variant; out aValue: Int64): boolean;
     procedure CheckErrorResponse(const aResponse: RawUtf8;
       aExpectedCode: integer; const aMessageContains: RawUtf8);
@@ -316,19 +380,79 @@ type
     procedure TypedToolRefusesArgumentsThatDoNotParse;
     procedure ToolArgumentsAreTypeChecked;
     procedure TypeCheckLeavesAmbiguousFormsToTheLoader;
+    procedure RegistriesKeepTheirContract;
+    procedure TypedToolCarriesManagedFields;
+    procedure GenericShellMatchesRecordTool;
   end;
 
 implementation
+
+/// a TDoubleDynArray from values - no array constructor before Delphi XE7
+function Doubles(const aValues: array of double): TDoubleDynArray;
+var
+  i: PtrInt;
+begin
+  SetLength(result, length(aValues));
+  for i := 0 to high(aValues) do
+    result[i] := aValues[i];
+end;
+
+{ TCalcToolBase }
 
 { TCalcToolBase }
 
 constructor TCalcToolBase.Create(const aName, aDescription: RawUtf8);
 begin
+  inherited CreateTyped(TypeInfo(TCalcParams), aName, aDescription);
+  MarkOptional(['Enabled', 'Name']);
+end;
+
+function TCalcToolBase.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TCalcParams(aParams), aAuthCtx);
+end;
+
+{$ifdef HASGENERICS}
+
+{ TGenericCalcTool }
+
+constructor TGenericCalcTool.Create(const aName, aDescription: RawUtf8);
+begin
   inherited Create(aName, aDescription);
   MarkOptional(['Enabled', 'Name']);
 end;
 
+function TGenericCalcTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+var
+  builder: TMcpResponseBuilder;
+begin
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText(FormatUtf8('% + % = %', [aParams.A, aParams.B, aParams.A + aParams.B]));
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
+end;
+
+{$endif HASGENERICS}
+
 { TEdgeTool }
+
+{ TEdgeToolBase }
+
+constructor TEdgeToolBase.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TEdgeParams), aName, aDescription);
+end;
+
+function TEdgeToolBase.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TEdgeParams(aParams), aAuthCtx);
+end;
 
 function TEdgeTool.ExecuteTyped(const aParams: TEdgeParams;
   const aAuthCtx: TMcpAuthContext): variant;
@@ -339,6 +463,46 @@ begin
   try
     builder.AddText(FormatUtf8('mode=% payload=% amount=% price=%',
       [ord(aParams.Mode), aParams.Payload, aParams.Amount, Curr64ToString(PInt64(@aParams.Price)^)]));
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
+end;
+
+{ TBagToolBase }
+
+constructor TBagToolBase.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TBagParams), aName, aDescription);
+end;
+
+function TBagToolBase.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TBagParams(aParams), aAuthCtx);
+end;
+
+{ TBagTool }
+
+constructor TBagTool.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited Create(aName, aDescription);
+  // left out by a caller, these must arrive EMPTY - never with the values of
+  // the call before
+  MarkOptional(['Tags', 'Counts', 'Target']);
+end;
+
+function TBagTool.ExecuteTyped(const aParams: TBagParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+var
+  builder: TMcpResponseBuilder;
+begin
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText(FormatUtf8('note=% tags=% counts=% region=% count=%',
+      [aParams.Note, RawUtf8ArrayToCsv(aParams.Tags, '|'),
+       IntegerDynArrayToCsv(aParams.Counts), aParams.Target.Region,
+       aParams.Target.Count]));
     result := builder.Build;
   finally
     builder.Free;
@@ -631,6 +795,7 @@ end;
 function TThrowingTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
 begin
+  result := Null; // never returned - only for the compiler's flow analysis
   // a plain RTL Exception (NOT ESynException): the dispatcher must still catch it
   raise Exception.Create('tool blew up');
 end;
@@ -653,6 +818,7 @@ end;
 function TProgressTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
 begin
+  result := Null; // never returned - only for the compiler's flow analysis
   raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
 end;
 
@@ -679,6 +845,7 @@ function TTraceRecordingTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
 begin
   // never reached: the server prefers ExecuteInteractive on this tool
+  result := Null; // never returned - only for the compiler's flow analysis
   raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
 end;
 
@@ -701,6 +868,7 @@ function TElicitingTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
 begin
   // never reached: the server prefers ExecuteInteractive on this tool
+  result := Null; // never returned - only for the compiler's flow analysis
   raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
 end;
 
@@ -746,9 +914,15 @@ begin
   // that, and the server must not leak a half-filled context on a refusal
   aAuthCtx.UserID := 'someone';
   if aToken <> GoodToken then
-    exit(mtrInvalid);
+  begin
+    result := mtrInvalid;
+    exit;
+  end;
   if Force <> mtrValid then
-    exit(Force);
+  begin
+    result := Force;
+    exit;
+  end;
   aAuthCtx.IsAuthenticated := true;
   aAuthCtx.UserID := 'user-1';
   aAuthCtx.Issuer := 'https://as.example.com';
@@ -783,6 +957,15 @@ begin
   //{$endif HASEXTRECORDRTTI}
 end;
 
+procedure TTestMcpCore.EnsureBagParamsRtti;
+begin
+  // a compiler without extended record RTTI (Delphi 7) needs the layout as text
+  if not RecordHasFields(TypeInfo(TBagParams)) then
+    Rtti.RegisterFromText(TypeInfo(TBagParams), 'Note:RawUtf8 ' +
+      'Tags:TRawUtf8DynArray Counts:TIntegerDynArray ' +
+      'Target:{Region:RawUtf8 Count:integer}');
+end;
+
 function TTestMcpCore.VariantToInt64Loose(const V: variant; out aValue: Int64): boolean;
 var
   d: double;
@@ -795,18 +978,26 @@ begin
   if VariantToDouble(V, d) then
   begin
     aValue := trunc(d);
-    exit(true);
+    result := true;
+    exit;
   end;
   VariantToUtf8(V, s, wasString);
   s := TrimU(s);
   if s = '' then
-    exit(false);
+  begin
+    result := false;
+    exit;
+  end;
   if ToInt64(s, aValue) then
-    exit(true);
+  begin
+    result := true;
+    exit;
+  end;
   if ToDouble(s, d) then
   begin
     aValue := trunc(d);
-    exit(true);
+    result := true;
+    exit;
   end;
   result := false;
 end;
@@ -1261,13 +1452,19 @@ begin
   // malformed payloads and notifications go through untouched
   if not doc.IsObject or
      VarIsVoid(doc.GetValueOrNull('id')) then
-    exit(aServer.ExecuteRequest(aJson));
+  begin
+    result := aServer.ExecuteRequest(aJson);
+    exit;
+  end;
   // params present but not an object = a deliberately malformed envelope:
   // hand it over untouched, that is exactly what such a test asserts
   if doc.GetValueIndex('params') >= 0 then
     if not doc.GetAsDocVariant('params', params) or
        not params^.IsObject then
-      exit(aServer.ExecuteRequest(aJson));
+    begin
+      result := aServer.ExecuteRequest(aJson);
+      exit;
+    end;
   // build params through the SAME production helper a real client uses, so the
   // tests exercise McpRequestParams instead of a second, divergent copy of the
   // _meta rules (McpPost in test.mcp.transports does the same)
@@ -2300,7 +2497,7 @@ begin
     CheckEqual(doc.U['resource'], 'https://mcp.example.com/mcp',
       'resource is the canonical URI clients put in the RFC 8707 parameter');
     Check(doc.GetValueIndex('authorization_servers') >= 0,
-      'it names where to authenticate — without this a client is stuck');
+      'it names where to authenticate - without this a client is stuck');
     Check(doc.GetValueIndex('scopes_supported') >= 0, 'and the base scopes');
     Check(PosEx('header', doc.ToJson) > 0,
       'bearer_methods_supported says header: a token MUST NOT ride in the query');
@@ -2378,7 +2575,7 @@ begin
       'a refused token is named invalid_token');
     Check(PosEx('error="invalid_token"',
       server.AuthChallenge(mtrExpired)) > 0,
-      'an expired one too — a fresh token is what fixes it');
+      'an expired one too - a fresh token is what fixes it');
     // A wrong audience is not a weaker permission, it is a token for someone
     // else — also invalid_token, never insufficient_scope.
     Check(PosEx('error="invalid_token"',
@@ -2828,7 +3025,9 @@ var
   procedure CallWith(const aExtraMeta: RawUtf8);
   begin
     inc(id);
-    tool.SawTrace := Default(TMcpTraceContext);
+    tool.SawTrace.TraceParent := ''; // no Default() before Delphi 2009
+    tool.SawTrace.TraceState := '';
+    tool.SawTrace.Baggage := '';
     server.ExecuteRequest(FormatUtf8(
       '{"jsonrpc":"2.0","id":%,"method":"tools/call","params":{' +
       '"name":"trace","arguments":{"a":1,"b":2},"_meta":{' +
@@ -2996,7 +3195,7 @@ begin
     server.Start;
 
     // --- opted in, values increasing: everything goes out ---
-    tool.Steps := TDoubleDynArray.Create(10, 50, 100);
+    tool.Steps := Doubles([10, 50, 100]);
     CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":"abc123"', true);
     Check(tool.SawWanted, 'a progressToken plus a stream means progress is wanted');
     CheckEqual(length(sink.Sent), 3, 'all three reports went out');
@@ -3012,7 +3211,7 @@ begin
     // --- "The progress value MUST increase with each notification" ---
     // A repeat and a step backwards are DROPPED rather than put on the wire:
     // a client is entitled to rely on the increase.
-    tool.Steps := TDoubleDynArray.Create(10, 10, 5, 20);
+    tool.Steps := Doubles([10, 10, 5, 20]);
     CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":7', true);
     CheckEqual(length(sink.Sent), 2, 'only the two increasing values are sent');
     Check(tool.Accepted[0], 'first value accepted');
@@ -3024,19 +3223,19 @@ begin
     CheckSame(params^.D['progress'], 20, 1E-9, 'the second sent value is 20, not 5');
 
     // --- no token: the client did not opt in, so nothing may be emitted ---
-    tool.Steps := TDoubleDynArray.Create(1, 2);
+    tool.Steps := Doubles([1, 2]);
     CallWith('', true);
     Check(not tool.SawWanted, 'without a token progress is not wanted');
     CheckEqual(length(sink.Sent), 0, 'and nothing is sent');
 
     // --- token but nowhere to send: a no-op, never an error ---
-    tool.Steps := TDoubleDynArray.Create(1, 2);
+    tool.Steps := Doubles([1, 2]);
     CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":"abc"', false);
     Check(not tool.SawWanted, 'no stream means progress cannot be wanted');
     Check(not tool.Accepted[0], 'Report says so instead of failing');
 
     // --- a token that is neither string nor integer is not an opt-in ---
-    tool.Steps := TDoubleDynArray.Create(1);
+    tool.Steps := Doubles([1]);
     CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":{"nope":1}', true);
     Check(not tool.SawWanted,
       'an object token cannot be correlated, so it is no opt-in');
@@ -3431,7 +3630,7 @@ begin
     if CheckFailed(_Safe(schema)^.GetAsDocVariant('properties', props), 'properties') or
        CheckFailed(props^.GetAsDocVariant('a', a), 'property a') then
       exit;
-    CheckEqual(a^.I['minimum'], -2147483648, 'minimum is published');
+    CheckEqual(a^.I['minimum'], Low(integer), 'minimum is published');
     CheckEqual(a^.I['maximum'], 2147483647, 'maximum is published');
     Check(a^.GetValueIndex('minimum') >= 0, 'an integer field carries its bound');
     Check(_Safe(props^.Value['name'])^.GetValueIndex('minimum') < 0,
@@ -3707,6 +3906,216 @@ begin
   finally
     server.Free;
   end;
+end;
+
+
+procedure TTestMcpCore.RegistriesKeepTheirContract;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+  raised: boolean;
+begin
+  // The four registries (tools, resources, prompts, templates) are keyed maps.
+  // What a caller relies on - and what a change of the map type must keep:
+  // a key is taken once, keys are case-sensitive, Unregister reports whether
+  // it removed something, and a removed key can be registered again.
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+
+    // tools
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    raised := false;
+    try
+      server.RegisterTool(TCalcTool.Create('calc', 'again'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'a tool name is taken once');
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":2,"B":3}}}');
+    Check(PosEx('2 + 3 = 5', response) > 0, 'the first registration still serves');
+    server.RegisterTool(TCalcTool.Create('Calc', 'other case'));
+    response := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+    Check((PosEx('"name":"calc"', response) > 0) and
+          (PosEx('"name":"Calc"', response) > 0), 'tool names are case-sensitive');
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"CALC",' +
+      '"arguments":{"A":2,"B":3}}}');
+    Check(PosEx('"code":-32602', response) > 0, 'a lookup is exact');
+    Check(not server.UnregisterTool('CALC'), 'unregister: unknown name');
+    Check(server.UnregisterTool('Calc'), 'unregister: exactly that one');
+    Check(not server.UnregisterTool('Calc'), 'unregister: only once');
+    server.RegisterTool(TCalcTool.Create('Calc', 'back'));
+    Check(server.UnregisterTool('Calc'), 'a removed name can come back');
+
+    // resources
+    server.RegisterResource(TVersionResource.Create('version://info', 'Version',
+      'Server version', 'application/json'));
+    raised := false;
+    try
+      server.RegisterResource(TVersionResource.Create('version://info', 'Again',
+        'Server version', 'application/json'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'a resource URI is taken once');
+    server.RegisterResource(TVersionResource.Create('VERSION://info', 'Upper',
+      'Server version', 'application/json'));
+    Check(not server.UnregisterResource('version://INFO'), 'URIs are case-sensitive');
+    Check(server.UnregisterResource('VERSION://info'), 'resource removed');
+    Check(server.UnregisterResource('version://info'), 'the other one independent');
+    Check(not server.UnregisterResource('version://info'), 'and only once');
+
+    // prompts
+    server.RegisterPrompt(TReviewPrompt.Create('review'));
+    raised := false;
+    try
+      server.RegisterPrompt(TReviewPrompt.Create('review'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'a prompt name is taken once');
+    server.RegisterPrompt(TReviewPrompt.Create('Review'));
+    response := Exec(server, '{"jsonrpc":"2.0","id":4,"method":"prompts/list"}');
+    Check((PosEx('"name":"review"', response) > 0) and
+          (PosEx('"name":"Review"', response) > 0), 'prompt names are case-sensitive');
+    Check(server.UnregisterPrompt('Review'), 'prompt removed');
+    Check(not server.UnregisterPrompt('Review'), 'and only once');
+    Check(server.UnregisterPrompt('review'), 'the other one independent');
+
+    // resource templates
+    server.RegisterResourceTemplate(TFilesTemplate.Create);
+    raised := false;
+    try
+      server.RegisterResourceTemplate(TFilesTemplate.Create);
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'a URI template is taken once');
+    Check(not server.UnregisterResourceTemplate('FILE:///{path}'),
+      'URI templates are case-sensitive');
+    Check(server.UnregisterResourceTemplate('file:///{path}'), 'template removed');
+    Check(not server.UnregisterResourceTemplate('file:///{path}'), 'and only once');
+    server.RegisterResourceTemplate(TFilesTemplate.Create);
+    Check(server.UnregisterResourceTemplate('file:///{path}'),
+      'a removed template can come back');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.TypedToolCarriesManagedFields;
+var
+  server: TMcpServer;
+  response, tags, counts, expected: RawUtf8;
+  schema: variant;
+  props: PDocVariantData;
+  i, j: integer;
+begin
+  EnsureBagParamsRtti;
+  // the published schema: one entry per field, by JSON type
+  schema := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TBagParams));
+  Check(_Safe(schema)^.GetAsDocVariant('properties', props), 'schema properties');
+  CheckEqual(DocPropType(props, 'note'), 'string');
+  CheckEqual(DocPropType(props, 'tags'), 'array');
+  CheckEqual(DocPropType(props, 'counts'), 'array');
+  CheckEqual(DocPropType(props, 'target'), 'object');
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TBagTool.Create('bag', 'Echo managed fields'));
+    server.Start;
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bag",' +
+      '"arguments":{"note":"first","tags":["a","b","c"],"counts":[1,2,3],' +
+      '"target":{"region":"eu","count":7}}}}');
+    Check(PosEx('note=first tags=a|b|c counts=1,2,3 region=eu count=7',
+      response) > 0, 'every managed field arrives');
+    // the optional fields left out: they must start empty, not carry what the
+    // call before had put there
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bag",' +
+      '"arguments":{"note":"second"}}}');
+    Check(PosEx('note=second tags= counts= region= count=0', response) > 0,
+      'omitted managed fields start empty');
+    // changing sizes over many calls: a lifetime bug in the argument record
+    // shows up as stale, torn or leaked values
+    for i := 1 to 200 do
+    begin
+      tags := '';
+      counts := '';
+      expected := '';
+      for j := 1 to i mod 5 do
+      begin
+        if j > 1 then
+        begin
+          tags := tags + ',';
+          counts := counts + ',';
+          expected := expected + '|';
+        end;
+        tags := FormatUtf8('%"t%"', [tags, j]);
+        counts := FormatUtf8('%%', [counts, j * i]);
+        expected := FormatUtf8('%t%', [expected, j]);
+      end;
+      response := Exec(server, FormatUtf8('{"jsonrpc":"2.0","id":%,' +
+        '"method":"tools/call","params":{"name":"bag","arguments":' +
+        '{"note":"n%","tags":[%],"counts":[%]}}}', [i + 2, i, tags, counts]));
+      if not CheckFailed(PosEx(FormatUtf8('note=n% tags=% counts=% region= count=0',
+           [i, expected, counts]), response) > 0, 'round trip') then
+        continue;
+      break; // one failure says enough, 200 identical messages say nothing more
+    end;
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.GenericShellMatchesRecordTool;
+{$ifdef HASGENERICS}
+var
+  server: TMcpServer;
+  rec, gen: IMcpTool;
+  a, b: RawUtf8;
+{$endif HASGENERICS}
+begin
+  {$ifdef HASGENERICS}
+  // TMcpToolBase<T> is only a typed shell over TMcpRecordTool: the same record
+  // must give the same schema, the same checks and the same result
+  EnsureCalcParamsRtti;
+  rec := TCalcTool.Create('calc', 'Add two numbers');
+  gen := TGenericCalcTool.Create('gcalc', 'Add two numbers');
+  CheckEqual(VariantSaveJson(rec.GetInputSchema),
+    VariantSaveJson(gen.GetInputSchema), 'same schema');
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(rec);
+    server.RegisterTool(gen);
+    server.Start;
+    a := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"calc","arguments":{"A":2,"B":3}}}');
+    b := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"gcalc","arguments":{"A":2,"B":3}}}');
+    Check(PosEx('2 + 3 = 5', b) > 0, 'the generic shell executes');
+    CheckEqual(a, b, 'same result');
+    a := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+      '{"name":"calc","arguments":{"A":2}}}');
+    b := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+      '{"name":"gcalc","arguments":{"A":2}}}');
+    Check(PosEx('"isError":true', b) > 0, 'the generic shell enforces required');
+    CheckEqual(a, b, 'same refusal');
+  finally
+    server.Free;
+  end;
+  {$else}
+  // no generics on this compiler (Delphi 7): TMcpToolBase<T> is not built
+  Check(true, 'TMcpToolBase<T> needs generics - not available here');
+  {$endif HASGENERICS}
 end;
 
 end.

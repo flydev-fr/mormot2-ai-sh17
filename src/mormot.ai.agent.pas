@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - tool-calling agent loop
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room from the OpenAI tool-calling protocol; no third-party code,
 //   target license MPL/GPL/LGPL (mORMot contribution)
 unit mormot.ai.agent;
@@ -142,7 +143,10 @@ begin
     req.Tools := fToolbox.List;
     resp := fClient.ChatComplete(req);
     if length(resp.ToolCalls) = 0 then
-      exit(resp); // the model answered without requesting any tool
+    begin
+      result := resp; // the model answered without requesting any tool
+      exit;
+    end;
 
     // 1) replay the assistant turn that requested the calls (OpenAI requires the
     //    tool_calls message to precede its tool results)

@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - HTTP client and provider contract
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room from public provider API docs (OpenAI Chat Completions); no
 //   third-party code, target license MPL/GPL/LGPL (mORMot contribution)
 // - the OpenAI wire is canonical: the same TLlmClient drives OpenAI, LiteLLM and

@@ -1,5 +1,6 @@
 /// LandrixAI - sqlite-vec (vec0) backed IVectorStore
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - this is the SQLite edge of the vector abstraction: it loads the sqlite-vec
 //   (vec0) extension into mORMot's static SQLite and implements IVectorStore on
 //   top, so a full RAG pipeline can run in-process, offline, with no API. The
@@ -17,6 +18,7 @@ interface
 uses
   sysutils,
   mormot.core.base,
+  mormot.core.unicode, // Utf8ToString
   mormot.core.text,
   mormot.db.raw.sqlite3,
   mormot.db.raw.sqlite3.static,
@@ -97,6 +99,7 @@ var
   r: TSqlRequest;
   blob: RawByteString;
 begin
+  result := 0; // set below - for the flow analysis of older compilers
   CheckDim(aVector);
   blob := VectorToBlob(aVector);
   // both inserts in one transaction: a failed vector insert must not leave an

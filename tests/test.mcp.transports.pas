@@ -1,4 +1,4 @@
-﻿// - transport tests for mormot.ai.mcp
+// - transport tests for mormot.ai.mcp
 unit test.mcp.transports;
 
 interface
@@ -16,6 +16,7 @@ uses
   mormot.core.rtti,
   mormot.core.variants,
   mormot.core.json,
+  mormot.core.threads, // TSynThread: Start on every compiler
   mormot.core.test,
   mormot.net.sock,
   mormot.net.http,
@@ -42,7 +43,17 @@ type
     Name: RawUtf8;
   end;
 
-  TCalcTool = class(TMcpToolBase<TCalcParams>)
+  TCalcToolBase = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
+  public
+    constructor Create(const aName, aDescription: RawUtf8); virtual;
+  end;
+
+  TCalcTool = class(TCalcToolBase)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -74,6 +85,7 @@ type
     procedure StdioTransportProcess;
     procedure StdioTransportMultiple;
     procedure StdioTransportBadJson;
+    procedure StdioReadsUtf8Unchanged;
     procedure StdioTransportLegacyInitialize; // LEGACY-ERA
     procedure LegacyBridgeTranslation;        // LEGACY-ERA
   end;
@@ -148,15 +160,21 @@ begin
       begin
         if not doc.GetAsDocVariant('params', params) or
            not params^.IsObject then
-          exit(aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
-            HTTP_KEEPALIVE_MS, headers));
+        begin
+          result := aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
+            HTTP_KEEPALIVE_MS, headers);
+          exit;
+        end;
       end
       else
       begin
         doc.AddValue('params', _ObjFast([]));
         if not doc.GetAsDocVariant('params', params) then
-          exit(aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
-            HTTP_KEEPALIVE_MS, headers));
+        begin
+          result := aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
+            HTTP_KEEPALIVE_MS, headers);
+          exit;
+        end;
       end;
       // build params through the SAME production helper a real client uses —
       // it merges into an existing _meta (e.g. a progressToken) instead of
@@ -181,6 +199,19 @@ begin
 end;
 
 { TCalcTool }
+
+{ TCalcToolBase }
+
+constructor TCalcToolBase.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TCalcParams), aName, aDescription);
+end;
+
+function TCalcToolBase.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TCalcParams(aParams), aAuthCtx);
+end;
 
 function TCalcTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
@@ -219,18 +250,26 @@ begin
   if VariantToDouble(V, d) then
   begin
     aValue := trunc(d);
-    exit(true);
+    result := true;
+    exit;
   end;
   VariantToUtf8(V, s, wasString);
   s := TrimU(s);
   if s = '' then
-    exit(false);
+  begin
+    result := false;
+    exit;
+  end;
   if ToInt64(s, aValue) then
-    exit(true);
+  begin
+    result := true;
+    exit;
+  end;
   if ToDouble(s, d) then
   begin
     aValue := trunc(d);
-    exit(true);
+    result := true;
+    exit;
   end;
   result := false;
 end;
@@ -289,7 +328,10 @@ begin
   endTick := GetTickCount64 + aTimeoutMs;
   repeat
     if FileSize(aFileName) > 0 then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
     SleepHiRes(10);
   until GetTickCount64 > endTick;
   result := false;
@@ -312,7 +354,10 @@ begin
     if (content <> '') and (content[length(content)] <> #10) then
       inc(lines);
     if lines >= aLines then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
     SleepHiRes(10);
   until GetTickCount64 > endTick;
   result := false;
@@ -748,6 +793,46 @@ begin
     server.Free;
     DeleteFile(inputFile);
     DeleteFile(outputFile);
+  end;
+end;
+
+/// raw bytes as a RawUtf8, whatever the compiler makes of a char literal
+function Utf8Bytes(const aBytes: array of byte): RawUtf8;
+begin
+  result := ''; // a managed result starts undefined in FPC's view
+  FastSetString(result, @aBytes[0], length(aBytes));
+end;
+
+procedure TTestMcpTransports.StdioReadsUtf8Unchanged;
+var
+  fn: TFileName;
+  f: TextFile;
+  line, utf8: RawUtf8;
+begin
+  // The read path of the stdio worker (the tests feed requests through
+  // ProcessRequest instead, the worker thread would read the real stdin).
+  // The bytes are built from numbers: a UTF-8 literal in the source would be
+  // re-encoded by a compiler that reads the file as ANSI, and #$C3 is a WideChar
+  // on a Unicode compiler. U+00FC, U+20AC and U+03A9 - two of them outside every
+  // single-byte Windows code page.
+  utf8 := '{"q":"' + Utf8Bytes([$C3, $BC, $E2, $82, $AC, $CE, $A9]) + '"}';
+  fn := TemporaryFileName;
+  try
+    Check(FileFromString(utf8 + #13#10 + 'plain'#10, fn));
+    AssignFile(f, fn);
+    Reset(f);
+    try
+      McpPrepareInput(f);
+      Check(McpReadLine(f, line), 'first line');
+      CheckEqual(line, utf8, 'UTF-8 arrives byte for byte - not re-encoded');
+      Check(McpReadLine(f, line), 'second line');
+      CheckEqual(line, 'plain', 'LF-only line');
+      Check(not McpReadLine(f, line), 'end of input');
+    finally
+      CloseFile(f);
+    end;
+  finally
+    DeleteFile(fn);
   end;
 end;
 
@@ -1920,7 +2005,8 @@ type
   /// drives a live subscription stream from outside the blocked POST
   // - the client's POST does not return until the stream ends, so the events
   //   under test have to be produced from another thread
-  TSubscriptionDriver = class(TThread)
+  // - a TSynThread, not a TThread: Delphi 7 has no TThread.Start
+  TSubscriptionDriver = class(TSynThread)
   public
     Server: TMcpServer;
     Opened: boolean;
@@ -2195,12 +2281,21 @@ function TTransportVerifier.VerifyToken(const aToken, aResource: RawUtf8;
   out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
 begin
   if aToken = 'expired-token' then
-    exit(mtrExpired);
+  begin
+    result := mtrExpired;
+    exit;
+  end;
   if aToken = 'other-audience' then
-    exit(mtrWrongAudience);
+  begin
+    result := mtrWrongAudience;
+    exit;
+  end;
   if (aToken <> 'good-token') and
      (aToken <> 'narrow-token') then
-    exit(mtrInvalid);
+  begin
+    result := mtrInvalid;
+    exit;
+  end;
   aAuthCtx.IsAuthenticated := true;
   aAuthCtx.UserID := 'user-1';
   aAuthCtx.Issuer := 'https://as.example.com';
@@ -2368,7 +2463,7 @@ begin
     Check(PosEx('insufficient_scope', client.Headers) > 0,
       'the challenge says why');
     Check(PosEx('files:write', client.Headers) > 0,
-      'and names the scope to step up to — without it the client can only ' +
+      'and names the scope to step up to - without it the client can only ' +
       'retry the same failing request');
 
     // --- the discovery document is public: it is read WITHOUT a token ------
@@ -2540,7 +2635,10 @@ begin
   if Calls > 1 then
     // the token lapsed in between - expiry, revocation, or a verifier that
     // reaches a backend and got a different answer this time
-    exit(mtrExpired);
+  begin
+    result := mtrExpired;
+    exit;
+  end;
   aAuthCtx.IsAuthenticated := true;
   aAuthCtx.UserID := 'user-1';
   aAuthCtx.Issuer := 'https://as.example.com';

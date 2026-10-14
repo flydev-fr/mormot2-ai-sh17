@@ -17,6 +17,7 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.rtti, // ObjectFromInterface
   mormot.core.buffers,
   mormot.core.variants,
   mormot.core.test,
@@ -73,6 +74,35 @@ begin
   result[3] := d;
 end;
 
+// array literals without the XE7 dynamic-array constructors (Delphi 7)
+
+function Emb(const aValues: array of single): TLlmEmbedding;
+var
+  i: PtrInt;
+begin
+  SetLength(result, length(aValues));
+  for i := 0 to high(aValues) do
+    result[i] := aValues[i];
+end;
+
+function Strs(const aValues: array of RawUtf8): TRawUtf8DynArray;
+var
+  i: PtrInt;
+begin
+  SetLength(result, length(aValues));
+  for i := 0 to high(aValues) do
+    result[i] := aValues[i];
+end;
+
+function Embs(const aValues: array of TLlmEmbedding): TLlmEmbeddingDynArray;
+var
+  i: PtrInt;
+begin
+  SetLength(result, length(aValues));
+  for i := 0 to high(aValues) do
+    result[i] := aValues[i];
+end;
+
 function C4: TVectorContract;
 begin
   result := VectorContract('test/model-4d', '', 4);
@@ -85,7 +115,10 @@ begin
   result := false;
   for i := 0 to high(aHits) do
     if aHits[i].Key = aKey then
-      exit(true);
+    begin
+      result := true;
+      exit;
+    end;
 end;
 
 { TTestVectorStoreNative }
@@ -213,7 +246,7 @@ var
 begin
   store := TNativeVectorStore.Create(':memory:', 'iv', C4);
   try
-    store.Upsert('a', 't', TLlmEmbedding.Create(1, 0, 0, 0, 0));
+    store.Upsert('a', 't', Emb([1, 0, 0, 0, 0]));
     Check(false, 'wrong dim');
   except
     on E: EVectorStore do
@@ -274,8 +307,8 @@ var
   vecs: TLlmEmbeddingDynArray;
 begin
   store := TNativeVectorStore.Create(':memory:', 'ab', C4);
-  texts := TRawUtf8DynArray.Create('a', 'b', 'c');
-  vecs := TLlmEmbeddingDynArray.Create(V4(1, 0, 0, 0), V4(0, 1, 0, 0), nil);
+  texts := Strs(['a', 'b', 'c']);
+  vecs := Embs([V4(1, 0, 0, 0), V4(0, 1, 0, 0), nil]);
   try
     store.AddBatch(texts, vecs);
     Check(false, 'bad vector in batch');
@@ -316,9 +349,9 @@ begin
   finally
     app.Free;
   end;
-  texts := TRawUtf8DynArray.Create('ok', 'boom', 'never');
-  vecs := TLlmEmbeddingDynArray.Create(V4(1, 0, 0, 0), V4(0, 1, 0, 0),
-    V4(0, 0, 1, 0));
+  texts := Strs(['ok', 'boom', 'never']);
+  vecs := Embs([V4(1, 0, 0, 0), V4(0, 1, 0, 0),
+    V4(0, 0, 1, 0)]);
   try
     store.AddBatch(texts, vecs);
     Check(false, 'trigger abort must surface');
@@ -328,8 +361,8 @@ begin
   end;
   CheckEqual(store.Count, 0, 'first row rolled back with the failed batch');
   // and the connection is usable again (no transaction left open)
-  texts := TRawUtf8DynArray.Create('ok');
-  vecs := TLlmEmbeddingDynArray.Create(V4(1, 0, 0, 0));
+  texts := Strs(['ok']);
+  vecs := Embs([V4(1, 0, 0, 0)]);
   CheckEqual(store.AddBatch(texts, vecs), 1, 'next batch works');
   CheckEqual(store.Count, 1, 'and is stored');
 end;
@@ -365,11 +398,11 @@ begin
   store := TNativeVectorStore.Create(StringToUtf8(fn), 'sha',
     VectorContract('test/model-4d', 'abcdef', 4));
   CheckEqual(store.Count, 0, 'SHA case does not create another contract');
-  CheckEqual((store as TNativeVectorStore).Contract.ModelSha256, 'abcdef',
+  CheckEqual(TNativeVectorStore(ObjectFromInterface(store)).Contract.ModelSha256, 'abcdef',
     'contract keeps the SHA lower-case');
   store := nil;
   store := TNativeVectorStore.Create(StringToUtf8(fn), 'sha', c); // upper-case
-  CheckEqual((store as TNativeVectorStore).Contract.ModelSha256, 'abcdef',
+  CheckEqual(TNativeVectorStore(ObjectFromInterface(store)).Contract.ModelSha256, 'abcdef',
     'constructor normalises a hand-built upper-case SHA');
 end;
 
@@ -568,8 +601,8 @@ begin
   a.Upsert('x', 'alt', V4(1, 0, 0, 0));
   CheckEqual(a.Count, 1, 'space a');
   CheckEqual(b.Count, 0, 'space b untouched');
-  b.Upsert('x', 'neu', TLlmEmbedding.Create(0, 1, 0));
-  CheckEqual(b.Search(TLlmEmbedding.Create(0, 1, 0), 1)[0].Text, 'neu', 'space b');
+  b.Upsert('x', 'neu', Emb([0, 1, 0]));
+  CheckEqual(b.Search(Emb([0, 1, 0]), 1)[0].Text, 'neu', 'space b');
   CheckEqual(a.Search(V4(1, 0, 0, 0), 1)[0].Text, 'alt', 'space a unchanged');
 end;
 
@@ -585,7 +618,10 @@ begin
   begin
     cand := MakePath([dir, 'tests', 'data', 'embed-de', 'reference'], true);
     if FileExists(cand + 'manifest.json') then
-      exit(cand);
+    begin
+      result := cand;
+      exit;
+    end;
     dir := ExtractFileDir(dir);
   end;
 end;

@@ -1,5 +1,6 @@
 /// LandrixAI - provider-backed IEmbedder (OpenAI-wire /embeddings)
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - implements IEmbedder against a provider's OpenAI-wire /embeddings endpoint;
 //   owns a TLlmClient built from the given provider config. This unit (not the
 //   IEmbedder interface in mormot.ai.embeddings) is what pulls the LLM client.

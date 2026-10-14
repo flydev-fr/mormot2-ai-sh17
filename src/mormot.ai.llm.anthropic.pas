@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - native Anthropic Messages API driver
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the OpenAI Chat Completions wire is the suite's lingua franca (mormot.ai.llm);
 //   Anthropic speaks a genuinely different wire (Messages API), so it gets a
 //   native adapter instead of an OpenAI-compatible shim

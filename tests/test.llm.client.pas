@@ -41,6 +41,25 @@ type
 
 implementation
 
+/// set the RTL's global thousand separator, return the previous one
+// - FPC: DefaultFormatSettings; Delphi XE and up: FormatSettings; older Delphi
+//   (7): the plain SysUtils global, there is no settings record yet
+function SwapThousandSeparator(aNew: char): char;
+begin
+  {$ifdef FPC}
+  result := DefaultFormatSettings.ThousandSeparator;
+  DefaultFormatSettings.ThousandSeparator := aNew;
+  {$else}
+  {$ifdef ISDELPHIXE}
+  result := FormatSettings.ThousandSeparator;
+  FormatSettings.ThousandSeparator := aNew;
+  {$else}
+  result := ThousandSeparator;
+  ThousandSeparator := aNew;
+  {$endif ISDELPHIXE}
+  {$endif FPC}
+end;
+
 // count non-overlapping occurrences of aSub in aText
 function CountSubstr(const aSub, aText: RawUtf8): integer;
 var
@@ -346,8 +365,7 @@ const
     '"model":"text-embedding-3-small"}';
 var
   vecs: TLlmEmbeddingDynArray;
-  saved: TFormatSettings;
-  rtlfs: ^TFormatSettings;
+  saved: char;
 begin
   // A value mORMot cannot hold in currency is stored as TEXT unless the parser
   // was allowed doubles - and reading it back then goes through the RTL's
@@ -357,11 +375,8 @@ begin
   // point of every vector component simply vanishes.
   // Set here rather than trusting the host locale, so the test proves the same
   // thing on the Linux CI as on the German Windows box where it was found.
-  // The global is DefaultFormatSettings in FPC and FormatSettings in Delphi.
-  rtlfs := @{$ifdef FPC}DefaultFormatSettings{$else}FormatSettings{$endif};
-  saved := rtlfs^;
+  saved := SwapThousandSeparator('.');
   try
-    rtlfs^.ThousandSeparator := '.';
     vecs := ParseOpenAIEmbeddings(EMB_RESP);
     CheckEqual(length(vecs), 1, 'one vector');
     CheckEqual(length(vecs[0]), 3, 'three components');
@@ -371,7 +386,7 @@ begin
     CheckSame(vecs[0][1], 0.12345678, 1e-6, 'eight decimals');
     CheckSame(vecs[0][2], 4.9e-5, 1e-9, 'exponent notation');
   finally
-    rtlfs^ := saved;
+    SwapThousandSeparator(saved);
   end;
 end;
 

@@ -36,6 +36,7 @@ implementation
 // build a 4-dim embedding inline (FPC-safe: no inline var / nested function)
 function V4(a, b, c, d: single): TLlmEmbedding;
 begin
+  result := nil; // a managed result starts undefined in FPC's view
   SetLength(result, 4);
   result[0] := a;
   result[1] := b;

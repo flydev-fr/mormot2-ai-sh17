@@ -1,5 +1,6 @@
 /// LandrixAI - agentic RAG: a search_docs MCP tool over the vector store
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - exposes retrieval as an MCP tool (TMcpToolBase) instead of the one-shot
 //   retrieve-then-answer of mormot.ai.rag: the agent decides WHEN to retrieve,
 //   may search several times with refined queries, and grounds its own answer
@@ -72,13 +73,18 @@ type
   // - embeds the query with the given IEmbedder and runs a KNN search over the
   //   given IVectorStore; the embedder and store are not owned (kept alive by
   //   the interface references)
-  TRagSearchTool = class(TMcpToolBase<TRagSearchParams>)
+  // - built on the non-generic TMcpRecordTool, so it compiles on every
+  //   compiler mORMot supports (Delphi 7 included)
+  TRagSearchTool = class(TMcpRecordTool)
   protected
     fEmbedder: IEmbedder;
     fStore: IVectorStore;
     fTopK: integer;
-    function ExecuteTyped(const aParams: TRagSearchParams;
+    function ExecuteRecord(const aParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
+    /// the tool logic, on the typed parameter record
+    function ExecuteTyped(const aParams: TRagSearchParams;
+      const aAuthCtx: TMcpAuthContext): variant; virtual;
   public
     /// wire the tool to an embedder and a vector store
     // - aTopK caps the passages returned per call (<= 0 falls back to 4)
@@ -110,12 +116,18 @@ constructor TRagSearchTool.Create(const aEmbedder: IEmbedder;
   const aStore: IVectorStore; aTopK: integer;
   const aName, aDescription: RawUtf8);
 begin
-  inherited Create(aName, aDescription);
+  inherited CreateTyped(TypeInfo(TRagSearchParams), aName, aDescription);
   fEmbedder := aEmbedder;
   fStore := aStore;
   if aTopK <= 0 then
     aTopK := 4;
   fTopK := aTopK;
+end;
+
+function TRagSearchTool.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TRagSearchParams(aParams), aAuthCtx);
 end;
 
 function TRagSearchTool.ExecuteTyped(const aParams: TRagSearchParams;

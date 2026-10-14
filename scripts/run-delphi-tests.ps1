@@ -66,6 +66,9 @@ New-Item -ItemType Directory -Force -Path $dcu | Out-Null
 # vec0 selbst finden (wie run-fpc-llm-tests.sh): ohne SQLITE_EXT_DIR ueberspringt
 # sich der Vectorstore-Test stumm und sieht trotzdem wie ein Lauf aus
 $ext = Join-Path $lai 'vendor\sqlite-ext\x86_64-win64'
+# nur fuer diesen Lauf: am Ende wiederhergestellt, sonst erbt ein spaeterer Lauf
+# in derselben PowerShell (etwa der Win32-Lauf mit Delphi 7) die 64-Bit-vec0
+$extDirBefore = $env:SQLITE_EXT_DIR
 if (-not $env:SQLITE_EXT_DIR -and (Test-Path $ext)) {
   $env:SQLITE_EXT_DIR = $ext
   Write-Host ">>> SQLITE_EXT_DIR=$ext (vec0 gefunden)"
@@ -120,5 +123,6 @@ foreach ($s in $suites) {
     $failed++
   }
 }
+$env:SQLITE_EXT_DIR = $extDirBefore
 if ($failed -gt 0) { exit 1 }
 exit 0

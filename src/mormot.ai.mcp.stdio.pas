@@ -34,6 +34,17 @@ uses
 
 {$I-} // avoid io check in writeln()
 
+/// prepare a text input for MCP stdio: the messages are UTF-8 on every platform
+// - sets the UTF-8 code page where the RTL decodes Text I/O (FPC, Delphi 2009+);
+//   pre-Unicode Delphi (7) reads bytes unchanged, nothing to set there
+procedure McpPrepareInput(var aInput: Text);
+
+/// read one line of an MCP stdio stream as UTF-8
+// - false at end of input or on an I/O error
+// - the decoding follows McpPrepareInput: the result is exactly the UTF-8 the
+//   client wrote, on every compiler
+function McpReadLine(var aInput: Text; out aLine: RawUtf8): boolean;
+
 type
   /// Worker thread for reading from stdin
   // - runs in background to avoid blocking main thread
@@ -111,26 +122,53 @@ begin
     TMcpStdioTransport(fTransport).ProcessRequest(aLine);
 end;
 
-procedure TMcpStdioWorker.Execute;
+procedure McpPrepareInput(var aInput: Text);
+begin
+  // Text I/O decodes with the system code page by default (ANSI on Windows, for
+  // Delphi and FPC alike); MCP stdio messages are UTF-8 on every platform
+  {$ifdef HASCODEPAGE}
+  SetTextCodePage(aInput, CP_UTF8);
+  {$endif HASCODEPAGE}
+end;
+
+function McpReadLine(var aInput: Text; out aLine: RawUtf8): boolean;
 var
   line: string;
+begin
+  result := false;
+  aLine := '';
+  if Eof(aInput) then
+    exit;
+  ReadLn(aInput, line);
+  if IOResult <> 0 then
+    exit;
+  {$ifdef HASCODEPAGE}
+  // the RTL decoded UTF-8 into the native string type (code page set above)
+  aLine := StringToUtf8(line);
+  {$else}
+  // pre-Unicode Delphi: string is an AnsiString holding the bytes as they
+  // came - already the UTF-8 the client sent. StringToUtf8 would treat them
+  // as ANSI and encode every non-ASCII character a second time.
+  aLine := RawUtf8(line);
+  {$endif HASCODEPAGE}
+  result := true;
+end;
+
+procedure TMcpStdioWorker.Execute;
+var
+  line: RawUtf8;
 begin
   // Blocking read loop. ReadLn waits for the next request by itself - the loop
   // used to sleep 500 ms BEFORE every read, adding half a second to each
   // request. It also never noticed EOF: {$I-} suppresses the I/O exception it
   // waited for, so a client closing stdin left the server process running.
-  // Text I/O decodes with the system code page by default (ANSI on Windows, for
-  // Delphi and FPC alike); MCP stdio messages are UTF-8 on every platform
-  SetTextCodePage(Input, CP_UTF8);
+  McpPrepareInput(Input);
   try
     while not Terminated do
     begin
-      if Eof(Input) then
+      if not McpReadLine(Input, line) then
         break;            // the client closed stdin: the session is over
-      ReadLn(line);
-      if IOResult <> 0 then
-        break;
-      ProcessLine(StringToUtf8(line));
+      ProcessLine(line);
     end;
   finally
     fInputClosed := true;
@@ -169,7 +207,9 @@ begin
     // Still through Output, not the raw handle: a host (or a test) may redirect
     // Output with AssignFile. Set on every write, because that redirection
     // resets the code page of the text file.
+    {$ifdef HASCODEPAGE}
     SetTextCodePage(Output, CP_UTF8);
+    {$endif HASCODEPAGE}
     WriteLn(aLine);
     Flush(Output);  // Ensure immediate delivery
   finally

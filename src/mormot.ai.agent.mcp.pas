@@ -1,5 +1,6 @@
 /// LandrixAI LLM Client - MCP toolbox bridge
 // - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - lets a TLlmAgent drive the very tools a mormot.ai.mcp server exposes: the
 //   bridge talks to the in-process server over JSON-RPC, exactly as a remote
 //   MCP client would, and the same RTTI-generated input schema describes both ends
@@ -100,7 +101,10 @@ begin
   if aArgumentsJson <> '' then
   begin
     if not IsValidJson(aArgumentsJson) then
-      exit(FormatUtf8('{"error":"invalid tool arguments JSON: %"}', [aArgumentsJson]));
+    begin
+      result := FormatUtf8('{"error":"invalid tool arguments JSON: %"}', [aArgumentsJson]);
+      exit;
+    end;
     // _JsonFastFloat: this goes on to a real MCP server, which validates
     // against the tool's schema - a float arriving as a string fails that
     args := _JsonFastFloat(aArgumentsJson);
@@ -119,7 +123,10 @@ begin
   doc := _Safe(v);
   // surface a JSON-RPC error as text so the model can recover instead of failing
   if doc^.O['error']^.Count > 0 then
-    exit(FormatUtf8('{"error":"%"}', [doc^.O['error']^.U['message']]));
+  begin
+    result := FormatUtf8('{"error":"%"}', [doc^.O['error']^.U['message']]);
+    exit;
+  end;
   res := doc^.O['result'];
   content := res^.A['content'];
   result := '';

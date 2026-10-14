@@ -14,7 +14,7 @@
 ## 1. Was LandrixAI ist (und was nicht)
 
 LandrixAI ist eine **mORMot-basierte AI-/LLM-Toolbox** im Namespace `mormot.ai.*`,
-**FPC primär** (Linux/Windows, x64/aarch64) und **Delphi 13 soweit möglich** (Win64),
+**FPC primär** (Linux/Windows/macOS, x64/aarch64) und **Delphi 7 bis 13** (Win32/Win64),
 veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
 
 - **Eigene Extension statt mORMot-PR** (Entscheidung 2026-07-29). Ein Pull Request
@@ -34,10 +34,55 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
   (`scripts/run-delphi-tests.ps1`, Win64). Regel: keine FPC-Eigenheit ohne Not — aber
   auch keine Doppelimplementierung erzwingen. Was nur unter FPC geht (der POSIX-
   Prozessstart in `vendor/mormot.ext.os`), bleibt per `{$ifdef FPC}`
-  abgegrenzt und fehlt unter Delphi eben. **Ziel seit 2026-10-14:** dieselbe
-  Compiler-Breite wie mORMot2, also auch **Delphi 7** (Win32); Befund und Vorgehen in
+  abgegrenzt und fehlt unter Delphi eben. **Seit 2026-10-14:** dieselbe Compiler-Breite
+  wie mORMot2, also auch **Delphi 7** (Win32) — Bibliothek und beide Suiten grün
+  (`scripts/run-delphi7-tests.ps1`); Umbau in
   [docs/native-inference.md](docs/native-inference.md#delphi-7). Die Landrix-Plattform selbst bleibt FPC-only;
   diese Ausnahme gilt nur für die Extension.
+- **Code im Stil von mORMot2** (verbindlich, 2026-10-14): Die Extension soll sich lesen
+  und bauen wie eine mORMot2-Unit, damit sie neben mORMot nicht als Fremdkörper wirkt und
+  dieselben Compiler trägt. Zwei Teile:
+
+  **Wie mORMot2** (bevorzugte Muster, wie sie mORMot selbst überwiegend nutzt):
+  - **Unit-Kopf**: `/// Titel`, dann `// - …`-Zeilen mit der Lizenzzeile
+    `// - licensed under a MPL/GPL/LGPL three license - see LICENSE`, danach
+    `{$I mormot.defines.inc}`. Längere Units gliedern sich in `{ ************ Abschnitt }`
+    und nennen die Abschnitte in einem Übersichtsblock unter der `unit`-Zeile.
+  - **Typen und Bausteine von mORMot** vor den RTL-Pendants:
+    - `RawUtf8` statt `string`, `PtrInt` für Indizes;
+    - JSON über `TDocVariantData`/`_ObjFast`;
+    - Text mit `FormatUtf8`;
+    - `TSynDictionary`, `TSynThread`, `TSynTempBuffer`, `TLightLock`.
+  - **Ausnahmen**: eigene Klassen von `ESynException` abgeleitet (Projektstandard), mit
+    `CreateUtf8`/`RaiseUtf8` oder `CreateU` für feste Meldungen.
+  - **Benennung**: Felder `f…`, Parameter `a…` (außer in Signaturen, die mORMot
+    vorgibt, etwa `Ctxt`), Klassen `T…`, Zeiger `P…`, Ausnahmen `E…`; `result`/`exit`
+    klein, zwei Leerzeichen Einzug, `begin` in eigener Zeile.
+  - **Doku**: `///` vor öffentlichen Symbolen, Details als `// - …`-Aufzählung,
+    Kommentare englisch.
+
+  **Strenger als mORMot2** (landrixai-Entscheidungen, wegen Delphi 7 und Lesbarkeit):
+  - **Nicht-generischer Kern**: keine Generics in der Bibliothek, außer als optionale
+    typisierte Hülle unter `HASGENERICS` über einem nicht-generischen Kern (Beispiel
+    `TMcpToolBase<T>` über `TMcpRecordTool`).
+  - Keine anonymen Methoden, keine Inline-Variablen, keine Array-Konstruktoren.
+  - Kein `exit(wert)` (Delphi 7) und kein `with`. mORMot nutzt beides vereinzelt, wir
+    nicht.
+  - Records mit Methoden als `{$ifdef USERECORDWITHMETHODS}record{$else}object{$endif}`.
+  - Quelltext ohne BOM, nur ASCII in String-Literalen.
+  - **Leistung**: in heißen Schleifen keine Allokation je Element; amortisiert
+    wachsende Puffer (wie in `TTopK`) sind erlaubt.
+
+  Nachschlagen: Skill `landrix-mormot2` und die mORMot2-Quellen selbst.
+
+  **Stand 2026-10-14**:
+  - Der strengere Teil ist erfüllt (Delphi 7 baut).
+  - Offen beim mORMot-Teil:
+    - der Übersichtsblock unter der `unit`-Zeile in den meisten Units;
+    - vereinzelt `integer` statt `PtrInt` als Index (z. B. `TTopK`);
+    - die undokumentierte Beispiel-Unit `mormot.ai.mcp.tools`.
+  - Zeilenenden sind im Repo einheitlich LF (mORMot speichert CRLF). Das ist bewusst so,
+    weil die Extension primär unter Linux gebaut wird.
 - **Die eiserne Regel bleibt**: **kein Landrix-Domänenwissen im `mormot.ai.*`-Code.**
   Sie begründet sich jetzt aus der **Repo-Grenze** (die Extension muss ohne Landrix
   brauchbar sein), nicht mehr aus der Upstream-Fähigkeit.
@@ -242,7 +287,7 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 **Reihenfolge:**
 1. Referenzvertrag und deutscher Testkorpus ✓
 2. nativer Store ✓ (ersetzt vec0)
-3. Delphi-7-Portierung des bestehenden Codes (§9 Punkt 9), **vor** dem Engine-Code;
+3. Delphi-7-Portierung des bestehenden Codes (§9 Punkt 9) ✓ (2026-10-14);
    danach Engine Phase 0, Python-Referenz:
    - festgelegte FP32-Referenz pro Layer;
    - winzige Fixtures.
@@ -549,13 +594,12 @@ Roadmap — DESIGN.md verweist hierher.
    lembed-Runtime, s. Punkt 4).
 9. **Plattformbreite wie mORMot2** (2026-10-14, Befunde in
    [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests)):
-   - **Delphi 7** (Win32): 11 von 22 Units bauen. Portierung:
-     - MCP-Registries nicht-generisch;
-     - typisierte Tools über eine RTTI-Basis, `TMcpToolBase<T>` bleibt als Hülle;
-     - `exit(x)` ersetzen, `object` statt Record mit Methoden;
-     - eigenes Testskript mit Laufzeit-Gates.
-
-     Aufwand: einige Tage.
+   - **Delphi 7** (Win32) ✓ **erledigt 2026-10-14**: alle 22 Units, MCP- und LLM-Suite
+     grün (`scripts/run-delphi7-tests.ps1`). MCP-Registries auf `TSynDictionary`,
+     typisierte Tools auf `TMcpRecordTool` (`TMcpToolBase<T>` bleibt als Hülle unter
+     `HASGENERICS`, der Konsument unverändert), `exit(x)` ersetzt, `object` statt Record
+     mit Methoden. Gefunden und behoben: stdio hätte unter Delphi 7 UTF-8 doppelt
+     kodiert (Test `StdioReadsUtf8Unchanged`).
    - **Windows ARM** (FPC 3.3.1): Die Suiten sind grün, sofern eine ARM64-`sqlite3-64.dll`
      danebenliegt; mORMot2 hat für `aarch64-win64` kein statisches SQLite. Es fehlen ein
      Testskript und die Beschaffung der DLL.

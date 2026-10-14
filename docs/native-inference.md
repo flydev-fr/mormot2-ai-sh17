@@ -26,6 +26,11 @@ in diesen Plan ein.
 Jede Schicht hat eine schmale, nicht-generische Schnittstelle. Neue Formate, Backends,
 Tokenizer oder Modelle kommen dazu, ohne dass Bestehendes geändert wird.
 
+Stil: wie der Rest der Extension **im Stil von mORMot2** — Regeln in
+[CONCEPT.md §1](../CONCEPT.md). Für die Engine heißt das vor allem: keine Generics und
+keine anonymen Methoden (Delphi 7), mORMot-Bausteine für Threads und Puffer, keine
+Heap-Allokation in den Rechenschleifen.
+
 Ablage (entschieden): im Unterordner **`src/infer/`** dieses Repos. Das ist eine klare
 Grenze, ohne zweites Repo und ohne tiefe Verzeichnishierarchie. mORMot2 selbst ordnet
 ebenso nach `src/<bereich>/`. Die Build-Skripte müssen den Pfad zusätzlich aufnehmen;
@@ -275,13 +280,13 @@ Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding, MoE.
 
 | Plattform | Compiler | Ergebnis |
 |---|---|---|
-| WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (LLM 656, alle Demos) |
-| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1012, LLM 647 (der vec0-Test wird mangels Extension übersprungen) |
-| Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1012 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
-| Windows x64 | Delphi 13 | grün (Stand 2026-10-13: LLM 659) |
+| WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, alle Demos) |
+| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen) |
+| Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
+| Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659) |
 | Windows x64 unter Prism | FPC 3.2.2 | nur Kompatibilitätsprobe, nicht für Leistungsaussagen |
-| Windows 11 x64, i9-14900K, 96 GB, RTX 5090 (32 GB, Treiber 616.64), per SSH (`rtx5090`) | FPC 3.2.2 (fpcupdeluxe) | grün: MCP 1012, LLM 647, **nativ** (ohne Prism). Delphi 13 ist installiert, CUDA-Toolkit (`nvcc`) nicht. |
-| Windows x86 | **Delphi 7** | 11 von 22 Units bauen, siehe unten |
+| Windows 11 x64, i9-14900K, 96 GB, RTX 5090 (32 GB, Treiber 616.64), per SSH (`rtx5090`) | FPC 3.2.2 (fpcupdeluxe) | grün **vor** dem Delphi-7-Umbau: MCP 1012, LLM 647, **nativ** (ohne Prism); danach nicht erneut gemessen (Rechner aus). Delphi 13 ist installiert, CUDA-Toolkit (`nvcc`) nicht. |
+| Windows x86 | **Delphi 7** | grün nach dem Umbau (MCP 1253, LLM 647; vec0 übersprungen, es gibt kein 32-Bit-Bundle), siehe unten |
 
 ### Rollen im Testplan
 
@@ -304,7 +309,16 @@ geprüft. Grüne Ergebnisse aus übersprungenen Tests darf es nicht geben:
 
 ## Delphi 7
 
-**Befund (2026-10-14, dcc32 gegen mORMot2 master):**
+> **Erledigt (2026-10-14):** alle 22 Units bauen, beide Suiten laufen unter Delphi 7 grün
+> (`scripts/run-delphi7-tests.ps1`), ebenso weiter unter FPC 3.2.4/3.2.2, Delphi 13, macOS
+> und Windows ARM. Umgesetzt wie unten geplant; dazu ein Fund: der stdio-Transport hätte
+> unter Delphi 7 eingehendes UTF-8 doppelt kodiert (`StringToUtf8` auf einem AnsiString) —
+> behoben in `McpReadLine`, abgesichert durch `StdioReadsUtf8Unchanged`, das erstmals den
+> echten Lesepfad prüft. Vorher dazugekommen: `RegistriesKeepTheirContract` und
+> `TypedToolCarriesManagedFields` als Netz für den Umbau, danach
+> `GenericShellMatchesRecordTool`. Fallen für die Engine: siehe „Praxis" unten.
+
+**Befund vor dem Umbau (2026-10-14, dcc32 gegen mORMot2 master):**
 - mORMot2-Kern, `mormot.db.raw.sqlite3.static` und `mormot.net.client` bauen.
 - Von den 22 landrixai-Units bauen **11** unverändert: `llm`, `llm.types`, `llm.openai`,
   `llm.anthropic`, `llm.sse`, `embeddings`, `embed.provider`, `vectorstore`, `rag`,
@@ -353,6 +367,18 @@ Hauptrisiko: das Ganze als reine Syntaxarbeit zu behandeln, während Schema-Erze
 Serialisierung oder die Lebensdauer verwalteter Felder zur Laufzeit brechen. Aufwand:
 einige Tage.
 
+**Praxis (beim Umbau gelernt, gilt auch für die Engine):**
+- Keine Array-Konstruktoren (`TFoo.Create(1, 2)`), kein `Default()`, kein `as` vom
+  Interface auf die Klasse (`ObjectFromInterface`), kein `TThread.Start` (`TSynThread`),
+  keine Konstante `-2147483648` (`Low(integer)`), kein `UnicodeString` ohne
+  `HASVARUSTRING`, keine globale `FormatSettings` (vor Delphi XE).
+- Kein UTF-8-BOM und keine Nicht-ASCII-Zeichen in String-Literalen: Delphi liest eine
+  Datei ohne BOM als ANSI.
+- Nach dem ersten Fehler meldet dcc32 oft Folgefehler in fremden Units (auch in mORMot) —
+  immer den ersten Fehler beheben.
+- Delphi 7 kürzt den Programmnamen am ersten Punkt (`mcp.tests` → `mcp.exe`) und braucht
+  FastMM4 als eigene Bibliothek.
+
 **Engine unter Delphi 7 / Win32:**
 - Reine Pascal-Referenz, keine SIMD-Pflicht. Assembler wäre möglich, ist aber kein Ziel.
 - Große Gewichte als Q8_0/F16; Normparameter und Ähnliches bleiben F32. Akkumuliert wird
@@ -399,8 +425,7 @@ einige Tage.
 
 1. ~~Lizenz~~ — **entschieden 2026-10-14**: mORMot-Dreifachlizenz für das ganze Repo,
    auch für die Engine (`LICENSE`).
-2. ~~Zeitpunkt der Delphi-7-Portierung~~ — **entschieden 2026-10-14**: bald, **vor** dem
-   ersten Engine-Code. Dann entsteht die Engine von Anfang an unter dem
-   Delphi-7-Testskript, und niemand muss sie später zurückportieren.
+2. ~~Zeitpunkt der Delphi-7-Portierung~~ — **erledigt 2026-10-14**, vor dem ersten
+   Engine-Code: die Engine entsteht von Anfang an unter `run-delphi7-tests.ps1`.
 3. **Maximale Kontextlänge** für Embeddings: 512 Tokens wie im Vertrag v1, oder mehr? Das
    bestimmt den Speicherbedarf der Attention.
