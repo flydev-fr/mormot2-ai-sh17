@@ -2,9 +2,10 @@
 
 > **Status (2026-10-14):** Phase 0, 1a und 1b erledigt: BGE-M3 läuft nativ von Text bis
 > Vektor, in FP32 gegen PyTorch und aus demselben Q8-GGUF wie lembed gegen das Orakel
-> (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 erledigt: schneller als
-> lembed bei gleichem CPU-Budget und weniger Speicher; offen sind AVX2 für x86_64 (die
-> Produktion), die Messung dort und das Umschalten des Defaults.
+> (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 und x86_64 (AVX2) erledigt:
+> auf x86_64 doppelt so schnell wie lembed, auf aarch64 gleichauf bis schneller, jeweils
+> mit weniger Speicher. Offen sind der Lauf unter Linux x86_64 (die Produktion), der
+> Langlauf und das Umschalten des Defaults.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -370,9 +371,33 @@ Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigen
   `Exact`-Modus im seriellen Attention-Pfad, einen Delphi-7-Startfehler (signalisierendes
   NaN durch die x87-FPU) und Tests, die NaN durchließen. Alle behoben, mit Gegenprobe.
 
-**Offen für 1c:** AVX2-Kernel für x86_64 (Linux-Docker ist die Produktion), Messung auf
-echter x86-Hardware, Langlauf für die Erstindizierung, dann das Umschalten des Defaults
-im Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
+**Stand 2026-10-14: Teil b (x86_64, AVX2) erledigt.**
+- **Kernel** in `kernels` unter `{$ifdef CPUX64}{$ifdef ASMX64AVX1}`, Auswahl zur Laufzeit
+  bei AVX2 + FMA + F16C: der FP32-Kernel 4×2 (vpsignb/vpmaddubsw/vpmaddwd wie ggml, FMA
+  mit dw·dx), der Quantisierer (byte-gleich zu Pascal), die exakten Integer-Blocksummen
+  (vpmovsxbw + vpmaddwd, auch für -128) und die beiden float-Attention-Kernel.
+- **Eine ABI für alle:** Jeder Kernel bekommt genau einen Record mit seinen Parametern
+  und Platz für die Register, die die ABI zurückverlangt (unter Win64 auch xmm6 bis
+  xmm15). Der Asm-Körper ist damit für Win64 und System V, FPC und Delphi derselbe; eine
+  Pascal-Hülle mit der gewohnten Signatur füllt den Record.
+- **F16C als Bytes:** FPC 3.2.2 kennt `vcvtph2ps`/`vcvtps2ph` nicht; per objdump geprüft.
+- **Vertrag des FP32-Kernels:** Aktivierungen liegen in -127..127 (der Quantisierer
+  schreibt nie -128). Der vpsignb-Trick von ggml verlangt das; der Test hält sich daran.
+- **LayerNorm auf allen Kernen**, zeilenweise, je Zeile die Referenzarithmetik: bitgleich
+  in beiden Modi. Auf dem i9 fiel sie damit von 26 % auf 3 % der Zeit.
+- **Messung** (i9-14900K, Windows 11, FPC 3.2.2 win64; Zahlen in der README): nativ
+  1039 Tokens/s gegen lembed 524 (×1,98), 377 MB gegen 514 MB Spitzenspeicher, Kosinus
+  ≥ 0,9991. Default (22 Threads) ist zugleich der beste Wert.
+- **Windows drosselt fensterlose Prozesse** (Power Throttling/EcoQoS, z. B. per SSH oder
+  als Dienst gestartet): Beide Engines verlieren dann etwa die Hälfte (lembed 187, nativ
+  417). `embed-bench` schaltet das für sich ab; ein Windows-Dienst, der viel einbettet,
+  sollte es ebenso tun.
+- **Erstindizierung, hochgerechnet:** 20 Texte/s bei ⌀ 51 Tokens ergeben für 2 Mio Texte
+  rund 28 h auf dem i9.
+
+**Offen für 1c:** der Lauf der Suite unter Linux x86_64 (System-V-Pfad, bisher nur
+übersetzt), der Langlauf für die Erstindizierung, dann das Umschalten des Defaults im
+Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
 
 ### Phase 2 — Decoder
 

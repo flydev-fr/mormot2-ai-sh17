@@ -251,7 +251,47 @@ provider or runtime, not only against tests.
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | pgvector backend | **not built** | phase E — the `IVectorStore` seam exists, the implementation does not |
 | Ollama embedder | **not built** | phase E |
-| Native inference engine (embeddings, then LLMs) | **in progress** | own Pascal engine, replaces `lembed` and every foreign `.so`; BGE-M3 runs from the same Q8 GGUF as lembed and passes its gates (not the default yet) — [docs/native-inference.md](docs/native-inference.md) |
+| Native inference engine (embeddings, then LLMs) | **in progress** | own Pascal engine, replaces `lembed` and every foreign `.so`; BGE-M3 runs from the same Q8 GGUF as lembed and passes its gates; about twice lembed's throughput on x86_64 (AVX2), on par or faster on aarch64 (not the default yet, see below) — [docs/native-inference.md](docs/native-inference.md) |
+
+### Native inference: measured throughput
+
+BGE-M3 (`bge-m3-q8_0.gguf`, the file lembed uses) on the embed-de corpus: 320 texts,
+16268 tokens, mean 51 tokens per text, one text at a time. `demos/infer/embed-bench`
+runs both engines over the same loop (`embed-bench [gguf] all [threads|lembed]`); runs
+alternate between the engines so that heat and background load hit both alike.
+Quality is the same on every platform: cosine against the lembed vectors >= 0.9991,
+nDCG@10 0.9004 (lembed 0.8963).
+
+**x86_64, AVX2** — Intel Core i9-14900K (8 P-cores with HT + 16 E-cores, 32 threads),
+Windows 11, FPC 3.2.2 win64, 2026-10-14:
+
+| | lembed | native | native / lembed |
+|---|---|---|---|
+| default threads, run 1 / 2 | 524 / 525 tokens/s | 1039 / 1027 tokens/s (22 threads) | 1.98x / 1.96x |
+| native with 8 / 16 / 24 / 32 threads | | 739 / 954 / 1040 / 959 tokens/s | |
+| peak working set | 514 MB | 377 MB | 0.73x |
+
+Without a visible window (started over SSH, or as a service) Windows throttles a
+process after a few seconds (EcoQoS): both engines then lose about half their speed —
+lembed 187, native 417 tokens/s on the same machine. The benchmark opts out with
+`SetProcessInformation(ProcessPowerThrottling)` (set `LAI_THROTTLE=1` to keep it); a
+Windows service doing bulk embedding should do the same. On Linux x86_64 the same
+kernels are built for the System V calling convention; that build has not run on
+hardware yet.
+
+**aarch64, NEON dot product** — Snapdragon X (12 cores), WSL2, FPC 3.2.4, model on the
+Linux file system, 2026-10-14:
+
+| | lembed | native | native / lembed |
+|---|---|---|---|
+| 4 cores (taskset, 4 threads each), run 1 / 2 | 359 / 297 tokens/s | 361 / 341 tokens/s | 1.00x / 1.15x |
+| whole machine, default threads, run 1 / 2 | 336 / 316 tokens/s | 385 / 315 tokens/s (8 threads) | 1.15x / 0.99x |
+| peak RSS | 758 MB | 617 MB | 0.81x |
+
+Peak RSS includes the pages of the mapped model file and moves with the page cache
+(480 to 617 MB for native over several runs).
+The laptop throttles under sustained load; the spread between runs is that, not noise
+in the engines. The default thread count is two thirds of the logical cores.
 
 Two things follow from the "needs a native library" rows: those features are **optional at
 runtime** (missing library ⇒ skip, never crash), and the libraries are **not in git** —

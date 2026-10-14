@@ -130,6 +130,9 @@ type
     fDxs: TSingleDynArray;
     fScratch: array of TSingleDynArray;
     fRowBlocks: PtrInt;
+    fGamma, fBeta: PSingleArray;
+    fEps: double;
+    fCols: PtrInt;
     procedure LinearTile(aItem: integer);
     procedure QuantizeRow(aItem: integer);
     procedure AttentionItem(aItem: integer);
@@ -137,6 +140,7 @@ type
     procedure AttentionSerial(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray);
     procedure GeluRange(aItem: integer);
+    procedure LayerNormRows(aItem: integer);
     procedure RunParallel(const aJob: TOnInferItem; aCount: integer);
   public
     /// aThreads: the threads to compute on, the calling one included; 0 means
@@ -147,6 +151,8 @@ type
     procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     procedure Gelu(x: PSingleArray; aCount: PtrInt); override;
+    procedure LayerNorm(x: PSingleArray; aRows, aCols: PtrInt;
+      gamma, beta: PSingleArray; aEps: double; y: PSingleArray); override;
     procedure Attention(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     /// the threads computing, the calling one included
@@ -880,6 +886,12 @@ begin
     @aJob.Xq^[first]);
   for b := first to first + aJob.Blocks - 1 do
   begin
+    // a block beyond 127 * 65504 has the FP16 scale +Inf (ggml writes it too):
+    // every product with it is Inf or NaN, and the SIMD kernels must not trap
+    // inside (see kernels) - refused here, before any of them runs
+    if aJob.Xq^[b].d and $7fff = $7c00 then
+      EInferError.RaiseUtf8('Linear: activation beyond the Q8_0 range in block %',
+        [b - first]);
     aJob.Dx^[b] := INFER_HALF[aJob.Xq^[b].d];
     aJob.Dxs^[b] := INFER_HALF[aJob.Xq^[b].d];
   end;
@@ -1351,6 +1363,43 @@ begin
     fX := x;
     fRows := aCount;
     RunParallel(GeluRange, (aCount + 4095) shr 12);
+  finally
+    fBusy.UnLock;
+  end;
+end;
+
+const
+  /// rows per LayerNorm work item
+  LAYERNORM_ROWS = 2;
+
+procedure TInferCpuFastBackend.LayerNormRows(aItem: integer);
+var
+  first: PtrInt;
+begin
+  // the reference arithmetic, each row on one thread: bit-identical
+  first := PtrInt(aItem) * LAYERNORM_ROWS;
+  inherited LayerNorm(@fX^[first * fCols], MinPtrInt(LAYERNORM_ROWS, fRows - first),
+    fCols, fGamma, fBeta, fEps, @fY^[first * fCols]);
+end;
+
+procedure TInferCpuFastBackend.LayerNorm(x: PSingleArray; aRows, aCols: PtrInt;
+  gamma, beta: PSingleArray; aEps: double; y: PSingleArray);
+begin
+  if (aRows < 2 * LAYERNORM_ROWS) or (aRows * aCols < 8192) or
+     not fBusy.TryLock then
+  begin
+    inherited LayerNorm(x, aRows, aCols, gamma, beta, aEps, y);
+    exit;
+  end;
+  try
+    fX := x;
+    fY := y;
+    fRows := aRows;
+    fCols := aCols;
+    fGamma := gamma;
+    fBeta := beta;
+    fEps := aEps;
+    RunParallel(LayerNormRows, (aRows + LAYERNORM_ROWS - 1) div LAYERNORM_ROWS);
   finally
     fBusy.UnLock;
   end;

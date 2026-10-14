@@ -5,8 +5,10 @@
 //   tokens/s, the time per backend operation, the peak memory and the cosine
 //   against the lembed vectors of tests/data/embed-de/reference
 //
-//   usage: embed-bench [gguf] [texts=all] [threads=0 (all cores) | ref]
+//   usage: embed-bench [gguf] [texts=all] [threads=0 (default) | ref | lembed]
 //   - ref: the scalar reference backend, otherwise TInferCpuFastBackend
+//   - lembed: the same loop through sqlite-lembed (vendor/sqlite-ext/<cpu>-<os>),
+//     for a comparison on one machine with one program
 //   e.g.   embed-bench vendor/models/bge-m3-q8_0.gguf 40 1
 program embed.bench;
 
@@ -18,6 +20,9 @@ program embed.bench;
 
 uses
   {$I mormot.uses.inc}
+  {$ifdef OSWINDOWS}
+  windows,
+  {$endif OSWINDOWS}
   sysutils,
   mormot.core.base,
   mormot.core.os,
@@ -26,6 +31,11 @@ uses
   mormot.core.buffers,
   mormot.core.variants,
   mormot.core.perf,
+  mormot.ai.llm.types,
+  mormot.ai.embeddings,
+  mormot.db.raw.sqlite3.static, // the SQLite that hosts lembed
+  mormot.ai.sqlite,
+  mormot.ai.embed.lembed,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
@@ -174,6 +184,10 @@ var
   s: RawUtf8;
   p: PUtf8Char;
 {$endif OSLINUX}
+{$ifdef OSWINDOWS}
+var
+  info: TMemoryInfo;
+{$endif OSWINDOWS}
 begin
   result := -1;
   {$ifdef OSLINUX}
@@ -182,7 +196,45 @@ begin
   if p <> nil then
     result := GetCardinal(PUtf8Char(GotoNextNotSpace(p + 6))) div 1024;
   {$endif OSLINUX}
+  {$ifdef OSWINDOWS}
+  if GetMemoryInfo(info, true) then
+    result := info.allocreserved shr 20; // the peak working set
+  {$endif OSWINDOWS}
 end;
+
+{$ifdef OSWINDOWS}
+/// opt out of Windows power throttling (EcoQoS): a process without a visible
+// window - e.g. started over SSH or as a service - is otherwise slowed down
+// after a while, which spoils any long measurement
+procedure NoPowerThrottling;
+type
+  TPowerThrottling = record
+    Version, ControlMask, StateMask: cardinal;
+  end;
+var
+  setInfo: function(aProcess: THandle; aClass: integer; aInfo: pointer;
+    aSize: cardinal): LongBool; stdcall;
+  state: TPowerThrottling;
+begin
+  setInfo := GetProcAddress(GetModuleHandle('kernel32.dll'), 'SetProcessInformation');
+  if not Assigned(setInfo) then
+    exit;
+  state.Version := 1;            // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+  state.ControlMask := 1;        // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+  state.StateMask := 0;          // ... switched off
+  if setInfo(GetCurrentProcess, 4 {ProcessPowerThrottling}, @state,
+       SizeOf(state)) then
+    ConsoleWrite('power throttling: off');
+end;
+{$endif OSWINDOWS}
+
+const
+  /// the largest text of each length bucket, in tokens (512 = the model limit)
+  BUCKET_MAX: array[0..3] of integer = (16, 64, 256, 512);
+  /// the folder of the sqlite-lembed build for this platform
+  EXT_PLATFORM =
+    {$ifdef CPUX64} 'x86_64-' {$else} 'aarch64-' {$endif CPUX64} +
+    {$ifdef OSWINDOWS} 'win64' {$else} 'linux' {$endif OSWINDOWS};
 
 /// <dir>/<aPath> for the first of the program folder and its parents holding it
 function FindUp(const aPath: TFileName): TFileName;
@@ -208,12 +260,18 @@ var
   raw: RawUtf8;
   row: TDocVariantData;
   cpu: TInferCpuBackend;
+  lembed: IEmbedder;
+  extDir: TFileName;
   timed: TTimedBackend;
   emb: TInferEmbedder;
   i, n, limit, tokens, h, below: PtrInt;
   t0, t1: Int64;
   cos, minCos, a: double;
   j: PtrInt;
+  t2, t3: Int64;
+  bucket: integer;
+  // per text length bucket (up to 16, 64, 256, 512 tokens): texts, tokens, us
+  bTexts, bTokens, bTime: array[0..3] of Int64;
 begin
   gguf := '';
   if ParamCount >= 1 then
@@ -259,6 +317,67 @@ begin
     MoveFast(pointer(raw)^, pointer(ref)^, length(raw));
   end;
   n := MinPtrInt(limit, length(texts));
+  {$ifdef OSWINDOWS}
+  if GetEnvironmentVariable('LAI_THROTTLE') = '' then
+    NoPowerThrottling;
+  {$endif OSWINDOWS}
+  if (ParamCount >= 3) and (ParamStr(3) = 'lembed') then
+  begin
+    extDir := FindUp(MakePath(['vendor', 'sqlite-ext', EXT_PLATFORM,
+      'lembed0' + SqliteExtSuffix]));
+    if extDir = '' then
+    begin
+      ConsoleWrite('lembed0 for % not found', [EXT_PLATFORM]);
+      ExitCode := 2;
+      exit;
+    end;
+    QueryPerformanceMicroSeconds(t0);
+    lembed := TLembedEmbedder.Create(StringToUtf8(ExtractFileDir(extDir)),
+      StringToUtf8(gguf), 'bench');
+    QueryPerformanceMicroSeconds(t1);
+    ConsoleWrite('backend: lembed %, loaded in % ms', [EXT_PLATFORM, (t1 - t0) div 1000]);
+    minCos := 1;
+    below := 0;
+    QueryPerformanceMicroSeconds(t0);
+    for i := 0 to n - 1 do
+    begin
+      v := lembed.Embed(texts[i]);
+      if ref <> nil then
+      begin
+        cos := 0;
+        for j := 0 to high(v) do
+        begin
+          a := v[j];
+          cos := cos + a * ref[i * length(v) + j];
+        end;
+        if cos < minCos then
+          minCos := cos;
+        if cos < 0.999 then
+          inc(below);
+      end;
+    end;
+    QueryPerformanceMicroSeconds(t1);
+    ConsoleWrite('peak RSS: % MB', [PeakRssMB]);
+    lembed := nil;
+    // the token count from the native tokenizer, after the timed run
+    cpu := TInferCpuBackend.Create;
+    emb := TInferEmbedder.CreateFromGguf(gguf, cpu);
+    try
+      tokens := 0;
+      for i := 0 to n - 1 do
+        inc(tokens, length(emb.Tokenizer.Encode(texts[i])));
+    finally
+      emb.Free;
+      cpu.Free;
+    end;
+    ConsoleWrite('% texts, % tokens (mean %) in % ms: % texts/s, % tokens/s',
+      [n, tokens, tokens / MaxPtrInt(n, 1), (t1 - t0) div 1000,
+       n * 1e6 / NotZero(t1 - t0), tokens * 1e6 / NotZero(t1 - t0)]);
+    if ref <> nil then
+      ConsoleWrite('cosine against the lembed reference: min %, % below 0.999',
+        [minCos, below]);
+    exit;
+  end;
   if (ParamCount >= 3) and (ParamStr(3) = 'ref') then
   begin
     cpu := TInferCpuBackend.Create;
@@ -283,11 +402,28 @@ begin
     tokens := 0;
     minCos := 1;
     below := 0;
+    FillCharFast(bTexts, SizeOf(bTexts), 0);
+    FillCharFast(bTokens, SizeOf(bTokens), 0);
+    FillCharFast(bTime, SizeOf(bTime), 0);
     QueryPerformanceMicroSeconds(t0);
     for i := 0 to n - 1 do
     begin
-      inc(tokens, length(emb.Tokenizer.Encode(texts[i])));
+      j := length(emb.Tokenizer.Encode(texts[i]));
+      inc(tokens, j);
+      if j <= 16 then
+        bucket := 0
+      else if j <= 64 then
+        bucket := 1
+      else if j <= 256 then
+        bucket := 2
+      else
+        bucket := 3;
+      QueryPerformanceMicroSeconds(t2);
       v := emb.Embed([texts[i]]);
+      QueryPerformanceMicroSeconds(t3);
+      inc(bTexts[bucket]);
+      inc(bTokens[bucket], j);
+      inc(bTime[bucket], t3 - t2);
       if ref <> nil then
       begin
         cos := 0;
@@ -308,6 +444,12 @@ begin
        n * 1e6 / NotZero(t1 - t0), tokens * 1e6 / NotZero(t1 - t0)]);
     if ref <> nil then
       ConsoleWrite('cosine against lembed: min %, % below 0.999', [minCos, below]);
+    for bucket := 0 to 3 do
+      if bTexts[bucket] > 0 then
+        ConsoleWrite('  up to % tokens: % texts, % tokens, % ms per text, % tokens/s',
+          [BUCKET_MAX[bucket], bTexts[bucket], bTokens[bucket],
+           bTime[bucket] / 1000 / bTexts[bucket],
+           bTokens[bucket] * 1000000 div NotZero(bTime[bucket])]);
     ConsoleWrite('peak RSS: % MB', [PeakRssMB]);
     ConsoleWrite(timed.Report(t1 - t0));
   finally

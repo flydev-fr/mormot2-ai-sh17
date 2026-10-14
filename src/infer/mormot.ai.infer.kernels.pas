@@ -12,7 +12,11 @@
 // - aarch64 with the dot product extension (ARMv8.2 SDOT, detected at runtime):
 //   NEON; FPC 3.2.x cannot assemble NEON register lists, so the vector
 //   instructions are embedded as their encodings, each commented with its
-//   mnemonic. Everything else: the Pascal loop
+//   mnemonic
+// - x86_64 with AVX2, FMA and F16C (detected at runtime), FPC and Delphi 11+ on
+//   Windows and System V: every kernel takes one record holding its parameters
+//   and room for the registers the ABI wants back, so one assembler body serves
+//   both calling conventions. Everything else: the Pascal loop
 unit mormot.ai.infer.kernels;
 
 {
@@ -84,7 +88,7 @@ var
   /// float weighted value sum of the fast backend, nil without a kernel:
   // y += sum over j of p[j] * (v + j * aStride bytes), aDim a multiple of 16
   InferAxpyRowsF32: TInferDotsF32;
-  /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod'
+  /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod', 'avx2'
   InferQ8KernelName: RawUtf8;
   /// every IEEE half (raw bits) as single - 256 KB, filled at initialization
   INFER_HALF: array[word] of single;
@@ -688,6 +692,644 @@ end;
 {$endif FPC}
 {$endif CPUAARCH64}
 
+{$ifdef CPUX64}
+{$ifdef ASMX64AVX1}
+
+{$define INFERAVX2}
+
+type
+  /// the one argument of every x86_64 kernel: its parameters, then room to keep
+  // the registers the ABI wants back - so the assembler body is the same for
+  // the Windows and the System V calling convention, and for FPC and Delphi
+  TInferAvx2Args = packed record
+    /// the parameters, offsets 0 .. 56
+    A: array[0..7] of PtrInt;
+    /// rbx rsi rdi r12 r13 r14 r15, offsets 64 .. 112
+    G: array[0..7] of PtrInt;
+    /// xmm6 .. xmm15 (Win64 only), offsets 128 .. 272
+    X: array[0..9] of THash128;
+  end;
+
+// the F16C conversions are written as bytes: FPC 3.2 does not know them
+// - no frame the Win64 unwinder knows: an FP exception raised inside a kernel
+// would leave the caller's rbx/rsi/rdi/r12/r13 and xmm6..15 clobbered. The
+// inputs are finite by contract - activations are checked by the quantizer,
+// a +Inf activation scale is refused before any kernel runs (LinearQuantizeRow)
+
+/// Q8DotF32x4x2Avx2 body: A = w, xA, xB, aBlocks, aDxA, aDxB, aStride, aOut
+// - per block and pair (weight row k, activation row): |w| times x with the sign
+// of w (vpsignb), u8 x s8 pairs (vpmaddubsw), int16 pairs (vpmaddwd): eight
+// exact int32 lanes, converted to float and multiply-added by dw * dx (FMA);
+// the lanes are added only at the end, as ggml's AVX2 path does
+// - needs activations within -127 .. 127 (the quantizer never writes -128):
+// x = -128 under a negative weight would overflow vpsignb
+procedure Q8DotF32x4x2Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     qword ptr [r11 + 64], rbx
+        mov     qword ptr [r11 + 72], rsi
+        mov     qword ptr [r11 + 80], rdi
+        mov     qword ptr [r11 + 88], r12
+        mov     qword ptr [r11 + 96], r13
+        {$ifdef ABIWINX64}
+        vmovups oword ptr [r11 + 128], xmm6
+        vmovups oword ptr [r11 + 144], xmm7
+        vmovups oword ptr [r11 + 160], xmm8
+        vmovups oword ptr [r11 + 176], xmm9
+        vmovups oword ptr [r11 + 192], xmm10
+        vmovups oword ptr [r11 + 208], xmm11
+        vmovups oword ptr [r11 + 224], xmm12
+        vmovups oword ptr [r11 + 240], xmm13
+        vmovups oword ptr [r11 + 256], xmm14
+        vmovups oword ptr [r11 + 272], xmm15
+        {$endif ABIWINX64}
+        // r8 = w row 0, r10 = w row 1, r9 = aStride: rows 2 and 3 are
+        // [r8 + r9 * 2] and [r10 + r9 * 2]; rsi = xA, rdi = xB,
+        // r12 = aDxA, r13 = aDxB, rcx = aBlocks
+        mov     r8, qword ptr [r11]
+        mov     rsi, qword ptr [r11 + 8]
+        mov     rdi, qword ptr [r11 + 16]
+        mov     rcx, qword ptr [r11 + 24]
+        mov     r12, qword ptr [r11 + 32]
+        mov     r13, qword ptr [r11 + 40]
+        mov     r9, qword ptr [r11 + 48]
+        lea     r10, [r8 + r9]
+        mov     eax, 00010001H
+        vmovd   xmm7, eax
+        vpbroadcastd ymm7, xmm7          // sixteen int16 ones
+        vxorps  ymm8, ymm8, ymm8          // row A, weight rows 0 .. 3
+        vxorps  ymm9, ymm9, ymm9
+        vxorps  ymm10, ymm10, ymm10
+        vxorps  ymm11, ymm11, ymm11
+        vxorps  ymm12, ymm12, ymm12       // row B, weight rows 0 .. 3
+        vxorps  ymm13, ymm13, ymm13
+        vxorps  ymm14, ymm14, ymm14
+        vxorps  ymm15, ymm15, ymm15
+        test    rcx, rcx
+        jz      @done
+@block: vmovdqu ymm0, yword ptr [rsi + 2]
+        vmovdqu ymm1, yword ptr [rdi + 2]
+        // weight row 0
+        vmovdqu ymm2, yword ptr [r8 + 2]
+        vpsignb ymm3, ymm2, ymm2
+        vpsignb ymm4, ymm0, ymm2
+        vpmaddubsw ymm4, ymm3, ymm4
+        vpmaddwd ymm4, ymm4, ymm7
+        vcvtdq2ps ymm4, ymm4
+        vpsignb ymm5, ymm1, ymm2
+        vpmaddubsw ymm5, ymm3, ymm5
+        vpmaddwd ymm5, ymm5, ymm7
+        vcvtdq2ps ymm5, ymm5
+        movzx   eax, word ptr [r8]
+        vmovd   xmm6, eax
+        db      0C4H, 0E2H, 79H, 13H, 0F6H // vcvtph2ps xmm6, xmm6 (F16C)
+        vmulss  xmm2, xmm6, dword ptr [r12]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm8, ymm4, ymm2
+        vmulss  xmm2, xmm6, dword ptr [r13]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm12, ymm5, ymm2
+        // weight row 1
+        vmovdqu ymm2, yword ptr [r10 + 2]
+        vpsignb ymm3, ymm2, ymm2
+        vpsignb ymm4, ymm0, ymm2
+        vpmaddubsw ymm4, ymm3, ymm4
+        vpmaddwd ymm4, ymm4, ymm7
+        vcvtdq2ps ymm4, ymm4
+        vpsignb ymm5, ymm1, ymm2
+        vpmaddubsw ymm5, ymm3, ymm5
+        vpmaddwd ymm5, ymm5, ymm7
+        vcvtdq2ps ymm5, ymm5
+        movzx   eax, word ptr [r10]
+        vmovd   xmm6, eax
+        db      0C4H, 0E2H, 79H, 13H, 0F6H // vcvtph2ps xmm6, xmm6 (F16C)
+        vmulss  xmm2, xmm6, dword ptr [r12]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm9, ymm4, ymm2
+        vmulss  xmm2, xmm6, dword ptr [r13]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm13, ymm5, ymm2
+        // weight row 2
+        vmovdqu ymm2, yword ptr [r8 + r9 * 2 + 2]
+        vpsignb ymm3, ymm2, ymm2
+        vpsignb ymm4, ymm0, ymm2
+        vpmaddubsw ymm4, ymm3, ymm4
+        vpmaddwd ymm4, ymm4, ymm7
+        vcvtdq2ps ymm4, ymm4
+        vpsignb ymm5, ymm1, ymm2
+        vpmaddubsw ymm5, ymm3, ymm5
+        vpmaddwd ymm5, ymm5, ymm7
+        vcvtdq2ps ymm5, ymm5
+        movzx   eax, word ptr [r8 + r9 * 2]
+        vmovd   xmm6, eax
+        db      0C4H, 0E2H, 79H, 13H, 0F6H // vcvtph2ps xmm6, xmm6 (F16C)
+        vmulss  xmm2, xmm6, dword ptr [r12]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm10, ymm4, ymm2
+        vmulss  xmm2, xmm6, dword ptr [r13]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm14, ymm5, ymm2
+        // weight row 3
+        vmovdqu ymm2, yword ptr [r10 + r9 * 2 + 2]
+        vpsignb ymm3, ymm2, ymm2
+        vpsignb ymm4, ymm0, ymm2
+        vpmaddubsw ymm4, ymm3, ymm4
+        vpmaddwd ymm4, ymm4, ymm7
+        vcvtdq2ps ymm4, ymm4
+        vpsignb ymm5, ymm1, ymm2
+        vpmaddubsw ymm5, ymm3, ymm5
+        vpmaddwd ymm5, ymm5, ymm7
+        vcvtdq2ps ymm5, ymm5
+        movzx   eax, word ptr [r10 + r9 * 2]
+        vmovd   xmm6, eax
+        db      0C4H, 0E2H, 79H, 13H, 0F6H // vcvtph2ps xmm6, xmm6 (F16C)
+        vmulss  xmm2, xmm6, dword ptr [r12]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm11, ymm4, ymm2
+        vmulss  xmm2, xmm6, dword ptr [r13]
+        vbroadcastss ymm2, xmm2
+        vfmadd231ps ymm15, ymm5, ymm2
+        add     r8, 34
+        add     r10, 34
+        add     rsi, 34
+        add     rdi, 34
+        add     r12, 4
+        add     r13, 4
+        sub     rcx, 1
+        jnz     @block
+        // the eight lanes of the four rows into [row 0, row 1, row 2, row 3]
+@done:  vhaddps ymm8, ymm8, ymm9
+        vhaddps ymm10, ymm10, ymm11
+        vhaddps ymm8, ymm8, ymm10
+        vextractf128 xmm9, ymm8, 1
+        vaddps  xmm8, xmm8, xmm9
+        vhaddps ymm12, ymm12, ymm13
+        vhaddps ymm14, ymm14, ymm15
+        vhaddps ymm12, ymm12, ymm14
+        vextractf128 xmm13, ymm12, 1
+        vaddps  xmm12, xmm12, xmm13
+        mov     rax, qword ptr [r11 + 56]
+        vmovups oword ptr [rax], xmm8
+        vmovups oword ptr [rax + 16], xmm12
+        vzeroupper
+        {$ifdef ABIWINX64}
+        movups  xmm6, oword ptr [r11 + 128]
+        movups  xmm7, oword ptr [r11 + 144]
+        movups  xmm8, oword ptr [r11 + 160]
+        movups  xmm9, oword ptr [r11 + 176]
+        movups  xmm10, oword ptr [r11 + 192]
+        movups  xmm11, oword ptr [r11 + 208]
+        movups  xmm12, oword ptr [r11 + 224]
+        movups  xmm13, oword ptr [r11 + 240]
+        movups  xmm14, oword ptr [r11 + 256]
+        movups  xmm15, oword ptr [r11 + 272]
+        {$endif ABIWINX64}
+        mov     rbx, qword ptr [r11 + 64]
+        mov     rsi, qword ptr [r11 + 72]
+        mov     rdi, qword ptr [r11 + 80]
+        mov     r12, qword ptr [r11 + 88]
+        mov     r13, qword ptr [r11 + 96]
+end;
+
+procedure Q8DotF32x4x2Avx2(w, xA, xB: PInferBlockQ8_0; aBlocks: PtrInt;
+  aDxA, aDxB: PSingleArray; aStride: PtrInt; aOut: PSingleArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(xA);
+  args.A[2] := PtrInt(xB);
+  args.A[3] := aBlocks;
+  args.A[4] := PtrInt(aDxA);
+  args.A[5] := PtrInt(aDxB);
+  args.A[6] := aStride;
+  args.A[7] := PtrInt(aOut);
+  Q8DotF32x4x2Avx2Asm(args);
+end;
+
+/// Q8BlockDots4Avx2 body: A = w, x, aBlocks, aSums, aStride
+// - exact int32 sums for any int8 input, -128 included: the bytes are sign
+// extended to int16 (vpmovsxbw) and multiplied pairwise (vpmaddwd)
+procedure Q8BlockDots4Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     qword ptr [r11 + 72], rsi
+        mov     qword ptr [r11 + 80], rdi
+        {$ifdef ABIWINX64}
+        vmovups oword ptr [r11 + 128], xmm6
+        vmovups oword ptr [r11 + 144], xmm7
+        vmovups oword ptr [r11 + 160], xmm8
+        vmovups oword ptr [r11 + 176], xmm9
+        vmovups oword ptr [r11 + 192], xmm10
+        vmovups oword ptr [r11 + 208], xmm11
+        {$endif ABIWINX64}
+        // r8 = w row 0, r10 = w row 1, r9 = aStride, rsi = x, rcx = aBlocks,
+        // rdi = aSums
+        mov     r8, qword ptr [r11]
+        mov     rsi, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     rdi, qword ptr [r11 + 24]
+        mov     r9, qword ptr [r11 + 32]
+        lea     r10, [r8 + r9]
+        test    rcx, rcx
+        jz      @done
+@block: vpmovsxbw ymm2, oword ptr [rsi + 2]
+        vpmovsxbw ymm3, oword ptr [rsi + 18]
+        vpmovsxbw ymm4, oword ptr [r8 + 2]
+        vpmaddwd ymm4, ymm4, ymm2
+        vpmovsxbw ymm5, oword ptr [r8 + 18]
+        vpmaddwd ymm5, ymm5, ymm3
+        vpaddd  ymm4, ymm4, ymm5
+        vpmovsxbw ymm6, oword ptr [r10 + 2]
+        vpmaddwd ymm6, ymm6, ymm2
+        vpmovsxbw ymm7, oword ptr [r10 + 18]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        vpmovsxbw ymm8, oword ptr [r8 + r9 * 2 + 2]
+        vpmaddwd ymm8, ymm8, ymm2
+        vpmovsxbw ymm9, oword ptr [r8 + r9 * 2 + 18]
+        vpmaddwd ymm9, ymm9, ymm3
+        vpaddd  ymm8, ymm8, ymm9
+        vpmovsxbw ymm10, oword ptr [r10 + r9 * 2 + 2]
+        vpmaddwd ymm10, ymm10, ymm2
+        vpmovsxbw ymm11, oword ptr [r10 + r9 * 2 + 18]
+        vpmaddwd ymm11, ymm11, ymm3
+        vpaddd  ymm10, ymm10, ymm11
+        vphaddd ymm4, ymm4, ymm6
+        vphaddd ymm8, ymm8, ymm10
+        vphaddd ymm4, ymm4, ymm8
+        vextracti128 xmm5, ymm4, 1
+        vpaddd  xmm4, xmm4, xmm5
+        vmovdqu oword ptr [rdi], xmm4
+        add     r8, 34
+        add     r10, 34
+        add     rsi, 34
+        add     rdi, 16
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+        {$ifdef ABIWINX64}
+        movups  xmm6, oword ptr [r11 + 128]
+        movups  xmm7, oword ptr [r11 + 144]
+        movups  xmm8, oword ptr [r11 + 160]
+        movups  xmm9, oword ptr [r11 + 176]
+        movups  xmm10, oword ptr [r11 + 192]
+        movups  xmm11, oword ptr [r11 + 208]
+        {$endif ABIWINX64}
+        mov     rsi, qword ptr [r11 + 72]
+        mov     rdi, qword ptr [r11 + 80]
+end;
+
+procedure Q8BlockDots4Avx2(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
+  aSums: PIntegerArray; aStride: PtrInt);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aSums);
+  args.A[4] := aStride;
+  Q8BlockDots4Avx2Asm(args);
+end;
+
+/// Q8BlockDotsAvx2 body: A = w, x, aBlocks, aSums - exact, as the 4-row one
+procedure Q8BlockDotsAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     r10, qword ptr [r11 + 24]
+        test    rcx, rcx
+        jz      @done
+@block: vpmovsxbw ymm2, oword ptr [r9 + 2]
+        vpmovsxbw ymm3, oword ptr [r9 + 18]
+        vpmovsxbw ymm4, oword ptr [r8 + 2]
+        vpmaddwd ymm4, ymm4, ymm2
+        vpmovsxbw ymm5, oword ptr [r8 + 18]
+        vpmaddwd ymm5, ymm5, ymm3
+        vpaddd  ymm4, ymm4, ymm5
+        vextracti128 xmm5, ymm4, 1
+        vpaddd  xmm4, xmm4, xmm5
+        vphaddd xmm4, xmm4, xmm4
+        vphaddd xmm4, xmm4, xmm4
+        vmovd   dword ptr [r10], xmm4
+        add     r8, 34
+        add     r9, 34
+        add     r10, 4
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+end;
+
+procedure Q8BlockDotsAvx2(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
+  aSums: PIntegerArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aSums);
+  Q8BlockDotsAvx2Asm(args);
+end;
+
+/// DotsF32Avx2 body: A = q, k, aStride, aKeys, aDim, aOut
+// - per key two accumulators of eight float lanes (FMA), summed at the end
+procedure DotsF32Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     qword ptr [r11 + 64], rbx
+        mov     qword ptr [r11 + 72], rsi
+        mov     qword ptr [r11 + 80], rdi
+        // r8 = q, r9 = k, r10 = aStride, rcx = aKeys, rdx = aDim, rax = aOut
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     r10, qword ptr [r11 + 16]
+        mov     rcx, qword ptr [r11 + 24]
+        mov     rdx, qword ptr [r11 + 32]
+        mov     rax, qword ptr [r11 + 40]
+        test    rcx, rcx
+        jz      @done
+        test    rdx, rdx
+        jz      @done
+@key:   mov     rsi, r9
+        mov     rdi, r8
+        mov     rbx, rdx
+        vxorps  ymm0, ymm0, ymm0
+        vxorps  ymm1, ymm1, ymm1
+@dim:   vmovups ymm2, yword ptr [rdi]
+        vmovups ymm3, yword ptr [rdi + 32]
+        vfmadd231ps ymm0, ymm2, yword ptr [rsi]
+        vfmadd231ps ymm1, ymm3, yword ptr [rsi + 32]
+        add     rdi, 64
+        add     rsi, 64
+        sub     rbx, 16
+        jnz     @dim
+        vaddps  ymm0, ymm0, ymm1
+        vextractf128 xmm1, ymm0, 1
+        vaddps  xmm0, xmm0, xmm1
+        vhaddps xmm0, xmm0, xmm0
+        vhaddps xmm0, xmm0, xmm0
+        vmovss  dword ptr [rax], xmm0
+        add     rax, 4
+        add     r9, r10
+        sub     rcx, 1
+        jnz     @key
+@done:  vzeroupper
+        mov     rbx, qword ptr [r11 + 64]
+        mov     rsi, qword ptr [r11 + 72]
+        mov     rdi, qword ptr [r11 + 80]
+end;
+
+procedure DotsF32Avx2(a, b: PSingle; aStride, aCount, aDim: PtrInt;
+  aOut: PSingleArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(a);
+  args.A[1] := PtrInt(b);
+  args.A[2] := aStride;
+  args.A[3] := aCount;
+  args.A[4] := aDim;
+  args.A[5] := PtrInt(aOut);
+  DotsF32Avx2Asm(args);
+end;
+
+/// AxpyRowsF32Avx2 body: A = p, v, aStride, aKeys, aDim, y
+procedure AxpyRowsF32Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     qword ptr [r11 + 64], rbx
+        mov     qword ptr [r11 + 72], rsi
+        mov     qword ptr [r11 + 80], rdi
+        // r8 = p, r9 = v, r10 = aStride, rcx = aKeys, rdx = aDim, rax = y
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     r10, qword ptr [r11 + 16]
+        mov     rcx, qword ptr [r11 + 24]
+        mov     rdx, qword ptr [r11 + 32]
+        mov     rax, qword ptr [r11 + 40]
+        test    rcx, rcx
+        jz      @done
+        test    rdx, rdx
+        jz      @done
+@key:   vbroadcastss ymm3, dword ptr [r8]
+        add     r8, 4
+        mov     rsi, r9
+        mov     rdi, rax
+        mov     rbx, rdx
+@dim:   vmovups ymm4, yword ptr [rdi]
+        vmovups ymm5, yword ptr [rdi + 32]
+        vfmadd231ps ymm4, ymm3, yword ptr [rsi]
+        vfmadd231ps ymm5, ymm3, yword ptr [rsi + 32]
+        vmovups yword ptr [rdi], ymm4
+        vmovups yword ptr [rdi + 32], ymm5
+        add     rdi, 64
+        add     rsi, 64
+        sub     rbx, 16
+        jnz     @dim
+        add     r9, r10
+        sub     rcx, 1
+        jnz     @key
+@done:  vzeroupper
+        mov     rbx, qword ptr [r11 + 64]
+        mov     rsi, qword ptr [r11 + 72]
+        mov     rdi, qword ptr [r11 + 80]
+end;
+
+procedure AxpyRowsF32Avx2(p, v: PSingle; aStride, aKeys, aDim: PtrInt;
+  y: PSingleArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(p);
+  args.A[1] := PtrInt(v);
+  args.A[2] := aStride;
+  args.A[3] := aKeys;
+  args.A[4] := aDim;
+  args.A[5] := PtrInt(y);
+  AxpyRowsF32Avx2Asm(args);
+end;
+
+/// Q8QuantizeRowAvx2 body: A = x, aBlocks, y; A[3] receives the status
+// - the same bytes as InferQuantizeRowQ8_0Pascal: d = max|x| / 127 in single,
+// kept as FP16 rounded to nearest even (vcvtps2ph), +Inf written as bits from
+// 65520 on (the conversion would raise the overflow FPC and Delphi unmask);
+// q = x * (1 / d) rounded to nearest even (vroundps, not the MXCSR mode),
+// all q = 0 when d <= 2^-128; a block with a NaN or an infinity stops the row
+procedure Q8QuantizeRowAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        {$ifdef ABIWINX64}
+        vmovups oword ptr [r11 + 128], xmm6
+        vmovups oword ptr [r11 + 144], xmm7
+        vmovups oword ptr [r11 + 160], xmm8
+        vmovups oword ptr [r11 + 176], xmm9
+        vmovups oword ptr [r11 + 192], xmm10
+        vmovups oword ptr [r11 + 208], xmm11
+        vmovups oword ptr [r11 + 224], xmm12
+        vmovups oword ptr [r11 + 240], xmm13
+        vmovups oword ptr [r11 + 256], xmm14
+        vmovups oword ptr [r11 + 272], xmm15
+        {$endif ABIWINX64}
+        // r8 = x, rcx = blocks left, r9 = y, rdx = aBlocks
+        mov     r8, qword ptr [r11]
+        mov     rdx, qword ptr [r11 + 8]
+        mov     r9, qword ptr [r11 + 16]
+        mov     rcx, rdx
+        mov     eax, 7FFFFFFFH
+        vmovd   xmm15, eax
+        vpbroadcastd ymm15, xmm15        // |x| mask
+        mov     eax, 7F800000H
+        vmovd   xmm14, eax
+        vpbroadcastd ymm14, xmm14        // exponent mask: NaN and infinity
+        mov     eax, 42FE0000H
+        vmovd   xmm13, eax               // 127.0
+        mov     eax, 00200000H
+        vmovd   xmm12, eax               // 2^-128
+        mov     eax, 477FF000H
+        vmovd   xmm11, eax               // 65520.0: rounds to +Inf in FP16
+        mov     eax, 3F800000H
+        vmovd   xmm10, eax               // 1.0
+        mov     rax, 0703060205010400H
+        vmovq   xmm9, rax
+        vpmovzxbd ymm9, xmm9             // dwords 0 4 1 5 2 6 3 7: undo the
+                                         // lane order of the two packs
+        test    rcx, rcx
+        jz      @ok
+@block: vmovups ymm0, yword ptr [r8]
+        vmovups ymm1, yword ptr [r8 + 32]
+        vmovups ymm2, yword ptr [r8 + 64]
+        vmovups ymm3, yword ptr [r8 + 96]
+        vandps  ymm4, ymm0, ymm14
+        vpcmpeqd ymm4, ymm4, ymm14
+        vandps  ymm5, ymm1, ymm14
+        vpcmpeqd ymm5, ymm5, ymm14
+        vpor    ymm4, ymm4, ymm5
+        vandps  ymm5, ymm2, ymm14
+        vpcmpeqd ymm5, ymm5, ymm14
+        vpor    ymm4, ymm4, ymm5
+        vandps  ymm5, ymm3, ymm14
+        vpcmpeqd ymm5, ymm5, ymm14
+        vpor    ymm4, ymm4, ymm5
+        vptest  ymm4, ymm4
+        jnz     @bad
+        vandps  ymm4, ymm0, ymm15
+        vandps  ymm5, ymm1, ymm15
+        vmaxps  ymm4, ymm4, ymm5
+        vandps  ymm5, ymm2, ymm15
+        vandps  ymm6, ymm3, ymm15
+        vmaxps  ymm5, ymm5, ymm6
+        vmaxps  ymm4, ymm4, ymm5
+        vextractf128 xmm5, ymm4, 1
+        vmaxps  xmm4, xmm4, xmm5
+        vmovhlps xmm5, xmm4, xmm4
+        vmaxps  xmm4, xmm4, xmm5
+        vmovshdup xmm5, xmm4
+        vmaxss  xmm4, xmm4, xmm5
+        vdivss  xmm4, xmm4, xmm13        // d = amax / 127
+        // d in every lane: vcvtps2ph converts four, and the upper lanes still
+        // hold partial maxima - one beyond 65504 would raise the overflow
+        vbroadcastss xmm4, xmm4
+        vucomiss xmm4, xmm11
+        jae     @hinf
+        db      0C4H, 0E3H, 79H, 1DH, 0E5H, 00H // vcvtps2ph xmm5, xmm4, 0 (F16C)
+        vmovd   eax, xmm5
+        mov     word ptr [r9], ax
+        jmp     @hdone
+@hinf:  mov     word ptr [r9], 7C00H
+@hdone: vucomiss xmm4, xmm12
+        jbe     @zero
+        vdivss  xmm5, xmm10, xmm4        // 1 / d
+        vbroadcastss ymm5, xmm5
+        vmulps  ymm0, ymm0, ymm5
+        vmulps  ymm1, ymm1, ymm5
+        vmulps  ymm2, ymm2, ymm5
+        vmulps  ymm3, ymm3, ymm5
+        // nearest, ties to even, whatever rounding mode MXCSR holds (imm 8:
+        // nearest, precision exception suppressed), then an exact truncation
+        vroundps ymm0, ymm0, 8
+        vroundps ymm1, ymm1, 8
+        vroundps ymm2, ymm2, 8
+        vroundps ymm3, ymm3, 8
+        vcvttps2dq ymm0, ymm0
+        vcvttps2dq ymm1, ymm1
+        vcvttps2dq ymm2, ymm2
+        vcvttps2dq ymm3, ymm3
+        vpackssdw ymm0, ymm0, ymm1
+        vpackssdw ymm2, ymm2, ymm3
+        vpacksswb ymm0, ymm0, ymm2
+        vpermd  ymm0, ymm9, ymm0
+        vmovdqu yword ptr [r9 + 2], ymm0
+        jmp     @next
+@zero:  vpxor   ymm0, ymm0, ymm0
+        vmovdqu yword ptr [r9 + 2], ymm0
+@next:  add     r8, 128
+        add     r9, 34
+        sub     rcx, 1
+        jnz     @block
+@ok:    xor     eax, eax
+        jmp     @ret
+@bad:   mov     rax, rdx
+        sub     rax, rcx
+        add     rax, 1
+@ret:   mov     qword ptr [r11 + 24], rax
+        vzeroupper
+        {$ifdef ABIWINX64}
+        movups  xmm6, oword ptr [r11 + 128]
+        movups  xmm7, oword ptr [r11 + 144]
+        movups  xmm8, oword ptr [r11 + 160]
+        movups  xmm9, oword ptr [r11 + 176]
+        movups  xmm10, oword ptr [r11 + 192]
+        movups  xmm11, oword ptr [r11 + 208]
+        movups  xmm12, oword ptr [r11 + 224]
+        movups  xmm13, oword ptr [r11 + 240]
+        movups  xmm14, oword ptr [r11 + 256]
+        movups  xmm15, oword ptr [r11 + 272]
+        {$endif ABIWINX64}
+end;
+
+function Q8QuantizeRowAvx2(x: PSingle; aBlocks: PtrInt;
+  y: PInferBlockQ8_0): PtrInt;
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(x);
+  args.A[1] := aBlocks;
+  args.A[2] := PtrInt(y);
+  Q8QuantizeRowAvx2Asm(args);
+  result := args.A[3];
+end;
+
+{$endif ASMX64AVX1}
+{$endif CPUX64}
+
 procedure InitKernels;
 var
   h: cardinal;
@@ -717,6 +1359,21 @@ begin
   end;
   {$endif FPC}
   {$endif CPUAARCH64}
+  {$ifdef INFERAVX2}
+  // AVX2 with FMA and F16C (Haswell, Zen and later; cfAVX2 and cfFMA are
+  // cleared when the OS does not save the YMM registers)
+  if (cfAVX2 in CpuFeatures) and (cfFMA in CpuFeatures) and
+     (cfF16C in CpuFeatures) then
+  begin
+    InferDotsF32 := DotsF32Avx2;
+    InferAxpyRowsF32 := AxpyRowsF32Avx2;
+    InferQ8QuantizeRow := Q8QuantizeRowAvx2;
+    InferQ8BlockDots := Q8BlockDotsAvx2;
+    InferQ8BlockDots4 := Q8BlockDots4Avx2;
+    InferQ8DotF32x4x2 := Q8DotF32x4x2Avx2;
+    InferQ8KernelName := 'avx2';
+  end;
+  {$endif INFERAVX2}
 end;
 
 initialization

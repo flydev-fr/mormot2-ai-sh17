@@ -58,8 +58,9 @@ type
     procedure KernelsMatchPascal;
     /// exact mode: Linear F32 and Q8_0, odd shapes included: the same bytes
     procedure LinearIsBitIdentical;
-    /// exact mode: Attention (with a mask) and GELU: the same bytes
-    procedure AttentionAndGeluAreBitIdentical;
+    /// exact mode: Attention (with a mask), GELU and LayerNorm (both modes):
+    // the same bytes as the reference
+    procedure ElementwiseOpsAreBitIdentical;
     /// default mode: Linear, Attention and GELU within their tolerances
     procedure FastModeWithinTolerance;
     /// the thread pool: exactly once, bursts, exceptions
@@ -205,7 +206,7 @@ end;
 
 procedure TTestInferFast.KernelsMatchPascal;
 var
-  xs, d1, d2: TSingleDynArray;
+  xs, d1, d2, g: TSingleDynArray;
   q1, q2: RawByteString;
   r, j, n: PtrInt;
   w, x: RawByteString;
@@ -214,11 +215,12 @@ var
   dx, acc, accRef, magn: TDoubleDynArray;
   dxs, out8: TSingleDynArray;
   wb: PInferBlockQ8_0;
+  a8: double;
 begin
   AddConsole(Utf8ToString('Q8_0 kernel: ' + InferQ8KernelName));
   // the activation quantizer of this CPU against the Pascal loop: same bytes,
   // ties, a zero block, subnormal scales, large values included
-  for r := 0 to 5 do
+  for r := 0 to 8 do
   begin
     Fill(xs, 32 * 9, 900 + r, 10);
     case r of
@@ -245,32 +247,85 @@ begin
           for j := 96 to 127 do
             xs[j] := xs[j] * 5e-37;
         end;
+      6:
+        // a valid scale (787) from values beyond the largest half: no
+        // intermediate of the quantizer may overflow on the way
+        for j := 0 to 63 do
+          xs[j] := 100000 - j * 1000;
+      7, 8:
+        begin
+          // the zero threshold itself: amax = 127 * 2^-128 gives d = 2^-128
+          // exactly (all q = 0); four ulps more give d = 2^-128 + 2^-149, the
+          // first scale above it (one ulp still rounds back to 2^-128)
+          for j := 32 to 63 do
+            xs[j] := xs[j] * 1e-40;
+          PCardinal(@xs[32])^ := $02FE0000 + 4 * cardinal(r - 7);
+        end;
     end;
     SetLength(q1, 9 * SizeOf(TInferBlockQ8_0));
     SetLength(q2, 9 * SizeOf(TInferBlockQ8_0));
     InferQuantizeRowQ8_0(pointer(xs), length(xs), pointer(q1));
     InferQuantizeRowQ8_0Pascal(pointer(xs), length(xs), pointer(q2));
     CheckUtf8(q1 = q2, 'quantizer = Pascal, row %', [r]);
+    if r >= 7 then
+      // block 1 starts with its largest value: q = 0 at the threshold, 127 above
+      CheckEqual(PInferBlockQ8_0Array(pointer(q1))^[1].qs[0], 127 * (r - 7),
+        'quantizer at the zero threshold');
+  end;
+  if Assigned(InferQ8QuantizeRow) then
+  begin
+    // a NaN in block 3 of 9: status 1 + 3, blocks 0..2 written as by Pascal,
+    // nothing written for block 3 or after it
+    Fill(xs, 32 * 9, 950, 10);
+    InferQuantizeRowQ8_0Pascal(pointer(xs), 3 * 32, pointer(q2));
+    PCardinal(@xs[3 * 32 + 17])^ := $7fc00000;
+    q1 := '';
+    SetLength(q1, 9 * SizeOf(TInferBlockQ8_0));
+    FillCharFast(pointer(q1)^, length(q1), $AA);
+    j := InferQ8QuantizeRow(pointer(xs), 9, pointer(q1));
+    CheckEqual(j, 4, 'quantizer status of a NaN in block 3');
+    CheckUtf8(CompareMem(pointer(q1), pointer(q2), 3 * SizeOf(TInferBlockQ8_0)),
+      'quantizer: the blocks before the bad one', []);
+    for j := 3 * SizeOf(TInferBlockQ8_0) to length(q1) - 1 do
+      if q1[j + 1] <> #$AA then
+      begin
+        CheckUtf8(false, 'quantizer wrote byte % after the bad block', [j]);
+        break;
+      end;
   end;
   // the float attention kernels against double sums
   if Assigned(InferDotsF32) then
   begin
+    // rows of n values, n + 16 apart (as heads inside a wider row)
     n := 64;
-    Fill(xs, n * 7, 31, 2);
+    Fill(xs, (n + 16) * 7, 31, 2);
     Fill(d1, n, 32, 2);
-    SetLength(d2, 7);
-    InferDotsF32(pointer(d1), pointer(xs), n * SizeOf(single), 7, n, pointer(d2));
+    SetLength(d2, 8);
+    d2[7] := 12345;
+    InferDotsF32(pointer(d1), pointer(xs), (n + 16) * SizeOf(single), 7, n,
+      pointer(d2));
     for j := 0 to 6 do
-    begin
-      CheckUtf8(Abs(d2[j] - DotD(pointer(d1), @xs[j * n], n)) <=
-        1e-5 * SumAbs(pointer(d1), @xs[j * n], n), 'float dot %', [j]);
-    end;
-    SetLength(d2, n);
+      CheckUtf8(Abs(d2[j] - DotD(pointer(d1), @xs[j * (n + 16)], n)) <=
+        1e-5 * SumAbs(pointer(d1), @xs[j * (n + 16)], n), 'float dot %', [j]);
+    CheckUtf8(d2[7] = 12345, 'float dot: nothing beyond the keys', []);
+    d2[0] := 12345;
+    InferDotsF32(pointer(d1), pointer(xs), (n + 16) * SizeOf(single), 0, n,
+      pointer(d2));
+    CheckUtf8(d2[0] = 12345, 'float dot: no key, nothing written', []);
+    SetLength(d2, n + 1);
     FillCharFast(pointer(d2)^, n * SizeOf(single), 0);
-    InferAxpyRowsF32(pointer(d1), pointer(xs), n * SizeOf(single), 7, n, pointer(d2));
+    d2[n] := 12345;
+    InferAxpyRowsF32(pointer(d1), pointer(xs), (n + 16) * SizeOf(single), 7, n,
+      pointer(d2));
     for j := 0 to n - 1 do
-      CheckUtf8(Abs(d2[j] - AxpyD(pointer(d1), pointer(xs), n, 7, j)) <= 1e-4,
+      CheckUtf8(Abs(d2[j] - AxpyD(pointer(d1), pointer(xs), n + 16, 7, j)) <= 1e-4,
         'float axpy %', [j]);
+    CheckUtf8(d2[n] = 12345, 'float axpy: nothing beyond the row', []);
+    g := copy(d2);
+    InferAxpyRowsF32(pointer(d1), pointer(xs), (n + 16) * SizeOf(single), 0, n,
+      pointer(d2));
+    CheckUtf8(SameBits(pointer(g), pointer(d2), n + 1),
+      'float axpy: no key, nothing written', []);
   end;
   for nb := 0 to 9 do
   begin
@@ -286,44 +341,68 @@ begin
     InferQ8BlockDots4Pascal(pointer(w), pointer(x), nb, pointer(s2),
       nb * SizeOf(TInferBlockQ8_0));
     CheckUtf8(CompareMem(pointer(s1), pointer(s2), nb * 16), '4-row kernel, % blocks', [nb]);
-    if not Assigned(InferQ8Linear4) then
-      continue;
-    // the fused kernel against the reference arithmetic, row by row
     SetLength(dx, nb + 1);
     for b := 0 to nb - 1 do
       dx[b] := InferHalfToSingle(PInferBlockQ8_0Array(pointer(x))^[b].d);
-    SetLength(acc, 4);
-    SetLength(accRef, 4);
-    SetLength(magn, 4);
-    SetLength(dxs, nb + 1);
-    for b := 0 to nb - 1 do
-      dxs[b] := dx[b];
-    for k := 0 to 3 do
+    if Assigned(InferQ8Linear4) then
     begin
-      acc[k] := k - 1.5; // a bias
-      accRef[k] := acc[k];
-      magn[k] := 0;
-      for b := 0 to nb - 1 do
+      // the fused kernel against the reference arithmetic, row by row
+      SetLength(acc, 4);
+      SetLength(accRef, 4);
+      for k := 0 to 3 do
       begin
-        wb := @PInferBlockQ8_0Array(pointer(w))^[k * nb + b];
-        accRef[k] := accRef[k] + s2[b * 4 + k] * (InferHalfToSingle(wb^.d) * dx[b]);
-        magn[k] := magn[k] + Abs(s2[b * 4 + k] * (InferHalfToSingle(wb^.d) * dx[b]));
+        acc[k] := k - 1.5; // a bias
+        accRef[k] := acc[k];
+        for b := 0 to nb - 1 do
+        begin
+          wb := @PInferBlockQ8_0Array(pointer(w))^[k * nb + b];
+          accRef[k] := accRef[k] + s2[b * 4 + k] * (InferHalfToSingle(wb^.d) * dx[b]);
+        end;
       end;
+      InferQ8Linear4(pointer(w), pointer(x), nb, pointer(dx),
+        nb * SizeOf(TInferBlockQ8_0), pointer(acc));
+      CheckUtf8(CompareMem(pointer(acc), pointer(accRef), 4 * SizeOf(double)),
+        'fused kernel = reference arithmetic, % blocks', [nb]);
     end;
-    InferQ8Linear4(pointer(w), pointer(x), nb, pointer(dx),
-      nb * SizeOf(TInferBlockQ8_0), pointer(acc));
-    CheckUtf8(CompareMem(pointer(acc), pointer(accRef), 4 * SizeOf(double)),
-      'fused kernel = reference arithmetic, % blocks', [nb]);
     if not Assigned(InferQ8DotF32x4x2) then
       continue;
-    // the float kernel: two activation rows, within float rounding of the
-    // exact double sums (no bias)
+    // the float kernel: two different activation rows, within float rounding
+    // of the exact double sums (no bias); activations as the quantizer writes
+    // them, -127 .. 127 (the AVX2 kernel relies on it)
+    x := RandomQ8(2, nb * 32, 199 + nb);
+    for b := 0 to nb * 2 - 1 do
+      for j := 0 to 31 do
+        if PInferBlockQ8_0Array(pointer(x))^[b].qs[j] = -128 then
+          PInferBlockQ8_0Array(pointer(x))^[b].qs[j] := -127;
+    SetLength(dxs, nb * 2 + 1);
+    for b := 0 to nb * 2 - 1 do
+      dxs[b] := InferHalfToSingle(PInferBlockQ8_0Array(pointer(x))^[b].d);
     SetLength(out8, 8);
-    InferQ8DotF32x4x2(pointer(w), pointer(x), pointer(x), nb, pointer(dxs),
-      pointer(dxs), nb * SizeOf(TInferBlockQ8_0), pointer(out8));
-    for k := 0 to 3 do
-      CheckUtf8((Abs(out8[k] - (accRef[k] - (k - 1.5))) <= 1e-5 * (magn[k] + 1)) and
-        (out8[k] = out8[4 + k]), 'float kernel row %, % blocks', [k, nb]);
+    InferQ8DotF32x4x2(pointer(w), pointer(x),
+      @PInferBlockQ8_0Array(pointer(x))^[nb], nb, pointer(dxs), @dxs[nb],
+      nb * SizeOf(TInferBlockQ8_0), pointer(out8));
+    SetLength(accRef, 8);
+    SetLength(magn, 8);
+    for r := 0 to 1 do
+    begin
+      InferQ8BlockDots4Pascal(pointer(w), @PInferBlockQ8_0Array(pointer(x))^[r * nb],
+        nb, pointer(s2), nb * SizeOf(TInferBlockQ8_0));
+      for k := 0 to 3 do
+      begin
+        accRef[r * 4 + k] := 0;
+        magn[r * 4 + k] := 0;
+        for b := 0 to nb - 1 do
+        begin
+          wb := @PInferBlockQ8_0Array(pointer(w))^[k * nb + b];
+          a8 := s2[b * 4 + k] * (InferHalfToSingle(wb^.d) * dxs[r * nb + b]);
+          accRef[r * 4 + k] := accRef[r * 4 + k] + a8;
+          magn[r * 4 + k] := magn[r * 4 + k] + Abs(a8);
+        end;
+      end;
+    end;
+    for k := 0 to 7 do
+      CheckUtf8(Abs(out8[k] - accRef[k]) <= 1e-5 * (magn[k] + 1),
+        'float kernel output %, % blocks: % <> %', [k, nb, out8[k], accRef[k]]);
   end;
 end;
 
@@ -371,7 +450,7 @@ begin
   end;
 end;
 
-procedure TTestInferFast.AttentionAndGeluAreBitIdentical;
+procedure TTestInferFast.ElementwiseOpsAreBitIdentical;
 var
   q, k, v, y1, y2, s, g1, g2: TSingleDynArray;
   keep: TIntegerDynArray;
@@ -407,6 +486,29 @@ begin
     CheckUtf8(SameBits(pointer(g1), pointer(g2), length(g1)), 'gelu of %',
       [length(g1)]);
   end;
+  // LayerNorm: rows split over the pool, every row in the reference
+  // arithmetic - in both modes; below, at and above the parallel threshold,
+  // into another buffer and in place
+  for i := 0 to 4 do
+  begin
+    seq := 1 + i * 16; // 1, 17, 33, 49, 65 rows
+    Fill(g1, seq * 1024, 300 + i, 4);
+    Fill(q, 1024, 400 + i, 1);
+    Fill(k, 1024, 500 + i, 1);
+    SetLength(y1, length(g1));
+    SetLength(y2, length(g1));
+    fRef.LayerNorm(pointer(g1), seq, 1024, pointer(q), pointer(k), 1e-5,
+      pointer(y1));
+    fFast.LayerNorm(pointer(g1), seq, 1024, pointer(q), pointer(k), 1e-5,
+      pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), length(y1)),
+      'layernorm, % rows', [seq]);
+    g2 := copy(g1);
+    fExact.LayerNorm(pointer(g2), seq, 1024, pointer(q), pointer(k), 1e-5,
+      pointer(g2));
+    CheckUtf8(SameBits(pointer(y1), pointer(g2), length(y1)),
+      'layernorm in place, % rows', [seq]);
+  end;
 end;
 
 procedure TTestInferFast.FastModeWithinTolerance;
@@ -419,6 +521,7 @@ var
   keep: TIntegerDynArray;
   wq: RawByteString;
   e, worst: double;
+  refused: boolean;
 begin
   // Q8_0 Linear: float lanes against the double reference - a few float ulps
   // of the largest output
@@ -486,6 +589,27 @@ begin
       worst := e;
   end;
   CheckUtf8(worst <= 1e-9, 'gelu table: error % beyond one single ulp', [worst]);
+  // an activation block whose FP16 scale is +Inf (|x| >= 127 * 65520) is
+  // refused before any kernel runs - on this thread and on the pool
+  for i := 0 to 1 do
+  begin
+    rows := 1 + i * 63;
+    nin := 1024;
+    nout := 100;
+    Fill(x, rows * nin, 171 + i, 3);
+    x[(rows - 1) * nin + 40] := 1e7;
+    wq := RandomQ8(nout, nin, 181 + i);
+    SetLength(y2, rows * nout);
+    refused := false;
+    try
+      fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ8_0), nout,
+        nil, pointer(y2));
+    except
+      on E: EInferError do
+        refused := true;
+    end;
+    CheckUtf8(refused, 'Linear refuses an activation scale of +Inf, % rows', [rows]);
+  end;
 end;
 
 procedure TTestInferFast.CountHit(aItem: integer);
