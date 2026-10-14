@@ -39,6 +39,28 @@ wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
 LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 tiny-gguf lembed-tokens
 ```
 
+## Qwen3 (Phase 2)
+
+`make_reference_qwen3.py` nutzt dieselbe Umgebung und schreibt die Qwen3-Datensätze. Es
+lädt Qwen/Qwen3-0.6B in der Revision `c1899de289a04d12100db370d81485cdf75e47ca` (rund
+1,5 GB) und kopiert die Dateien nach `vendor/models/qwen3-0.6b/` (gitignored, mit
+`LAI_QWEN3_DIR` umlenkbar).
+
+```bash
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen3.py          # alles
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen3.py qwen3-unicode
+```
+
+Ziele:
+- `qwen3-unicode` schreibt `src/infer/mormot.ai.infer.unicode.inc`. Es misst jede
+  Codepoint-Klasse am Pre-Tokenizer von tokenizer.json und baut die NFC-Tabellen so,
+  dass eine Nachbildung des Pascal-Algorithmus den HF-Normalisierer für jeden Codepoint,
+  jedes Paar und Starter mal Zeichen trifft. Der HF-Normalisierer beruht auf älteren
+  Unicode-Daten als Python, deshalb ist er der Vertrag und nicht `unicodedata`.
+- `qwen3-tokens` und `qwen3-chat` sind die Gates von 2a.
+- `tiny-qwen3` und `qwen3` gehören zu 2b und 2c. Das echte Modell braucht rund 6 GB RAM
+  und läuft auf einem Thread einige Minuten.
+
 ## Was das Skript festlegt
 
 - **FP32, eval(), ein Thread, deterministische Algorithmen, Attention „eager".** Jeder

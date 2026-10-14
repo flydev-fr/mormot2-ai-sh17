@@ -1,6 +1,8 @@
 # infer-ref — Referenzdaten der nativen Inferenz
 
-Erzeugt von [tools/infer-ref/make_reference.py](../../../tools/infer-ref/make_reference.py)
+Erzeugt von [tools/infer-ref/make_reference.py](../../../tools/infer-ref/make_reference.py),
+die Qwen3-Datensätze von
+[tools/infer-ref/make_reference_qwen3.py](../../../tools/infer-ref/make_reference_qwen3.py)
 (Umgebung und Festlegungen: [tools/infer-ref/README.md](../../../tools/infer-ref/README.md)).
 Gelesen von der Suite `infer.tests` (`tests/test.infer.ref.pas`). Keine dieser Dateien wird
 von Hand geändert.
@@ -31,6 +33,11 @@ verglichen, sondern elementweise: `|a − r| ≤ atol + rtol·|r|`, dazu Kosinus
 | `q8/` | Q8_0-Arithmetik aus ggml selbst (Build des lembed-Orakels): FP16-Rundung (`ggml_fp32_to_fp16`, mit Gleichständen, Überlauf, Subnormalen), Quantisierung von Aktivierungszeilen durch ggml-cpu (Gleichstände zur geraden Zahl, Nullblock, winzige und große Werte), Q8_0-Linear über `ggml_vec_dot_q8_0_q8_0`, Dequantisierung. | 7 KiB |
 | `tiny-gguf/` | `tiny-xlmr` als GGUF, so wie llama.cpp XLM-R umwandelt: Architektur `bert`, Positionen ab 0 (die ersten pad + 1 Zeilen fallen weg), Matrizen und Wort-Embedding in Q8_0. Vertrag ist `model.gguf`. Erwartete Zustände: jede Matrixmultiplikation mit den Q8_0-Kerneln von ggml, der Rest in float64, nach jeder Operation auf f32 gerundet, exaktes GELU. Drei Sequenzen mit allen Zuständen, dazu ein gepaddeter Batch. | 46 KiB |
 | `lembed-tokens/` | Token-IDs des lembed-Orakels (`lembed_tokenize_json`, GGUF des Referenzvertrags v1) für alle Fälle von `bge-m3-tokens`, in derselben Reihenfolge. `special_literal` markiert die 30 Fälle mit `<s>`, `</s>`, `<pad>`, `<unk>` oder `<mask>` im Text: lembed liest sie als Steuertokens (`parse_special = true`), der native Tokenizer als Text. Alle übrigen 1318 Fälle sind gleich der SentencePiece-Referenz (vom Generator geprüft). | 0,15 MiB |
+
+| `qwen3-tokens/` | Token-IDs als Gate für den Qwen3-Tokenizer (Byte-Level-BPE): alle Texte aus embed-de, die Grenzfälle von `bge-m3-tokens`, 168 Qwen-spezifische Fälle (Kontraktionen samt U+017F, Ziffern, Zeilenumbrüche und Leerraum-Läufe, Satzzeichen, NFC mit Umordnung, Ausschlüssen und Hangul, alle Bytes, lange Läufe, die 26 Zusatztoken als Text) und 1800 erzeugte Mischungen. Referenz ist tokenizer.json **ohne** Zusatztoken: Jeder Text ist Text. `hf_ids`, wo der HF-Tokenizer abweicht (79 Fälle mit Token-Literalen). Text und NFC-Text auch byte-genau im Blob. | 0,6 MiB |
+| `qwen3-chat/` | 21 Gespräche durch das Chat-Template der Revision (transformers rendert, der HF-Tokenizer zerlegt): mit und ohne System, Thinking an und aus, Verlauf mit `<think>`, Tools mit Zahlen und Escapes, Tool-Aufrufe und -Antworten. Gerenderter Text und IDs. | 0,02 MiB |
+| `tiny-qwen3/` | Qwen3 mit 2 Layern, Breite 64, 4 Köpfen auf 2 KV-Köpfen, `head_dim` 32 (nicht 64/4), verbundenen Embeddings und BF16-Gewichten. Vertrag sind `model.safetensors` und `config.json`. Drei Sequenzen mit allen Zuständen, allen Logits und 16 Greedy-Tokens samt Abstand der zwei besten Logits je Schritt. | 0,3 MiB |
+| `qwen3/` | Qwen3-0.6B in FP32: sieben Prompts (roher Text, Chat mit und ohne System, Thinking, Code, Tool-Aufruf), je IDs, Logits der letzten Position und bis zu 48 Greedy-Tokens samt Abstand je Schritt; für zwei Prompts alle 28 Layer-Zustände. Die Gewichte liegen nicht im Repo (`vendor/models/qwen3-0.6b/`). | 7,8 MiB |
 
 Gemessen am 2026-10-14:
 - Beim Tiny-Modell sind die Batch-Zeilen bitgleich mit den Einzelläufen. Bei BGE-M3 weicht

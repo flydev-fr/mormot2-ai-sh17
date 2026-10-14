@@ -305,7 +305,8 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
    und Soak-Test grün):
    - „native" ist der empfohlene Provider im Backend (`AI_EMBED_PROVIDER=native`);
    - lembed bleibt Fallback und Orakel.
-7. Phase 2, Decoder Qwen3
+7. Phase 2, Decoder Qwen3 (2-0 bis 2c ✓ 2026-10-14: Tokenizer, Chat-Template, Forward,
+   KV-Cache; Greedy in FP32 tokengleich zu transformers; offen 2d hinter `ILlmClient`)
 8. Phase 3, Quantisierung und SIMD
 9. Phase 4, CUDA
 
@@ -595,7 +596,9 @@ Roadmap — DESIGN.md verweist hierher.
      Phase 1b (dasselbe Q8-GGUF wie lembed, trifft das Orakel, nDCG@10 0,8989) ✓
      2026-10-14; 1c ✓ 2026-10-14: NEON und AVX2, auf x86_64 1,6- bis 2-mal so schnell
      wie lembed, Linux x86_64 grün, Soak-Test über 90 Minuten bestanden, im Backend der
-     empfohlene Provider; dazu der Load Governor (Punkt 10.7).
+     empfohlene Provider; dazu der Load Governor (Punkt 10.7). Phase 2 bis 2c ✓
+     2026-10-14: Qwen3-0.6B in FP32, Greedy tokengleich zu transformers; offen 2d
+     (`mormot.ai.llm.native` hinter `ILlmClient`).
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.

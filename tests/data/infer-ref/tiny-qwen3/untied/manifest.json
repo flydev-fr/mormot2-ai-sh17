@@ -1,0 +1,65 @@
+{
+ "dataset": "tiny-qwen3/untied",
+ "note": "tiny-qwen3 with its own lm_head (tie_word_embeddings false): logits and final norm of case0",
+ "safetensors_sha256": "572c54d6769df4511466d2bb3246261a50e4e3e274268b7d9df0ea28ad637d4d",
+ "environment": {
+  "created_utc": "2026-10-14T22:00:34Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 3220,
+  "sha256": "63f1c572e4e69cbb3b3f4bbbe7d4f267d7bc7ec2d9438170ab310113d3ca1f70",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "case0.ids",
+   "dtype": "i32",
+   "shape": [
+    5
+   ],
+   "offset": 0,
+   "bytes": 20,
+   "sha256": "935ea33c39d631247df4ceefb145685345cf7ca56f5f883a9b6476fefdf3dd00"
+  },
+  {
+   "name": "case0.logits",
+   "dtype": "f32",
+   "shape": [
+    5,
+    96
+   ],
+   "offset": 20,
+   "bytes": 1920,
+   "sha256": "de574ef10edfecd2ded2184f08cbbe86101d07e47dc4d316efe718fb02024d5c"
+  },
+  {
+   "name": "case0.norm",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 1940,
+   "bytes": 1280,
+   "sha256": "ace9d1ca9f8ab5d1b6d6481ea722b255637e7b246735428f84991ab1f0cc015c"
+  }
+ ]
+}

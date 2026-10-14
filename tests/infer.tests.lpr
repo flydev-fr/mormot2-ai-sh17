@@ -20,7 +20,9 @@ uses
   test.infer.xlmr,
   test.infer.tokenizer,
   test.infer.gguf,
-  test.infer.fast;
+  test.infer.fast,
+  test.infer.bpe,
+  test.infer.qwen3;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -36,7 +38,9 @@ begin
     TTestInferXlmr,
     TTestInferTokenizer,
     TTestInferGguf,
-    TTestInferFast
+    TTestInferFast,
+    TTestInferBpe,
+    TTestInferQwen3
   ]);
 end;
 

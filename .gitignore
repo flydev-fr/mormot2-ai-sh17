@@ -27,3 +27,6 @@ demos/.env
 *.ppu
 *.compiled
 *.bak
+
+# Python-Bytecode der Referenzwerkzeuge (tools/infer-ref)
+__pycache__/

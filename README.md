@@ -10,8 +10,9 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
 > GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
 > it passes all suites, its quality gate and a 90-minute soak test on Linux x86_64 too,
-> and it is the recommended provider of the consuming backend. Next: decoder LLMs (Qwen3),
-> then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
+> and it is the recommended provider of the consuming backend. The Qwen3 decoder passes
+> its gate: on a fixed prompt set, greedy output in FP32 is token-identical to
+> `transformers`. Next: the decoder behind `ILlmClient`, then quantisation and CUDA. Three test suites, about 3600 assertions, green wherever they have run (table below).
 
 ## What it does
 
@@ -28,17 +29,17 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
 ## Where it runs
 
-Number of assertions per suite, every one passing; each row with numbers ran on 2026-10-14:
+Number of assertions per suite, every one passing; each row with numbers ran on 2026-10-14 or 15:
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1215 |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ |
-| Windows x64 | Delphi 13 | 1257 | 720 | 1205 |
-| Windows x86 | **Delphi 7** | 1253 | 708 | 669 |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1597 |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
+| Windows x64 | Delphi 13 | 1257 | 720 | 1587 |
+| Windows x86 | **Delphi 7** | 1253 | 708 | 891 ⁶ |
 | macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | not yet run |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
-| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ |
+| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
 ¹ Without the converted FP32 reference model on that machine; those tests skip.
 ² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
@@ -46,6 +47,10 @@ that target.
 ³ The production target (Docker uses the same FPC 3.2.2), with the BGE-M3 corpus gate
 (`LAI_INFER_GATE=1`) included: nDCG@10 0.8994 on the AVX2 path.
 ⁴ Run before the load governor tests were added (they bring about 60 assertions).
+⁵ Run before the Qwen3 tests were added (tokenizer, chat template, decoder: about 380
+assertions with the model, about 170 without it).
+⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
+model, the tokenizer and the chat template run.
 
 Counts differ by compiler because some tests only exist where a feature does (the `vec0`
 extension has no 32-bit build, so Delphi 7 skips that test).
@@ -471,6 +476,7 @@ provider or runtime, not only against tests.
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
+| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) | **works, not wired yet** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; correctness first, slow (scalar FP32); not yet behind `ILlmClient` |
 | Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
@@ -493,11 +499,14 @@ Done:
 - ✓ **Native vector store** — replaces sqlite-vec.
 - ✓ **Native inference, phases 0 to 1b and the speed work of 1c** — reference data,
   BGE-M3 in FP32 and from the Q8_0 GGUF, NEON and AVX2 kernels, measured against lembed.
+- ✓ **Qwen3 decoder up to its gate** — byte-level BPE tokenizer and chat template
+  identical to Hugging Face on every reference case; Qwen3-0.6B in FP32 with KV cache,
+  greedy output token-identical to `transformers` for all seven reference prompts.
 
 Next, in this order:
-1. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
-   `ILlmClient` as `mormot.ai.llm.native`, with streaming and tool calls; gate: greedy
-   output token-identical to `transformers` in FP32.
+1. **Decoder LLMs behind `ILlmClient`** — the Qwen3 engine is in place and passes its
+   gate (greedy output token-identical to `transformers` in FP32); next is
+   `mormot.ai.llm.native` with streaming, stop tokens and tool calls.
 2. **Quantisation and speed** — Q4_0, later K-quants, sampling (temperature, top-k,
    top-p), benchmarks per platform.
 3. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.

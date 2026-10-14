@@ -7,6 +7,10 @@
 > mit weniger Speicher; unter Linux x86_64 (die Produktion) alle Suiten und das
 > Korpus-Gate grün, Soak-Test über 90 Minuten bestanden; im Backend der empfohlene
 > Provider (`AI_EMBED_PROVIDER=native`). Phase 1c ist damit abgeschlossen.
+> Phase 2 (Decoder Qwen3) bis 2c erledigt: Tokenizer und Chat-Template treffen
+> transformers in jedem Referenzfall, und die Greedy-Ausgabe von Qwen3-0.6B in FP32 ist
+> für alle sieben Referenz-Prompts tokengleich - das Gate von Phase 2. Offen ist 2d, die
+> Anbindung hinter `ILlmClient`.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -446,6 +450,58 @@ Indizier-Job im Backend) und ein Lauf auf echter Sensor-Hardware.
 
 **Fertig, wenn:** Greedy-Sampling in FP32 für einen festen Prompt-Satz tokengleich zu
 `transformers` ist.
+
+**Stand 2026-10-14:** 2-0 bis 2c erledigt, das Gate ist erfüllt. Offen ist 2d.
+
+- **2-0, Referenzdaten** (`tools/infer-ref/make_reference_qwen3.py`, Qwen/Qwen3-0.6B in
+  der Revision `c1899de289a04d12100db370d81485cdf75e47ca`):
+  - `qwen3-tokens`: 2416 Fälle für den Tokenizer;
+  - `qwen3-chat`: 21 Gespräche für das Chat-Template, mit Tools, Tool-Aufrufen und
+    Thinking;
+  - `tiny-qwen3`: ein winziges Qwen3 mit 2 Layern, BF16-Gewichten und `head_dim` 32
+    statt 64/4, mit allen Zuständen;
+  - `qwen3`: sieben Prompts des echten Modells in FP32, mit Zuständen, Logits und je
+    48 Greedy-Tokens samt dem Abstand der zwei besten Logits pro Schritt.
+- **2a, Tokenizer** (`mormot.ai.infer.unicode`, `mormot.ai.infer.tokenizer.bpe`):
+  - NFC und die Zeichenklassen des Split-Regex (`\p{L}`, `\p{N}`, `\s`) stehen als
+    erzeugte Tabellen im Code. Sie sind am HF-Tokenizer selbst gemessen und über alle
+    Codepoints dagegen geprüft.
+  - Befund dabei: Der NFC des HF-Tokenizers beruht auf älteren Unicode-Daten als Python
+    (15.0), mit 1129 Abweichungen. Die Tabellen folgen deshalb dem Tokenizer, nicht der
+    neuesten Unicode-Version.
+  - Das Regex läuft nicht über eine Regex-Engine, sondern als handgeschriebener Abgleich
+    seiner sieben Alternativen. Ein Fuzzing mit 200.000 Fällen gegen den HF-Pre-Tokenizer
+    ergab keine Abweichung.
+  - BPE arbeitet mit derselben Merge-Reihenfolge wie die tokenizers-Bibliothek: Rang,
+    dann Position, veraltete Einträge werden übersprungen.
+- **2a, Chat-Template** (`mormot.ai.infer.chat`): Das Jinja-Template von Qwen3 ist in
+  Pascal nachgebaut. Tools werden wie `json.dumps` von Python serialisiert
+  (`PythonJson`).
+  - Eine Abweichung ist gewollt: Steuertokens kommen nur aus dem Template, Nachrichtentext
+    bleibt immer Text. Ein `<|im_end|>` im Text eines Nutzers schließt also nicht seinen
+    Turn.
+  - Floats mit mehr als 15 signifikanten Stellen weist `PythonJson` ab, statt die
+    binäre Rundung zu raten.
+- **2b, Forward** (`mormot.ai.infer.model.qwen3`):
+  - Aufbau: RMSNorm, Q/K-Norm je Kopf, RoPE, GQA, kausale Attention, SwiGLU, verbundener
+    oder eigener LM-Head.
+  - BF16-Gewichte werden beim Laden exakt auf F32 erweitert.
+  - Abweichung von der Referenz: Zustände und Logits weichen höchstens um 9e-5 ab
+    (Kosinus 0,99999999998).
+  - Rotationswinkel: Sie folgen den float32-Schritten der Referenz.
+- **2c, KV-Cache und Greedy:**
+  - Logits über den Cache sind bitgleich zu einem vollen Durchlauf.
+  - Alle sieben Prompts sind tokengleich, auch einer mit nur 0,0046 Abstand zwischen den
+    zwei besten Tokens und der Tool-Aufruf.
+  - Gegenprobe: Schlüssel an Position 0 statt an ihrer Cache-Position machen den
+    Cache-Test und das Greedy-Gate rot.
+  - Zeiten auf dem Snapdragon X (WSL, FP32, Pascal-Skalarcode): 4 + 48 Tokens in
+    13 s, 193 + 20 Tokens in 46 s. Phase 2 ist bewusst auf Korrektheit gebaut,
+    Geschwindigkeit ist Phase 3.
+- **2d, offen:** `mormot.ai.llm.native` hinter `ILlmClient`. Dazu gehören:
+  - Streaming aus der Dekodier-Schleife;
+  - Stop-Tokens;
+  - das Übersetzen von `<tool_call>` in `TLlmToolCall`.
 
 Qwen3-Embedding ist **kein** Nebenprodukt: Es braucht einen eigenen, separat trainierten
 Checkpoint und eigene Eingabekonventionen, nicht nur Last-Token-Pooling. Es gehört zu
