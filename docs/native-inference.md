@@ -225,7 +225,8 @@ Identitäten (Vertrag, Fingerprint).
 **Fertig, wenn:**
 - der Durchsatz mindestens 80 % von lembed erreicht, bei höchstens 125 % Peak-RSS;
 - der Durchsatz für die Erstindizierung von 2 Mio Texten gemessen ist;
-- der Build unter FPC 3.2.2/3.2.4 und Delphi 13 grün ist.
+- der Build unter FPC 3.2.2/3.2.4 und Delphi 7 bis 13 grün ist (Delphi 7 ohne
+  Leistungsziel).
 
 Danach wird **nativ** zum Default. lembed bleibt als expliziter Fallback und als
 unabhängiges Orakel erhalten, bis die nativen Gates auf allen Zielplattformen stehen.

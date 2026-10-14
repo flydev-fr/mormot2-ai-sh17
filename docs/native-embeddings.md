@@ -361,8 +361,9 @@ CLS/Mean/LastToken, Instruction-Präfixe für E5/BGE, ein GGUF-Reader
 7. Die BERT-Satz-Helfer passen nicht direkt (`[CLS]/[SEP]`, Mean-Pooling, keine
    Padding-Maske) — BGE braucht eigene Tokenaufbereitung + `epCLS` + Normierung.
 
-Lizenz: LGPL-2.1 mit Linking-Exception — für uns unkritisch. FPC-only ist laut
-CONCEPT.md §1 erlaubt (Backend hinter der Naht).
+Lizenz: LGPL-2.1 mit Linking-Exception — für uns unkritisch. FPC-only galt damals als
+erlaubt (Backend hinter der Naht); seit 2026-10-14 verlangt CONCEPT.md §1 Delphi 7 bis 13,
+und neural-api ist verworfen.
 
 ### Option D — eigener schlanker Encoder auf dem vorhandenen GGUF
 
@@ -376,7 +377,7 @@ CONCEPT.md §1 erlaubt (Backend hinter der Naht).
 **Vorteile:**
 - Dieselben Gewichte und Tokenizer-Daten wie lembed → **lembed ist das Test-Orakel**.
 - Keine Konvertierung, kein Python, das Modell-Asset bleibt unverändert.
-- Baut auch unter Delphi 13 (Dual-Compiler-Linie der Extension).
+- Baut auch unter Delphi 7 bis 13 (Compiler-Breite der Extension).
 - Kleine, kontrollierte Codebasis; die Charsmap-Arbeit kann upstream an neural-api.
 
 **Was leicht unterschätzt wird** (aus dem Review):
@@ -504,7 +505,7 @@ Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 | 3 → 1b | GGUF-Reader + UGM-Tokenizer (jetzt Phase 1b in [native-inference.md](native-inference.md), nach FP32-Phase 1a) | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-Fällen (wörtliche Sondertokens getrennt gegen `parse_special = false`); beschädigte Dateien sicher abgelehnt |
 | 4 | Encoder: skalare Referenz, dann Blocking/SIMD | mehrere Wochen | Cosine ≥ 0,999 je Fall, korrekte Normen, Batch = Einzel; nDCG@10 höchstens 1 Prozentpunkt unter lembed |
 | 5 | Messung auf Zielhardware | – | ≥ 80 % lembed-Durchsatz, ≤ 125 % Peak-RSS; Store-p95 ≤ 100 ms bei **2 Mio × 1024**, k = 10, vier Clients; Recall@10 ≥ 0,95 gegen exakten Scan; Store-RAM im konfigurierten Budget (Richtwert 2–4 GiB, Consumer-Hardware mit 32/64 GB); Erstindizierungs-Durchsatz für 2 Mio Texte ermittelt — sonst optimieren oder D stoppen |
-| 6 | Integration: FPC 3.2.2/3.2.4 + Delphi 13; Extension-Download beim Konsumenten je Provider trennen | 2–3 Tage | danach Default „native", lembed bleibt expliziter Fallback |
+| 6 | Integration: FPC 3.2.2/3.2.4 + Delphi 7 bis 13; Extension-Download beim Konsumenten je Provider trennen | 2–3 Tage | danach Default „native", lembed bleibt expliziter Fallback |
 
 Die Gate-Zahlen sind **Vorschläge**, noch nicht abgestimmt.
 

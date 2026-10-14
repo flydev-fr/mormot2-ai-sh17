@@ -2,8 +2,9 @@
   Baut + laeuft die Testsuiten dieser Extension mit Delphi (dcc64, Win64).
   Pendant zu scripts/run-fpc-tests.sh und scripts/run-fpc-llm-tests.sh.
 
-  FPC bleibt der Primaer-Compiler; Delphi wird unterstuetzt, soweit der Code es
-  erlaubt. Baseline: Delphi 13 (Compiler-Version 37.0).
+  FPC ist Referenz-Compiler. Die Extension baut mit Delphi 7 bis 13; dieses Skript
+  prueft das obere Ende, Delphi 13 (Compiler-Version 37.0). Das untere Ende, Delphi 7
+  (Win32), prueft run-delphi7-tests.ps1.
 
   Beispiele:
     .\scripts\run-delphi-tests.ps1                  # MCP- + LLM-Suite

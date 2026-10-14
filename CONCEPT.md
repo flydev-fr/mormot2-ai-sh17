@@ -17,28 +17,29 @@ LandrixAI ist eine **mORMot-basierte AI-/LLM-Toolbox** im Namespace `mormot.ai.*
 **FPC primär** (Linux/Windows/macOS, x64/aarch64) und **Delphi 7 bis 13** (Win32/Win64),
 veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
 
-- **Eigene Extension statt mORMot-PR** (Entscheidung 2026-07-29). Ein Pull Request
-  an Synopse mORMot ist **nicht** mehr das Ziel. Grund: Ein Upstream-PR würde uns auf
-  mORMots **Dual-Compiler-Anspruch (FPC + Delphi)** festlegen — und damit die
-  stärkste verfügbare Inferenz-Option ausschließen, denn **neural-api ist FPC-only**
-  (§5). Als eigenständige Extension können wir sie **voll** nutzen. mORMot2 bleibt
-  die **Grundlage** (Basis-Units, HTTP, JSON, SQLite, Crypto) — wir liefern nur
-  nicht dorthin ab.
-  > **Nachtrag 2026-10-14:** Dieser Grund ist entfallen. neural-api wird nicht genutzt,
-  > die native Inferenz wird eine eigene Engine für **alle** mORMot2-Compiler bis
-  > Delphi 7 (§5, [docs/native-inference.md](docs/native-inference.md)). Das eigene Repo
-  > bleibt trotzdem: eigene Compiler-Strategie, eigenes Tempo, MCP 2026-07-28.
-- **FPC primär, Delphi 13 soweit möglich** (Entscheidung 2026-09-10 — revidiert das
-  „FPC-only" vom 2026-07-29). FPC bleibt Referenz und Gate (`scripts/run-fpc-*.sh`, fest
-  auf FPC 3.2.4 — seit 2026-09-30, vorher 3.2.2); Delphi 13 wird mitgebaut und mitgetestet
-  (`scripts/run-delphi-tests.ps1`, Win64). Regel: keine FPC-Eigenheit ohne Not — aber
-  auch keine Doppelimplementierung erzwingen. Was nur unter FPC geht (der POSIX-
-  Prozessstart in `vendor/mormot.ext.os`), bleibt per `{$ifdef FPC}`
-  abgegrenzt und fehlt unter Delphi eben. **Seit 2026-10-14:** dieselbe Compiler-Breite
-  wie mORMot2, also auch **Delphi 7** (Win32) — Bibliothek und beide Suiten grün
-  (`scripts/run-delphi7-tests.ps1`); Umbau in
-  [docs/native-inference.md](docs/native-inference.md#delphi-7). Die Landrix-Plattform selbst bleibt FPC-only;
-  diese Ausnahme gilt nur für die Extension.
+- **Eigenes Repository statt mORMot-PR** (Entscheidung 2026-07-29). Die Extension geht
+  nicht als Pull Request an Synopse. mORMot2 bleibt die **Grundlage** (Basis-Units, HTTP,
+  JSON, SQLite, Crypto), wir liefern nur nicht dorthin ab. Gründe: eigenes Tempo, eigene
+  Plattformziele (CUDA, Engine) und MCP 2026-07-28 ohne Rücksicht auf ältere
+  Protokollstände. Der ursprüngliche Grund, neural-api als FPC-only-Backend nutzen zu
+  können, ist mit der eigenen Engine entfallen (§5).
+- **Compiler: FPC und Delphi 7 bis 13**, dieselbe Breite wie mORMot2.
+  - **FPC** ist Referenz und Gate: `scripts/run-fpc-*.sh`, fest auf FPC 3.2.4 (seit
+    2026-09-30, vorher 3.2.2; die Skripte brechen bei einer anderen Version ab, siehe
+    `scripts/fpc-env.sh`). FPC 3.2.2 muss ebenfalls bauen (Windows und Docker des
+    Konsumenten).
+  - **Delphi** wird an beiden Enden gebaut und getestet: Delphi 13 (Win64,
+    `scripts/run-delphi-tests.ps1`) und Delphi 7 (Win32, `scripts/run-delphi7-tests.ps1`).
+    Die Versionen dazwischen unterstützt mORMot2; wir bauen sie nicht eigens. Ein Bruch
+    dort gilt als Fehler, ist aber durch keinen Lauf abgesichert.
+  - Was nur unter FPC geht (der POSIX-Prozessstart in `vendor/mormot.ext.os`), bleibt per
+    `{$ifdef FPC}` abgegrenzt und fehlt unter Delphi. Keine Doppelimplementierung
+    erzwingen.
+  - Verlauf: FPC-only (2026-07-29), dazu Delphi 13 (2026-09-10), dazu Delphi 7
+    (2026-10-14, Umbau in [docs/native-inference.md](docs/native-inference.md#delphi-7)).
+  - Die Delphi-Breite gilt nur für die Extension. Beim Konsumenten (Landrix-Plattform)
+    bleiben Backend und Werkzeuge FPC-only; dessen geteilter Client baut eigenständig mit
+    FPC und Delphi 13.
 - **Code im Stil von mORMot2** (verbindlich, 2026-10-14): Die Extension soll sich lesen
   und bauen wie eine mORMot2-Unit, damit sie neben mORMot nicht als Fremdkörper wirkt und
   dieselben Compiler trägt. Zwei Teile:
@@ -117,7 +118,7 @@ bleiben als Bezeichner; „Schicht M" gibt es nicht mehr.)
 
 | Schicht | Namespace | Repo | Inhalt | Landrix-abhängig? |
 |---|---|---|---|---|
-| **A — Extension** | `mormot.ai.*`, `mormot.db.*` | **eigenes Repo** (§7), FPC primär, Delphi 13 soweit möglich | Alles Generische: LLM-Wire-Treiber, Embeddings, VectorStore + pgvector-Binding, RAG-Engine, MCP, SSE, Structured Output, Agent-Loop, Skill-/Memory-/Session-**Interfaces**, CLI | **nein** |
+| **A — Extension** | `mormot.ai.*`, `mormot.db.*` | **eigenes Repo** (§7), FPC und Delphi 7 bis 13 | Alles Generische: LLM-Wire-Treiber, Embeddings, VectorStore + pgvector-Binding, RAG-Engine, MCP, SSE, Structured Output, Agent-Loop, Skill-/Memory-/Session-**Interfaces**, CLI | **nein** |
 | **B — Backend** | `landrix.server.ai.*` | landrix-platform | Landrix-Bindungen: Memory/Sessions als `TOrm` in `TLandrixDatabase`, guard-/scope-geprüfte Tools, Audit-Anbindung, Domänen-Skills, REST-Endpunkte | **ja** |
 
 **Konsequenz für Interfaces vs. Implementierungen — „Interface tief, Bindung hoch":**
@@ -264,8 +265,8 @@ hier gilt „Interface tief, Bindung hoch" — die Engine kennt nur `IEmbedder` 
 
 Die native Inferenz wird eine **eigene Engine in reinem Object Pascal**: zuerst BGE-M3
 als Ersatz für lembed, danach Decoder-LLMs (Qwen3) hinter `ILlmClient`, später CUDA.
-Sie läuft auf allen mORMot2-Compilern (FPC, Delphi 13, Delphi 7 als reine
-Korrektheitsstufe) und nutzt nur MIT-Vorlagen als Code (llama2.c, ggml, calm);
+Sie läuft auf allen mORMot2-Compilern (FPC und Delphi 7 bis 13; Delphi 7 als reine
+Korrektheitsstufe ohne Leistungsziel) und nutzt nur MIT-Vorlagen als Code (llama2.c, ggml, calm);
 Apache-2.0-Quellen (transformers, tokenizers) dienen nur zum Nachschlagen. Plan, Phasen,
 Gates und Plattformmatrix: [docs/native-inference.md](docs/native-inference.md).
 

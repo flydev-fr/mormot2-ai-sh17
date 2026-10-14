@@ -18,15 +18,13 @@ crypto are the foundation, not a dependency we tolerate.
 
 ## Why a standalone extension
 
-- **Not an upstream mORMot PR** (decided 2026-07-29). A PR would commit us to mORMot's
-  dual-compiler promise (FPC *and* Delphi) and thereby rule out **neural-api** (FPC-only)
-  as an inference backend. mORMot2 stays the **foundation**, not the delivery target.
-  Rationale: [CONCEPT.md §1](CONCEPT.md). (Since 2026-10-14 neural-api is no longer
-  pursued; native inference becomes an own engine — see
-  [docs/native-inference.md](docs/native-inference.md).)
-- **FPC first, Delphi 7 to 13 alongside** (Delphi 13 since 2026-09-10, Delphi 7 since
-  2026-10-14). FPC is the reference compiler and the gate; Delphi 13 (Win64) and Delphi 7
-  (Win32) build the library and run both test suites.
+- **Not an upstream mORMot PR** (decided 2026-07-29). mORMot2 stays the **foundation**,
+  not the delivery target: an own repository keeps our own pace and platform goals
+  (native inference engine, CUDA) and lets MCP follow the 2026-07-28 spec alone.
+  Rationale: [CONCEPT.md §1](CONCEPT.md).
+- **FPC and Delphi 7 to 13** — the same compiler range as mORMot2. FPC is the reference
+  compiler and the gate; Delphi 13 (Win64) and Delphi 7 (Win32), the two ends of the
+  range, build the library and run both test suites.
   Parts that only exist under FPC — the POSIX process launcher in `vendor/` — stay behind
   `{$ifdef FPC}` instead of being duplicated. The library needs no generics: the MCP
   registries are `TSynDictionary`, typed tools build on `TMcpRecordTool`, and the generic

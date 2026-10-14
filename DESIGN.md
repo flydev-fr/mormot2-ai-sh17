@@ -949,10 +949,11 @@ Body `{` bekam 200, ein Array-Body 400.
 > [CONCEPT.md §1 / §7](CONCEPT.md). Dieses Dokument ist ein historisches Bau-Log;
 > maßgeblich ist CONCEPT.md.
 >
-> **Überholt (2026-09-10):** „FPC-only" gilt nicht mehr — FPC bleibt primär, Delphi 13
-> wird **soweit möglich** mitgebaut und mitgetestet (`scripts/run-delphi-tests.ps1`).
-> Die Einträge unten, die „FPC-only" nennen (z. B. „Delphi-Artefakte entfernt"), sind
-> Stand ihres Datums.
+> **Überholt:** „FPC-only" gilt nicht mehr. Seit 2026-09-10 baut die Extension auch mit
+> Delphi 13, seit 2026-10-14 mit Delphi 7 bis 13 (`scripts/run-delphi-tests.ps1`,
+> `scripts/run-delphi7-tests.ps1`), maßgeblich ist [CONCEPT.md §1](CONCEPT.md). Die
+> Einträge in diesem Log, die „FPC-only" nennen (z. B. „Delphi-Artefakte entfernt"),
+> sind Stand ihres Datums.
 
 Lizenz bleibt die mORMot-Drei-Lizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1) — die adoptierten
 MCP-Units verlangen es. Namespace `mormot.ai.*` bleibt, ist aber bei
