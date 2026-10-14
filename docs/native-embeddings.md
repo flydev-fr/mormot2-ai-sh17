@@ -12,6 +12,11 @@
 > Geprüfte Stände: dieses Repo, mORMot2 (Submodul), neural-api `b172061`
 > (2026-10-11), Modelldatei `vendor/models/bge-m3-q8_0.gguf`.
 > Einordnung in die Gesamtstrategie: [CONCEPT.md §3/§5](../CONCEPT.md).
+>
+> **Nachtrag 2026-10-14:** Teil B geht in den Plan für eine **eigene Inferenz-Engine** über
+> ([native-inference.md](native-inference.md)). Option D wird dort zu Phase 1; die Schritte
+> 3–6 unten heißen dort Phasen 1a–1c. neural-api wird nicht weiter verfolgt (#225
+> geschlossen). Teil B bleibt hier als Analyse stehen.
 
 ## Kurzfassung
 
@@ -22,10 +27,9 @@ Die Ablösung zerfällt in **zwei unabhängige Teile mit sehr unterschiedlichem 
 | **A. Nativer Vektor-Store** | `vec0` | ~1 Woche | gering |
 | **B. Nativer Embedder** | `lembed0` + `libllama`/`ggml` | mehrere Wochen | hoch (Tokenizer, Numerik, Performance) |
 
-Teil A lohnt sich unabhängig davon, wie B ausgeht. Für B ist **neural-api heute kein
-fertiger Weg für unser Modell** (bge-m3); empfohlen wird ein eigener schlanker
-Encoder, der das **vorhandene GGUF** liest („Option D"). neural-api bleibt das
-strategische Backend für **generative** Inferenz (`ILlmClient`).
+Teil A lohnt sich unabhängig davon, wie B ausgeht. Für B ist **neural-api kein
+fertiger Weg für unser Modell** (bge-m3). Seit 2026-10-14 gilt: eine eigene Engine für
+Embeddings **und** generative Inferenz, siehe [native-inference.md](native-inference.md).
 
 ---
 
@@ -61,7 +65,8 @@ Folgerungen:
 - **Brute-Force mit float32 im RAM scheidet aus.** Ein exakter Scan über 2 Mio × 1024 sind
   ~2 Mrd. Multiplikationen und ~2 GB Speicherlesen je Abfrage (auch int8) — grob
   ≥ 100 ms pro Abfrage und Kern (**Schätzung, ungemessen**); mit vier Workern zu langsam.
-- **Quantisierung + Nachbewertung gehören in v1**, ein **ANN-Index (IVF) direkt danach**.
+- **Quantisierung + Nachbewertung gehören in v1** (umgesetzt in 2b als 1-Bit-Index), ein
+  **ANN-Index (IVF) nur bei Bedarf** (2c).
 - **Artikel und Positionen sind getrennte Stores** (Nutzer, 2026-10-13: Positionen sind
   i. d. R. keine Artikelkopien und sollen nicht zusammengelegt werden) — je eigener
   Indexvertrag, kein Dedup über Bestände hinweg. Innerhalb eines Stores optional nur ein
@@ -89,8 +94,9 @@ Folgerungen:
     (z. B. „welche Positionsgruppen 2025 häufiger als 2024") — ein weiterer Grund für IVF.
   - Für Analyseläufe ist ein exakter Scan über eine gefilterte Teilmenge eher tragbar als
     für interaktive Suche.
-- **Hardware**: Consumer-Klasse, **32/64 GB RAM** zumutbar. ⇒ **int8 im RAM ist der
-  Default** (2 Mio × 1024 ≈ 1,9 GiB), 1-bit nur optional; RAM-Budget je Store
+- **Hardware**: Consumer-Klasse, **32/64 GB RAM** zumutbar. ⇒ ursprünglich **int8 im RAM**
+  als Default geplant (2 Mio × 1024 ≈ 1,9 GiB); umgesetzt ist in 2b der **1-Bit-Index**
+  (244 MiB) mit exakter Nachbewertung, weil int8 ohne SIMD ~10× langsamer war; RAM-Budget je Store
   konfigurierbar (Richtwert 2–4 GiB). SIMD-Ziel **AVX2 + NEON** (AVX-512 ist bei Consumer-
   CPUs nicht verlässlich; ARM-Laptops/Macs kommen vor).
 - **Modell**: bge-m3 war bei Deutsch gut; ein **externer Anbieter** ist möglich —
@@ -120,7 +126,7 @@ Folgerungen:
 aus alten Positionen aufbauen.
 
 1. **Eingang**: GAEB-LV oder Freitext (Freitext zuerst in Positionen zerlegen, z. B. per
-   LLM mit `mormot.ai.structured`) → je Position Kurztext, Langtext, Menge, Einheit.
+   LLM mit `mormot.ai.llm.structured`) → je Position Kurztext, Langtext, Menge, Einheit.
 2. **Je neue Position**: einbetten → ähnliche **alte** Positionen suchen.
 3. **Vorschlag**: Kalkulation (EP-Zerlegung), Artikel, Langtext übernehmen; der
    Bearbeiter bestätigt.
@@ -235,8 +241,8 @@ Treffer übrig):
   keinen Busy-Timeout). `TNativeVectorStore.JournalMode` meldet den Modus beim Öffnen;
   die Anwendung setzt WAL und einen Busy-Timeout auf ihrer Seite. Der RAM-Index von 2b
   verkürzt die Lesesperre auf das Nachladen der Treffer.
-- **Extension-Lader**: `EnableSqliteExtensions`/`LoadSqliteExtension` aus
-  `sqlitevec` in eine eigene Unit ziehen — lembed braucht sie, bis Teil B steht.
+- ~~**Extension-Lader**~~ — **erledigt**: `EnableSqliteExtensions`/`LoadSqliteExtension`
+  liegen in `mormot.ai.sqlite`; lembed braucht sie, bis Teil B steht.
 
 ### Vergleich mit sqlite-vec — gleichwertig, besser oder schlechter?
 
@@ -301,10 +307,11 @@ Naht `IVectorStore`.
 
 **Empfehlung:**
 - Eigene Pascal-Engine nach diesem bewährten Design: Full-Scan (Referenz) +
-  **int8-quantisierter Scan mit float32-Rescoring**, vorladen/streamen per Konfiguration.
+  **quantisierter Scan mit float32-Rescoring**, vorladen/streamen per Konfiguration.
+  (Umgesetzt in 2b als **1-Bit**-Index statt int8 — ohne SIMD war int8 rund 10× langsamer.)
   Ideen übernehmen, Code clean-room (Apache 2.0 ist mit der GPL-2-Variante der
   mORMot-Tri-Lizenz nicht kompatibel).
-- **sqlite-vector als möglicher Austausch-Backend** (`TSqliteVectorStore`), falls unsere
+- **sqlite-vector als mögliches Austausch-Backend** (`TSqliteVectorStore`), falls unsere
   Engine nicht mithält — gleiches Datenformat, Umstieg per Konfiguration; dann aber wieder
   C (statisch in mORMots SQLite gelinkt statt `load_extension`, C-Build je Architektur).
 - ANN erst bei echtem Bedarf (≫ 10⁶ Vektoren): HNSW in Pascal oder pgvector.
@@ -394,8 +401,8 @@ Beide Wege passen unverändert hinter `IEmbedder`. Je Modell ein geteilter Diens
 nie eine Modellkopie je Store. Für jeden Wechsel braucht es einen **Indexvertrag**
 (Fingerprint von Modell + Tokenizer, Pooling, Normierung, Trunkierung, Metrik) —
 `Model()` allein reicht nicht; Wechsel = kontrollierte Neuindexierung.
-neural-api übernimmt den Embedder, sobald es diesen Vertrag erfüllt, die Gates
-besteht und insgesamt weniger Wartung verursacht. Für E5-Modelle fehlt in
+~~neural-api übernimmt den Embedder, sobald es diesen Vertrag erfüllt~~ — überholt
+(2026-10-14): eigene Engine, siehe [native-inference.md](native-inference.md). Für E5-Modelle fehlt in
 `IEmbedder` noch der Verwendungszweck (Query vs. Dokument, Präfixe `query:`/`passage:`).
 
 Alternative zum Einstieg (Codex, Runde 1): **multilingual-e5-small** (384 dim,
@@ -461,7 +468,7 @@ billigste Operation und passt direkt zu int8-Quantisierung.
   Handwerkspositionen und Artikel mit bewerteten Anfragen (Grad 2 = gleiche Leistung,
   1 = verwandt), inkl. harter Negative und Dimensionsvarianten.
 - Generator: `demos/rag/embed-reference.lpr`, Aufruf `scripts/embed-reference.sh`
-  (braucht die gitignorten `vendor/`-Artefakte). Er prüft den Vertrag (Tokenlimit,
+  (braucht die gitignorierten `vendor/`-Artefakte). Er prüft den Vertrag (Tokenlimit,
   Einheitsnorm, Dimension, bekannte IDs) und schreibt `reference/manifest.json`
   (Vertrag, SHA-256 von Modell und Korpus, Statistik, Metriken, exakte Top-20 je Anfrage)
   sowie `docs.f32`/`queries.f32` (float32 little-endian, Dateireihenfolge).
@@ -494,7 +501,7 @@ Bodenfliesen — der Korpus trennt also, ist nicht trivial.
 | 2a ✓ | Nativer Store, exakte Suche: float32-BLOB je Vektorraum, Vertrag persistiert + erzwungen, Fachfilter (`IFilteredVectorStore.SearchWhere`, read-only SQL auf Fachtabellen derselben Datei, vor Top-k), mehrere Räume je Datei, Eingabeprüfung — **erledigt 2026-10-13** (`mormot.ai.vectorstore.native`, Tests `test.llm.vectorstore.native`) | – | **Parität: alle 58 Referenzanfragen liefern die Top-20 der Referenz (Score je Rang ± 1e-5, Dokument je Rang identisch außer bei Beinahe-Gleichstand < 1e-6)**; FTS5-Schlüsselabfragen (Hybridsuche) funktionieren; Atomarität, Fehlerfälle, Neustart, Raumtrennung getestet |
 | 2b ✓ | Nativer Store, schnell: 1-Bit-Index im RAM + exakte float32-Nachbewertung, Generationszähler, parallele Anfragen, Benchmark `demos/rag/vector-bench.lpr` — **erledigt 2026-10-13** | – | über den Index mit voller Nachbewertung **identisch** zur Referenz; Recall@10 mit nur 20 von 262 Kandidaten **0,929** (echte bge-m3-Vektoren); Gate 5 s. u. |
 | 2c | IVF-Partitionierung (nur bei Bedarf, s. Gate-5-Ergebnis) | ~1–2 Wochen | Recall@10 ≥ 0,95 gegen exakten Scan bei 2 Mio × 1024; Einfügen/Löschen ohne Neutraining korrekt |
-| 3 | GGUF-Reader + UGM-Tokenizer | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-/Sondertoken-Fällen; beschädigte Dateien sicher abgelehnt |
+| 3 → 1b | GGUF-Reader + UGM-Tokenizer (jetzt Phase 1b in [native-inference.md](native-inference.md), nach FP32-Phase 1a) | ~1 Woche | identische Token-IDs zu lembed auf ≥ 1000 Unicode-Fällen (wörtliche Sondertokens getrennt gegen `parse_special = false`); beschädigte Dateien sicher abgelehnt |
 | 4 | Encoder: skalare Referenz, dann Blocking/SIMD | mehrere Wochen | Cosine ≥ 0,999 je Fall, korrekte Normen, Batch = Einzel; nDCG@10 höchstens 1 Prozentpunkt unter lembed |
 | 5 | Messung auf Zielhardware | – | ≥ 80 % lembed-Durchsatz, ≤ 125 % Peak-RSS; Store-p95 ≤ 100 ms bei **2 Mio × 1024**, k = 10, vier Clients; Recall@10 ≥ 0,95 gegen exakten Scan; Store-RAM im konfigurierten Budget (Richtwert 2–4 GiB, Consumer-Hardware mit 32/64 GB); Erstindizierungs-Durchsatz für 2 Mio Texte ermittelt — sonst optimieren oder D stoppen |
 | 6 | Integration: FPC 3.2.2/3.2.4 + Delphi 13; Extension-Download beim Konsumenten je Provider trennen | 2–3 Tage | danach Default „native", lembed bleibt expliziter Fallback |
@@ -527,20 +534,19 @@ Kernel, IVF (2c) zur Verkleinerung der gescannten Menge.
 - ~~Metrik~~ — **entschieden**: Cosinus = Skalarprodukt auf Einheitsvektoren (Ranking
   identisch zu L2), siehe „Referenzvertrag v1".
 - ~~Mengengerüst~~ — **beantwortet** (bis 2 Mio Artikel, Positionen ~2,6 Mio in 10
-  Jahren, siehe „Mengengerüst"): Quantisierung in v1, IVF direkt danach.
-- ~~Zielhardware~~ — **beantwortet**: Consumer-Klasse, 32/64 GB RAM; int8 im RAM als Default.
+  Jahren, siehe „Mengengerüst"): Quantisierung in v1 (1-Bit-Index, 2b), IVF nur bei Bedarf (2c).
+- ~~Zielhardware~~ — **beantwortet**: Consumer-Klasse, 32/64 GB RAM; 1-Bit-Index im RAM als Default (2b).
 - ~~Was eingebettet wird~~ — **beantwortet**: Texte von Artikeln bzw. Positionen, getrennte
   Stores, Zweck Analyse.
 - ~~Modell~~ — **beantwortet**: bge-m3 lokal + IONOS (BGE M3) als externer Anbieter;
   ein kleineres Modell nur, falls der lokale Durchsatz nicht reicht.
 - ~~Fachfilter~~ — **beantwortet**, siehe „Anwendungsfall und Fachfilter".
-- neural-api-Beitrag: Issue
-  [joaopauloschuler/neural-api#225](https://github.com/joaopauloschuler/neural-api/issues/225)
-  (2026-10-13) fragt an, ob Charsmap-Normalisierung, BERT/XLM-R-GGUF-Laden und ggf. NEON
-  als Beitrag willkommen sind. Nimmt der Maintainer an, wird Option D zum Beitrag in
-  neural-api (FPC-Stil, ohne mORMot) statt eines eigenen Encoders. Antwort abwarten.
+- ~~neural-api-Beitrag~~ — **erledigt**: Issue
+  [#225](https://github.com/joaopauloschuler/neural-api/issues/225) am 2026-10-14 ohne
+  Antwort als „not planned" geschlossen; eigene Engine ([native-inference.md](native-inference.md)).
 - Maximale Kontextlänge für Embeddings (512? 2048?) — bestimmt Speicherbedarf der
   Attention.
-- Option D oder direkt neural-api (mit Upstream-Beitrag für Charsmap + BERT-GGUF)?
+- ~~Option D oder direkt neural-api?~~ — **entschieden**: eigene Engine, Option D geht
+  als Phase 1 darin auf.
 - Wird der heutige `TVec0Store` nach Teil A gelöscht (Greenfield) oder als Fallback
   behalten?

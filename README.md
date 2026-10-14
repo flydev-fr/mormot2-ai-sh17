@@ -7,11 +7,12 @@ crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one — plus a temporary stdio bridge for the legacy `initialize`
-> handshake, marked for removal. Build, tests and demos green on aarch64-linux/FPC 3.2.4:
-> **935 assertions** MCP suite, **361 assertions** LLM suite. Library and both suites also
-> green under **Delphi 13** (Win64): 935 MCP, 364 LLM (the Windows `vec0` tests run too);
-> all 14 demos compile with Delphi 13 as well, but are not run there and have no Delphi
-> build script yet. Open: phase E
+> handshake, marked for removal. As of 2026-10-14 both suites are green — **1012
+> assertions** MCP, **647–659** LLM (depending on platform and whether the `vec0` test runs) — on
+> aarch64-linux (FPC 3.2.4/3.2.2), aarch64-darwin, x86_64-win64 (FPC 3.2.2) and Win64
+> (Delphi 13); aarch64-win64 (FPC 3.3.1) needs an external `sqlite3-64.dll`. Per-platform
+> table: [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests).
+> All 14 demos build with FPC and Delphi 13; Delphi has no demo build script yet. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
 ## Why a standalone extension
@@ -19,14 +20,18 @@ crypto are the foundation, not a dependency we tolerate.
 - **Not an upstream mORMot PR** (decided 2026-07-29). A PR would commit us to mORMot's
   dual-compiler promise (FPC *and* Delphi) and thereby rule out **neural-api** (FPC-only)
   as an inference backend. mORMot2 stays the **foundation**, not the delivery target.
-  Rationale: [CONCEPT.md §1](CONCEPT.md).
+  Rationale: [CONCEPT.md §1](CONCEPT.md). (Since 2026-10-14 neural-api is no longer
+  pursued; native inference becomes an own engine — see
+  [docs/native-inference.md](docs/native-inference.md).)
 - **FPC first, Delphi 13 where it works** (since 2026-09-10). FPC is the reference
   compiler and the gate; Delphi 13 (Win64) builds the library and runs both test suites.
-  Parts that only exist under FPC — the POSIX process launcher in `vendor/`, later
-  neural-api — stay behind `{$ifdef FPC}` instead of being duplicated.
+  Parts that only exist under FPC — the POSIX process launcher in `vendor/` — stay behind
+  `{$ifdef FPC}` instead of being duplicated. Target since 2026-10-14: the same compiler
+  range as mORMot2, down to **Delphi 7** (not there yet, see the plan).
 - **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
   provider wires) rather than chasing another library's changes.
-- **License stays MPL/GPL/LGPL** — the adopted MCP units require it, and it composes with
+- **License MPL/GPL/LGPL** (still marked "intended" in `LICENSE`; the native engine plan
+  reopens the question for its units) — the adopted MCP units require it, and it composes with
   MIT and LGPL-with-linking-exception.
 
 ## Layout
@@ -38,7 +43,8 @@ mormot2-ai/
     mormot.ai.llm[.types|.openai|.anthropic]  LLM clients (+ .sse, .structured)
     mormot.ai.agent[.mcp]                     agent / tool-calling loop
     mormot.ai.embeddings, .embed.{provider,lembed}
-    mormot.ai.vectorstore[.sqlitevec]
+    mormot.ai.vectorstore[.sqlitevec|.native]
+    mormot.ai.sqlite                          SQLite helpers, extension loader
     mormot.ai.rag[.tool]
   tests/    mcp.tests.lpr · llm.tests.lpr (mORMot TSynTests)
   demos/    stdio · http · jsonrpc · streamable · llm/* · rag/*
@@ -178,7 +184,7 @@ provider or runtime, not only against tests.
 
 | Area | State | Notes |
 |---|---|---|
-| MCP core, JSON-RPC, tool/resource registry | **stable** | 892 assertions, hardened over five review rounds |
+| MCP core, JSON-RPC, tool/resource registry | **stable** | 1012 assertions in the MCP suite (2026-10-14), hardened over five review rounds |
 | Transports: stdio, HTTP, Streamable HTTP, in-process | **stable** | concurrency covered (parallel clients, keep-alive reuse) |
 | MCP authorization (resource server) | **stable** | opt-in per spec (`OPTIONAL`), closed once a verifier is set; the verifier itself is supplied by the consumer |
 | LLM client, OpenAI wire | **stable, live** | also covers LiteLLM and Ollama-compatible endpoints |
@@ -187,10 +193,11 @@ provider or runtime, not only against tests.
 | Embeddings via provider API | **stable** | |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | process-wide singleton per model; not re-entrant, calls are serialised |
 | Vector store `sqlite-vec` | **works, needs a native library** | real-extension test is env-gated (`SQLITE_EXT_DIR`) |
+| Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | pgvector backend | **not built** | phase E — the `IVectorStore` seam exists, the implementation does not |
 | Ollama embedder | **not built** | phase E |
-| neural-api (native Pascal inference) | **not evaluated** | the strategic goal: it would remove every foreign `.so` — see [CONCEPT.md §5](CONCEPT.md) |
+| Native inference engine (embeddings, then LLMs) | **planned** | own Pascal engine, replaces `lembed` and every foreign `.so` — [docs/native-inference.md](docs/native-inference.md) |
 
 Two things follow from the "needs a native library" rows: those features are **optional at
 runtime** (missing library ⇒ skip, never crash), and the libraries are **not in git** —
@@ -282,7 +289,8 @@ Anthropic an `image` block with a typed `source`; an empty `MediaType` falls bac
 `image/png`).
 
 **Structured output** and **embeddings** run through the same seam; RAG combines
-`IEmbedder` with `IVectorStore` (sqlite-vec today, pgvector planned in phase E).
+`IEmbedder` with `IVectorStore` (native store or sqlite-vec today, pgvector only when a
+deployment needs it).
 
 ### Tests
 
@@ -294,8 +302,8 @@ payloads, and runs as part of the suite.
 **Native libraries are handled defensively.** `sqlite-vec` and `lembed` are external
 `.so`/`.dll` files; the suite must catch the dynamic load and **skip cleanly** when they are
 missing, never crash (see the env-gated `VectorStoreKeyedOps` test). That constraint goes
-away if **neural-api** (native Pascal inference, [CONCEPT.md §5](CONCEPT.md)) replaces the
-foreign libraries.
+away once the **native engine** ([docs/native-inference.md](docs/native-inference.md))
+and the native vector store replace the foreign libraries.
 
 ### Running the demos live
 

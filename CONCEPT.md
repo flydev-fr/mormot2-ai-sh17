@@ -24,13 +24,19 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
   (§5). Als eigenständige Extension können wir sie **voll** nutzen. mORMot2 bleibt
   die **Grundlage** (Basis-Units, HTTP, JSON, SQLite, Crypto) — wir liefern nur
   nicht dorthin ab.
+  > **Nachtrag 2026-10-14:** Dieser Grund ist entfallen. neural-api wird nicht genutzt,
+  > die native Inferenz wird eine eigene Engine für **alle** mORMot2-Compiler bis
+  > Delphi 7 (§5, [docs/native-inference.md](docs/native-inference.md)). Das eigene Repo
+  > bleibt trotzdem: eigene Compiler-Strategie, eigenes Tempo, MCP 2026-07-28.
 - **FPC primär, Delphi 13 soweit möglich** (Entscheidung 2026-09-10 — revidiert das
   „FPC-only" vom 2026-07-29). FPC bleibt Referenz und Gate (`scripts/run-fpc-*.sh`, fest
   auf FPC 3.2.4 — seit 2026-09-30, vorher 3.2.2); Delphi 13 wird mitgebaut und mitgetestet
   (`scripts/run-delphi-tests.ps1`, Win64). Regel: keine FPC-Eigenheit ohne Not — aber
   auch keine Doppelimplementierung erzwingen. Was nur unter FPC geht (der POSIX-
-  Prozessstart in `vendor/mormot.ext.os`, künftig neural-api), bleibt per `{$ifdef FPC}`
-  abgegrenzt und fehlt unter Delphi eben. Die Landrix-Plattform selbst bleibt FPC-only;
+  Prozessstart in `vendor/mormot.ext.os`), bleibt per `{$ifdef FPC}`
+  abgegrenzt und fehlt unter Delphi eben. **Ziel seit 2026-10-14:** dieselbe
+  Compiler-Breite wie mORMot2, also auch **Delphi 7** (Win32); Befund und Vorgehen in
+  [docs/native-inference.md](docs/native-inference.md#delphi-7). Die Landrix-Plattform selbst bleibt FPC-only;
   diese Ausnahme gilt nur für die Extension.
 - **Die eiserne Regel bleibt**: **kein Landrix-Domänenwissen im `mormot.ai.*`-Code.**
   Sie begründet sich jetzt aus der **Repo-Grenze** (die Extension muss ohne Landrix
@@ -45,7 +51,10 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
 > von flydev **nur Code übernehmen** und kein gemeinsames Repo betreiben (§4), ist die
 > Kollision folgenlos. **Lizenz bleibt MPL/GPL/LGPL**
 > (wie mORMot): die adoptierten MCP-Units verlangen es, und es ist mit MIT
-> (flydev-pgvector) wie mit LGPL-2.1+Linking-Exception (neural-api) verträglich.
+> (flydev-pgvector) wie mit LGPL-2.1+Linking-Exception verträglich. **Offen
+> (2026-10-14):** `LICENSE` nennt die Dreifachlizenz noch „intended"; der Plan zur
+> nativen Inferenz schlägt MIT vor. Vor dem ersten portierten Fremdcode entscheiden
+> ([docs/native-inference.md](docs/native-inference.md#offene-entscheidungen)).
 
 ## 2. Schichtenmodell (die Kernregel)
 
@@ -109,8 +118,8 @@ eigenes Modell in den RAM). `TLembedEmbedder` besitzt dazu eine **eigene, dedizi
 `:memory:`-Connection** (hostet nur lembed0 + das Modell); `SharedLembedEmbedder()`
 gibt den **prozessweiten Singleton je logischem Modellnamen** zurück. Der
 lembed-Context ist nicht re-entrant → Embed/EmbedBatch serialisieren unter einem
-`TOSLightLock`; wenn Nebenläufigkeit dominiert, skaliert man über einen zweiten
-`IEmbedder`-Backend (Ollama, Merge §4), nicht über mehrere Modell-Loads.
+`TOSLightLock`; wenn Nebenläufigkeit dominiert, skaliert man über ein zweites
+`IEmbedder`-Backend (Provider/IONOS, Ollama), nicht über mehrere Modell-Loads.
 
 Regel (gilt jetzt durchgängig): **Die RAG-/Agent-Engine kennt nur die Interfaces.**
 Welches Backend (sqlite-vec im Single-Binary-Edge-Fall, pgvector im
@@ -129,7 +138,8 @@ Das „parallele Repo" ist identifiziert und **öffentlich**:
 [mormot-ai.fsb.dev](https://mormot-ai.fsb.dev/). Die Unit-Liste deckt sich exakt mit
 dem, was hier bisher als „Parallel-Repo" geführt wurde.
 
-**Ziel: Vollintegration** („das große Ganze") — nicht nur Rosinen. Es sind aber
+**Ziel: Vollintegration** („das große Ganze") — nicht nur Rosinen. *(Revidiert
+2026-10-14: nur noch selektiv, pgvector erst bei Bedarf — siehe §9 Punkt 10.)* Es sind aber
 **zwei getrennte Libraries mit unterschiedlicher Lizenz**, und genau daran hängt der
 Zeitplan:
 
@@ -165,7 +175,7 @@ RAG-Zerlegung, chunk) — blockiert nichts; (2) SDK-Teil erst nach Lizenzzusage.
 **Wir übernehmen nur den Code** — kein Fork, kein geteiltes Repository, keine
 Upstream-PRs. Unser **Namespace `mormot.ai.*` bleibt unverändert**, auch dort, wo er
 mit flydevs kollidiert; adoptierte Units werden in unseren Baum eingepasst/umbenannt.
-Das hält uns unabhängig (eigene Compiler-Strategie, neural-api, MCP 2026-07-28) — Punkte, die flydev
+Das hält uns unabhängig (eigene Compiler-Strategie, eigene Inferenz-Engine, MCP 2026-07-28) — Punkte, die flydev
 nicht mitträgt.
 
 **Preis dieser Freiheit: manuelles Nachziehen.** Damit spätere flydev-Änderungen
@@ -183,7 +193,7 @@ git -C <klon> diff <gepinnter-sha>..<neuer-sha> -- mormot2-pgvector
 **Regel:** Wer aus flydev portiert, **bumpt UPSTREAM_BASE im selben Commit** — sonst
 ist die Diff-Basis verloren und die nächste Runde muss raten.
 
-## 5. Inferenz-Backends: lembed ↔ Ollama ↔ neural-api
+## 5. Inferenz-Backends: lembed ↔ Provider ↔ eigene native Engine
 
 Die zweite Backend-Achse neben der Persistenz (§3): **wo läuft das Modell?** Auch
 hier gilt „Interface tief, Bindung hoch" — die Engine kennt nur `IEmbedder` /
@@ -194,79 +204,61 @@ hier gilt „Interface tief, Bindung hoch" — die Engine kennt nur `IEmbedder` 
 | **lembed** (heute) | GGUF-Modell in SQLite via `lembed0` | `lembed0` + `libllama`/`ggml` **je Arch** (`.so`/`.dll`), `load_extension` | ✓ gebaut, prozessweiter Singleton |
 | **Provider** | OpenAI-Wire `/embeddings` | Netz + API-Key | ✓ gebaut |
 | **Ollama** | HTTP an lokalen Ollama-Server | **externer Prozess** | ○ kommt mit §4 |
-| **native** (Option D) | eigener Pascal-Encoder auf dem vorhandenen GGUF | **keine** | ○ vorgeschlagen (2026-10-13) |
-| **neural-api** | **native Pascal-Inferenz im Prozess** | **keine** (statisch gelinkt) | ○ strategisch für `ILlmClient`; als Embedder für bge-m3 heute nicht fertig |
+| **native** | eigene Pascal-Engine (`src/infer/`): Embedder **und** `ILlmClient` | **keine** | ○ geplant (2026-10-14), [docs/native-inference.md](docs/native-inference.md) |
+| ~~neural-api~~ | native Pascal-Inferenz (LGPL) | – | ✗ **nicht weiter verfolgt** (2026-10-14) |
 
 > **Stand 2026-10-13:** Die Ablösung von `vec0` **und** `lembed0` durch nativen Pascal-Code
 > ist in [docs/native-embeddings.md](docs/native-embeddings.md) analysiert (Entwurf zur
 > Diskussion, gegen den Code von neural-api `b172061` geprüft). Kernergebnisse unten; die
 > Details, der Plan mit Prüfpunkten und die offenen Fragen stehen dort.
 
-### neural-api (CAI NEURAL API) — die interessante Option
+### Eigene Engine statt neural-api (Entscheidung 2026-10-14)
 
-[joaopauloschuler/neural-api](https://github.com/joaopauloschuler/neural-api) —
-LGPL-2.1 **mit Linking-Exception**, sehr aktiv (letzter geprüfter Stand `b172061`,
-2026-10-11), AVX/AVX2/AVX512 + OpenCL. Kann **echte LLM-Inferenz nativ in Pascal**:
-Qwen2.5 (0.5B–32B), Qwen3, Llama/TinyLlama/SmolLM2, Mistral 7B, Phi-3-mini, OLMoE (MoE),
-RWKV, xLSTM (`ChatTerminal`); dazu Retrieval-Bausteine für die **E5/BGE/GTE**-Familie
-(`EmbeddingSearch`, `SemanticSearch`, `ColBERTSearch`, `DebertaReranker`).
+Die native Inferenz wird eine **eigene Engine in reinem Object Pascal**: zuerst BGE-M3
+als Ersatz für lembed, danach Decoder-LLMs (Qwen3) hinter `ILlmClient`, später CUDA.
+Sie läuft auf allen mORMot2-Compilern (FPC, Delphi 13, Delphi 7 als reine
+Korrektheitsstufe) und nutzt nur MIT-Vorlagen als Code (llama2.c, ggml, calm);
+Apache-2.0-Quellen (transformers, tokenizers) dienen nur zum Nachschlagen. Plan, Phasen,
+Gates und Plattformmatrix: [docs/native-inference.md](docs/native-inference.md).
 
-**Der Gewinn, wenn es trägt** — genau die Linie „Single Binary, kein externer
-Dienst": **alle nativen Fremdbibliotheken entfallen**. Kein `lembed0`/`vec0`-`.so`,
-kein `libllama`/`ggml`, kein `load_extension`, **kein Arch-Bundle-Download + SHA256**
-im Docker-Entrypoint, kein Ollama-Server. Ein statisch gelinktes FPC-Binary macht
-Embeddings **und** Chat.
+**neural-api** war bis hierher das strategische Ziel-Backend. Es wird nicht weiter
+verfolgt:
+- Für bge-m3 fehlten Charsmap-Normalisierung, BERT-GGUF, NEON und Reentranz (Analyse in
+  [docs/native-embeddings.md](docs/native-embeddings.md), Stand `b172061`).
+- Es ist LGPL und FPC-only.
+- Das Beitragsangebot [#225](https://github.com/joaopauloschuler/neural-api/issues/225)
+  ist geschlossen („not planned", 2026-10-14).
 
-**Was inzwischen vorhanden ist** (überholt frühere Annahmen hier): GGUF-Reader
-(`neuralgguf.pas`, Q8_0/K-Quants) und SafeTensors-Reader — der frühere Haken „kein GGUF,
-nur `.nn` über eine Python-Toolchain" gilt so **nicht mehr**; dazu
-`BuildXLMRobertaFromSafeTensors` (bge-m3 ist XLM-RoBERTa) mit Int8-Quantisierung,
-Unigram-/SentencePiece-Tokenizer, CLS/Mean-Pooling und E5/BGE-Präfixe.
-
-**Die Haken für unser Embedding-Modell (bge-m3) — Stand 2026-10-13:**
-
-1. **Tokenizer-Normalisierung fehlt**: die SentencePiece-`precompiled_charsmap` wird
-   ignoriert → Abweichungen bei deutschem/Unicode-Text. Risiko Nr. 1.
-2. **GGUF nur für Decoder**: der GGUF-Pfad nimmt llama/qwen2/gemma2, nicht
-   `architecture=bert` + `tokenizer.model=t5` → unser `bge-m3-q8_0.gguf` lädt nicht;
-   Umweg über SafeTensors.
-3. ~~**FPC/Lazarus only**~~ — **kein Hindernis** (§1): FPC-only-Backends hinter der Naht
-   sind erlaubt; unter Delphi fehlt das Backend dann eben.
-4. **AArch64 ohne SIMD** (`NOTAVX`, skalar) — ARM-Entwicklungsrechner, Apple Silicon,
-   ARM-Server.
-5. **Nicht reentrant**, große Abhängigkeitsfläche (`neuralpretrained.pas` ~91k Zeilen,
-   zieht Chat/Audio/Diffusion; `neuralthread` braucht Lazarus `UTF8Process`).
-6. **Embedding-Tauglichkeit unverifiziert**: Paritätstests nur gegen ein Pico-Fixture
-   (2 Layer, Hidden 8); Performance gegenüber llama.cpp unbelegt.
-
-**Entscheidung (gilt weiter): neural-api ist das strategische Ziel-Backend** (§1) — für
-die **generative** Inferenz (`mormot.ai.llm.neuralapi` hinter `ILlmClient`) hat es den
-größten Wert. Die Naht bleibt bestehen — wegen Delphi und weil Provider-/Ollama-/
-lembed-Backends weiter sinnvoll sind (Cloud-Modelle, bestehende Ollama-Deployments,
-Fallback).
-
-**Vorschlag für den Embedder (in Diskussion, nicht entschieden) — Option D:** ein
-eigener schlanker Encoder in der Extension, der das **vorhandene** `bge-m3-q8_0.gguf`
-liest (GGUF-Reader, UGM-Tokenizer inkl. Charsmap, BERT-Forward, `TNativeEmbedder`).
-Das GGUF ist selbsttragend (24 Layer, CLS-Pooling, 250 002 Tokens im XLM-R-ID-Raum,
-Scores, Charsmap, Q8_0/F32-Tensoren). Gleiche Gewichte und Tokenizer-Daten wie lembed
-→ **lembed ist das Test-Orakel**; keine Konvertierung, baut auch unter Delphi. Parität
-nur **annähernd** (tanh-GELU + Q8-Aktivierungen in ggml), Aufwand **mehrere Wochen**.
-neural-api übernimmt den Embedder später, sobald es Charsmap + BERT-GGUF kann (ggf.
-durch unseren Upstream-Beitrag) und dieselben Gates besteht. Umgeschaltet wird per
-Config (`AI_EMBED_PROVIDER`), nie per `{$ifdef}`.
+Die Naht bleibt unverändert: Umgeschaltet wird per Config (`AI_EMBED_PROVIDER`), nie per
+`{$ifdef}`, und Provider-/Ollama-/lembed-Backends bleiben sinnvoll (Cloud-Modelle,
+bestehende Deployments, Fallback, Orakel).
 
 **Vektorsuche gehört dazu:** `vec0` wird unabhängig davon durch einen nativen Store
-ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` je Vektorraum (`<space>_items`) als Wahrheit, quantisierte Kopie int8/1-bit + Nachbewertung, danach IVF — ausgelegt auf 2 Mio+ Vektoren je DB,
+ersetzt (`mormot.ai.vectorstore.native`: float32-`embedding BLOB` je Vektorraum (`<space>_items`) als Wahrheit, 1-Bit-Index im RAM + exakte Nachbewertung, IVF nur bei Bedarf — ausgelegt auf 2 Mio+ Vektoren je DB,
 mORMot bindet `create_function_v2`/`create_module_v2` auch statisch). vec0 rechnete mit
 **L2** (keine Metrik im Schema); der native Store rechnet **Cosinus** auf Einheitsvektoren —
 das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 
-**Reihenfolge (Risiko zuerst, Details + Gates in docs/native-embeddings.md):**
-Referenzvertrag + deutscher Testkorpus → nativer Store (ersetzt vec0) →
-GGUF-Reader + Tokenizer (identische Token-IDs zu lembed) → Encoder (Cosine ≥ 0,999,
-nDCG@10 ≤ 1 Prozentpunkt Verlust) → Messung auf Zielhardware → Default-Wechsel,
-lembed bleibt expliziter Fallback.
+**Reihenfolge:**
+1. Referenzvertrag und deutscher Testkorpus ✓
+2. nativer Store ✓ (ersetzt vec0)
+3. Engine Phase 0, Python-Referenz:
+   - Lizenz klären;
+   - festgelegte FP32-Referenz pro Layer;
+   - winzige Fixtures.
+4. Phase 1a, BGE-M3 FP32
+5. Phase 1b, das vorhandene Q8-GGUF:
+   - Token-IDs identisch zu lembed (wörtliche Sondertokens getrennt gegen
+     `parse_special = false`);
+   - nDCG@10 ≥ 0,8863.
+6. Phase 1c, Messung und Umschaltung:
+   - Default „native";
+   - lembed bleibt Fallback und Orakel.
+7. Phase 2, Decoder Qwen3
+8. Phase 3, Quantisierung und SIMD
+9. Phase 4, CUDA
+
+Details stehen in [docs/native-inference.md](docs/native-inference.md).
 
 ## 6. MCP-Protokoll: Sprung auf 2026-07-28 (Greenfield, kein Legacy)
 
@@ -427,7 +419,7 @@ Empfehlung: **jetzt splitten**, nicht nach Merge/MCP-Umbau. Begründung:
   `GetSharedEmbedder`) — der Schnitt ist heute billig und wird mit jedem weiteren
   Feature teurer.
 - Die drei großen anstehenden Arbeiten (flydev-Merge §4, MCP-Neubau §6,
-  neural-api §5) finden **vollständig innerhalb** der Extension statt. Sie im
+  native Inferenz §5) finden **vollständig innerhalb** der Extension statt. Sie im
   Zielrepo zu machen erspart einen zweiten Umzug.
 - Der flydev-Merge bedeutet ohnehin ein neues Repo-Layout (zwei Libraries
   zusammenführen) — das gehört nicht ins Landrix-Monorepo.
@@ -439,8 +431,9 @@ wählbar (`mormot.ai` ist bei flydev belegt) — z. B. `landrix/mormot-ai-ext`.
 
 ## 8. Ist-Stand-Inventar (Schicht A, gebaut)
 
-Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP-Suite
-**202 Assertions**, LLM-Suite **272 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
+Alles unten **gebaut + review-gehärtet + grün**; aktuelle Zahlen je Plattform (Stand
+2026-10-14: MCP 1012; LLM je nach Plattform und vec0-Test 647–659) in
+[docs/native-inference.md](docs/native-inference.md#plattformen-und-tests). Streaming/Tool-Loop/RAG/Vision auch
 **live** verifiziert (OpenAI/Ollama/Anthropic). Aufbau-Historie: [DESIGN.md](DESIGN.md).
 
 - **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca, deckt OpenAI/LiteLLM/
@@ -449,18 +442,20 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
   (`mormot.ai.llm.sse`, Basis + OpenAI-/Anthropic-Subklassen); Vision/Multimodal
   (`TLlmMessage.Images`, beide Wires).
 - **Agent-Loop**: `TLlmAgent` + `ILlmToolbox` ([mormot.ai.agent.pas](src/mormot.ai.agent.pas)).
-- **MCP**: Server+Client, stdio/HTTP/SSE/Streamable, RTTI-Tool-Schema
-  (`mormot.ai.mcp.*`), MCP-Bridge in den Agenten (`mormot.ai.agent.mcp`).
-  ⚠️ Spricht **2025-11-25** mit Versions-Negotiation — das ist der **Alt-Stand**;
-  Ziel ist ausschließlich **2026-07-28** (§6), inkl. Löschen von Sessions/
-  `initialize`/Legacy-SSE.
+- **MCP**: Server+Client, stdio/HTTP/Streamable HTTP/in-process, RTTI-Tool-Schema
+  (`mormot.ai.mcp.*`), MCP-Bridge in den Agenten (`mormot.ai.agent.mcp`). Spricht
+  ausschließlich **2026-07-28** (§6, zustandslos); Legacy-SSE ist entfernt, nur eine
+  stdio-Brücke für den alten `initialize`-Handshake (`mormot.ai.mcp.legacy`) ist noch da
+  und zum Entfernen vorgesehen.
 - **Structured Output**: `mormot.ai.llm.structured` (`ChatStructured` provider-agnostisch);
   OpenAI `response_format` ↔ Anthropic `output_config.format` (Adapter übersetzt + injiziert
   `additionalProperties:false`), beide live verifiziert.
 - **Embeddings/RAG** (Interface/Impl getrennt, §3): Interfaces `IEmbedder`
   (`mormot.ai.embeddings`) + `IVectorStore` (`mormot.ai.vectorstore`, SQLite-frei);
   Impls `TProviderEmbedder` (`mormot.ai.embed.provider`), `TLembedEmbedder`
-  (`mormot.ai.embed.lembed`), `TVec0Store` (`mormot.ai.vectorstore.sqlitevec`);
+  (`mormot.ai.embed.lembed`), `TVec0Store` (`mormot.ai.vectorstore.sqlitevec`) und
+  `TNativeVectorStore` (`mormot.ai.vectorstore.native`: ohne C-Extension, Vertrag,
+  Fachfilter `SearchWhere`, 1-Bit-Index + exakte Nachbewertung, 2 Mio × 1024 gemessen);
   Engine `TLlmRag` (`mormot.ai.rag`) + **agentic RAG** als `search_docs`-MCP-Tool
   (`mormot.ai.rag.tool`, dasselbe Tool extern wie in-process).
 - **codenav**: MCP-Tools für Code-Navigation (`codenav/`).
@@ -470,7 +465,7 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 Die Engine-Funktionsfläche (Phase D) steht, die **Repo-Auslösung** (§7) ist erledigt,
 der **MCP-Sprung auf 2026-07-28** (§6) ist durchgezogen und mit der
 Konsumenten-Bindung (Phase B) auch praktisch belegt; offen sind der **flydev-Merge**
-(§4) und die **nativen Embeddings + Vektorsuche** (§5, inkl. neural-api). Diese Liste ist die konsolidierte
+(§4) und die **native Inferenz** (§5, eigene Engine). Diese Liste ist die konsolidierte
 Roadmap — DESIGN.md verweist hierher.
 
 0. **Repo-Auslösung (§7)** ✓ **erledigt (2026-07-29)** — `landrix/mormot2-ai`, Historie
@@ -479,7 +474,8 @@ Roadmap — DESIGN.md verweist hierher.
 1. **Refactor §3** ✓ **umgesetzt** (Interface/Impl-Units getrennt: `vectorstore` +
    `vectorstore.sqlitevec`, `embeddings` + `embed.provider` + `embed.lembed`; Engine
    SQLite-frei, Demos grün). Offen bleibt nur das **neue** pgvector-Backend (Punkt 2).
-2. **Merge §4** durchziehen — **Ziel Vollintegration**, gestaffelt nach Lizenz:
+2. **Merge §4** — *seit 2026-10-14 selektiv statt Vollintegration (Punkt 10)*;
+   ursprünglich gestaffelt nach Lizenz:
    - **(a) jetzt**: `mormot2-pgvector` (**MIT**) — pgvector als zweites
      `IVectorStore`-Backend `mormot.ai.vectorstore.pgvector` (die Naht steht),
      Ollama-Embedder als `mormot.ai.embed.ollama`, RAG-Zerlegung
@@ -538,17 +534,50 @@ Roadmap — DESIGN.md verweist hierher.
      schon entschieden, die frühere Nennung als Lücke war ein Doku-Fehler.
    - **Demo-Härtung** ✓ (bleibt gültig): Streamable-Demo bindet **Loopback**,
      `ask_claude` standardmäßig **deaktiviert** (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in).
-7. **Native Embeddings + Vektorsuche** (§5, Analyse: `docs/native-embeddings.md`,
-   Entwurf 2026-10-13) — `vec0` durch `mormot.ai.vectorstore.native` ersetzen (klein,
-   zuerst), danach Option D (`mormot.ai.embed.native`, eigener Encoder auf dem GGUF)
-   gegen lembed als Orakel; Gates siehe Analyse. **neural-api** bleibt Ziel für
-   `mormot.ai.llm.neuralapi` (generativ) und übernimmt den Embedder, sobald es
-   Charsmap + BERT-GGUF kann. Ziel: alle nativen Fremd-`.so` + der Docker-Bundle-
-   Download entfallen.
+7. **Native Embeddings + Vektorsuche + Inferenz** (§5):
+   - Store ✓, 2026-10-13: `mormot.ai.vectorstore.native` ersetzt `vec0`. Analyse und
+     Gate-5-Messung in `docs/native-embeddings.md`; 2c IVF nur bei Bedarf.
+   - Engine ○: eigene Pascal-Inferenz nach
+     [docs/native-inference.md](docs/native-inference.md). Zuerst BGE-M3 (ersetzt lembed),
+     dann Qwen3 hinter `ILlmClient`, dann CUDA.
+   - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
+     lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
+     dahin Fallback und Orakel.
 8. **Tests**: TVec0Store hat einen **env-gated Real-vec0-Test** (Keyed-Ops
    `Upsert`/`Delete`/`Search`-Key, `test.llm.rag`, läuft bei gesetztem `SQLITE_EXT_DIR`,
    sonst Skip). Offen: TLembedEmbedder-Realtest + RAG-Atomar-Rollback (brauchen die
    lembed-Runtime, s. Punkt 4).
+9. **Plattformbreite wie mORMot2** (2026-10-14, Befunde in
+   [docs/native-inference.md](docs/native-inference.md#plattformen-und-tests)):
+   - **Delphi 7** (Win32): 11 von 22 Units bauen. Portierung:
+     - MCP-Registries nicht-generisch;
+     - typisierte Tools über eine RTTI-Basis, `TMcpToolBase<T>` bleibt als Hülle;
+     - `exit(x)` ersetzen, `object` statt Record mit Methoden;
+     - eigenes Testskript mit Laufzeit-Gates.
+
+     Aufwand: einige Tage.
+   - **Windows ARM** (FPC 3.3.1): Die Suiten sind grün, sofern eine ARM64-`sqlite3-64.dll`
+     danebenliegt; mORMot2 hat für `aarch64-win64` kein statisches SQLite. Es fehlen ein
+     Testskript und die Beschaffung der DLL.
+   - **macOS M2** (FPC 3.2.4-rc2): grün. Es fehlt ein wiederholbares Skript.
+   - **RTX-Rechner** (Windows 11 x64, i9-14900K, RTX 5090): Die Suiten sind nativ unter
+     FPC 3.2.2 grün. Rolle: AVX2, native x64-Leistung, CUDA. Das CUDA-Toolkit fehlt
+     noch.
+10. **Weitere Lücken**, nach unmittelbarem Nutzen geordnet (Codex-Abgleich 2026-10-14):
+    1. Embedder-Auswahl im Konsumenten vervollständigen. Die Backend-Fabrik kennt nur
+       `none`/`lembed` und lehnt `ollama` ab. Der OpenAI-kompatible
+       `TProviderEmbedder` (z. B. IONOS) reicht als zweiter Weg.
+    2. Agent-Loop:
+       - Abbruch, Fristen, Kontextbudget, Schritt-Ereignisse;
+       - danach Sitzungs-Persistenz (Punkt 3). Wiederholte Tool-Aufrufe mit
+         Seiteneffekten müssen dabei ausgeschlossen sein.
+    3. Ingestion:
+       - tokenbasiertes Chunking (`ChunkText` zählt Bytes);
+       - stabile Dokument- und Chunk-Identität;
+       - Ersetzen, Löschen und Neuindizieren als Ablauf.
+    4. flydev-Übernahmen (Punkt 2) nur selektiv; pgvector erst, wenn ein Deployment es
+       braucht.
+    5. Die Stale-Zähler der Assertions in README/DESIGN vereinheitlichen.
 
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
