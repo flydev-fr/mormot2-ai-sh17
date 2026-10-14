@@ -5,7 +5,8 @@
 > (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 und x86_64 (AVX2) erledigt:
 > auf x86_64 1,6-mal (Linux) bis doppelt (Windows) so schnell wie lembed, auf aarch64 gleichauf bis schneller, jeweils
 > mit weniger Speicher; unter Linux x86_64 (die Produktion) alle Suiten und das
-> Korpus-Gate grün. Offen sind der Langlauf und das Umschalten des Defaults.
+> Korpus-Gate grün, Soak-Test über 90 Minuten bestanden. Offen ist das Umschalten des
+> Defaults im Backend.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -327,7 +328,11 @@ Blocktyp in `tensor`; `Linear` nimmt typisierte Gewichte (`TInferWeight`). Ergeb
 
 **Fertig, wenn:**
 - der Durchsatz mindestens 80 % von lembed erreicht, bei höchstens 125 % Peak-RSS;
-- der Durchsatz für die Erstindizierung von 2 Mio Texten gemessen ist;
+- der Durchsatz unter Dauerlast stabil ist: Soak-Test über 90 Minuten unter Linux x86_64,
+  gedrosselt auf 16 Threads, jeder Vektor über alle Durchgänge bitgleich (`embed-bench …
+  soak90 16`). Die Erstindizierung von 2 Mio Texten wird daraus hochgerechnet, nicht
+  abgewartet: 28 h Volllast wären für den Rechner unnötige Last (geändert 2026-10-14, mit
+  dem Nutzer abgestimmt);
 - der Build unter FPC 3.2.2/3.2.4 und Delphi 7 bis 13 grün ist (Delphi 7 ohne
   Leistungsziel).
 
@@ -364,7 +369,7 @@ Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigen
   Default sind zwei Drittel der Kerne: Alle Kerne spinnen zu lassen ist in der VM
   langsamer. Unter Dauerlast drosselt der Laptop; deshalb wechseln die Läufe ab.
 - **Hochrechnung Erstindizierung:** 5,6 Texte/s bei ⌀ 51 Tokens ergibt für 2 Mio Texte
-  rund 100 h auf diesem Laptop. Ein echter Langlauf steht noch aus.
+  rund 100 h auf diesem Laptop (Hochrechnung; das Gate ist der Soak-Test, siehe oben).
 - **Reviews:** Codex und Claude-Finder fanden u. a. einen ABA-Fehler im Pool (Aufträge
   mit 8, 2, 8 Einträgen konnten Count und Base mischen - jetzt Seqlock), einen
   Überlauf des Ticketzählers (jetzt Neustart bei 2^30 im Ruhezustand), den verlorenen
@@ -403,8 +408,22 @@ Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigen
   `*.gguf` in `.gitignore` und fehlte in jedem frischen Klon (26 Fehlschläge). Jetzt mit
   Ausnahme eingecheckt.
 
-**Offen für 1c:** der Langlauf für die Erstindizierung, dann das Umschalten des Defaults
-im Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
+- **Soak-Test bestanden** (2026-10-14, Linux x86_64 unter WSL2 auf dem i9, FPC 3.2.2,
+  16 Threads, `embed-bench … soak90 16`): 90 Minuten, 248 volle Durchgänge über den
+  Korpus plus 268 Texte, zusammen 79.628 Texte und 4,05 Mio Tokens. Durchsatz über alle
+  neun 10-Minuten-Intervalle 744 bis 752 Tokens/s, RSS durchgehend 437 MB (Spitze 442):
+  kein Einbruch und kein Wachstum beobachtet. **0 Vektoren** weichen vom ersten Durchgang
+  ab (79.308 bitgenaue Vergleiche). CPU bei 88 bis 90 °C, Lüfter 100 %; Microcode 0x12F
+  (die Raptor-Lake-Korrektur ab 0x12B ist drauf). Nach Überschlag (rund 25.000
+  Pool-Tickets je Text, zusammen rund 2,0 Mrd) ist der Ticket-Neustart bei 2^30 dabei
+  einmal gelaufen; gezählt hat das Programm ihn nicht.
+- **Erstindizierung, hochgerechnet:** aus dem Soak 14,7 Texte/s mit 16 Threads, für
+  2 Mio Texte rund 38 h unter Linux; aus der Einzelmessung mit dem Default von 22
+  Threads (861 Tokens/s) rund 33 h, über Dauer nicht gemessen.
+
+**Offen für 1c:** das Umschalten des Defaults im Backend (`native`-Provider), dazu der
+Load Governor (CONCEPT.md §9). Bis dahin bleibt lembed der Produktions-Default; nativ
+ist wählbar.
 
 ### Phase 2 — Decoder
 

@@ -10,7 +10,7 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
 > GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
 > it passes all suites and its quality gate on Linux x86_64 too; before it becomes the
-> default it still needs a long indexing run. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
+> default it passed a 90-minute soak test; switching the default comes next. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
 
 ## What it does
 
@@ -466,7 +466,7 @@ provider or runtime, not only against tests.
 | Embeddings via provider API | **stable** | |
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
-| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; waits for a long indexing run |
+| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the backend switch comes next |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
 | pgvector backend, Ollama embedder | **not built** | the `IVectorStore` / `IEmbedder` seams exist; built when a deployment needs them |
@@ -490,8 +490,10 @@ Done:
   BGE-M3 in FP32 and from the Q8_0 GGUF, NEON and AVX2 kernels, measured against lembed.
 
 Next, in this order:
-1. **Native embeddings by default** — a long run for a first indexing of 2 million
-   texts, then switch the default; lembed stays as fallback.
+1. **Native embeddings by default** in the consuming backend, with a load governor for
+   bulk jobs; lembed stays as fallback. The 90-minute soak test passed: 79,628 texts
+   (248 full passes over the corpus plus 268 texts), throughput flat at 744–752 tokens/s, memory flat
+   at 437 MB, every vector bit-identical to the first pass.
 2. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
    `ILlmClient` as `mormot.ai.llm.native`, with streaming and tool calls; gate: greedy
    output token-identical to `transformers` in FP32.
@@ -501,8 +503,11 @@ Next, in this order:
 5. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
-Alongside: agent loop limits (cancellation, deadlines, context budget), token-based
-chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
+Alongside: a **load governor** for bulk embedding (maximum threads, a duty cycle, and a
+temperature threshold where a sensor is readable — Linux hwmon — otherwise a heuristic on
+the throughput: a drop on unchanged texts hints at throttling or competing load; fans and
+power limits stay with the firmware), agent loop limits (cancellation, deadlines, context budget),
+token-based chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
 the single source of truth for open points.
 
 ## Why a standalone extension

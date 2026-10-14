@@ -9,6 +9,11 @@
 //   - ref: the scalar reference backend, otherwise TInferCpuFastBackend
 //   - lembed: the same loop through sqlite-lembed (vendor/sqlite-ext/<cpu>-<os>),
 //     for a comparison on one machine with one program
+//   - texts = soak<minutes>, e.g. soak90: a soak test - the corpus over and over
+//     for that long, a report every LAI_SOAK_INTERVAL seconds (default 600) with
+//     throughput, current and peak memory, and every vector compared bit for bit
+//     with the one of the first pass; a file soak.stop next to the program ends
+//     it after the current text (native engine only)
 //   e.g.   embed-bench vendor/models/bge-m3-q8_0.gguf 40 1
 program embed.bench;
 
@@ -236,6 +241,31 @@ const
     {$ifdef CPUX64} 'x86_64-' {$else} 'aarch64-' {$endif CPUX64} +
     {$ifdef OSWINDOWS} 'win64' {$else} 'linux' {$endif OSWINDOWS};
 
+/// current resident memory in MB, -1 if unknown
+function RssMB: integer;
+{$ifdef OSLINUX}
+var
+  s: RawUtf8;
+  p: PUtf8Char;
+{$endif OSLINUX}
+{$ifdef OSWINDOWS}
+var
+  info: TMemoryInfo;
+{$endif OSWINDOWS}
+begin
+  result := -1;
+  {$ifdef OSLINUX}
+  s := StringFromFileNoSize('/proc/self/status');
+  p := StrPosI('VMRSS:', pointer(s));
+  if p <> nil then
+    result := GetCardinal(PUtf8Char(GotoNextNotSpace(p + 6))) div 1024;
+  {$endif OSLINUX}
+  {$ifdef OSWINDOWS}
+  if GetMemoryInfo(info, true) then
+    result := info.allocused shr 20; // the working set
+  {$endif OSWINDOWS}
+end;
+
 /// <dir>/<aPath> for the first of the program folder and its parents holding it
 function FindUp(const aPath: TFileName): TFileName;
 var
@@ -269,6 +299,13 @@ var
   cos, minCos, a: double;
   j: PtrInt;
   t2, t3: Int64;
+  // soak test
+  soakMin, interval, pass, done, mism, tokTotal, lastTok: Int64;
+  tLast: Int64;
+  first: TSingleDynArray;
+  tokc: TIntegerDynArray;
+  stopFile: TFileName;
+  stop: boolean;
   bucket: integer;
   // per text length bucket (up to 16, 64, 256, 512 tokens): texts, tokens, us
   bTexts, bTokens, bTime: array[0..3] of Int64;
@@ -279,7 +316,10 @@ begin
   if gguf = '' then
     gguf := FindUp(MakePath(['vendor', 'models', 'bge-m3-q8_0.gguf']));
   limit := MaxInt;
-  if (ParamCount >= 2) and (ParamStr(2) <> 'all') then
+  soakMin := 0;
+  if (ParamCount >= 2) and (copy(ParamStr(2), 1, 4) = 'soak') then
+    soakMin := GetInteger(pointer(StringToUtf8(copy(ParamStr(2), 5, 10))))
+  else if (ParamCount >= 2) and (ParamStr(2) <> 'all') then
     limit := GetInteger(pointer(StringToUtf8(ParamStr(2))));
   corpus := FindUp(MakePath(['tests', 'data', 'embed-de', 'corpus.jsonl']));
   queries := FindUp(MakePath(['tests', 'data', 'embed-de', 'queries.jsonl']));
@@ -317,6 +357,13 @@ begin
     MoveFast(pointer(raw)^, pointer(ref)^, length(raw));
   end;
   n := MinPtrInt(limit, length(texts));
+  if (soakMin > 0) and ((n = 0) or
+     ((ParamCount >= 3) and (ParamStr(3) = 'lembed'))) then
+  begin
+    ConsoleWrite('soak: needs a non-empty corpus and the native engine');
+    ExitCode := 2;
+    exit;
+  end;
   {$ifdef OSWINDOWS}
   if GetEnvironmentVariable('LAI_THROTTLE') = '' then
     NoPowerThrottling;
@@ -399,6 +446,64 @@ begin
     QueryPerformanceMicroSeconds(t1);
     ConsoleWrite('loaded % in % ms', [ExtractFileName(gguf), (t1 - t0) div 1000]);
     h := emb.Dim;
+    if soakMin > 0 then
+    begin
+      interval := GetInteger(pointer(StringToUtf8(
+        GetEnvironmentVariable('LAI_SOAK_INTERVAL'))));
+      if interval <= 0 then
+        interval := 600;
+      stopFile := MakePath([Executable.ProgramFilePath, 'soak.stop']);
+      SetLength(tokc, n);
+      for i := 0 to n - 1 do
+        tokc[i] := length(emb.Tokenizer.Encode(texts[i]));
+      SetLength(first, n * h);
+      ConsoleWrite('soak: % min, % texts per pass, report every % s, stop file %',
+        [soakMin, n, interval, stopFile]);
+      pass := 0;
+      done := 0;
+      mism := 0;
+      tokTotal := 0;
+      lastTok := 0;
+      stop := false;
+      QueryPerformanceMicroSeconds(t0);
+      tLast := t0;
+      repeat
+        for i := 0 to n - 1 do
+        begin
+          v := emb.Embed([texts[i]]);
+          if pass = 0 then
+            MoveFast(pointer(v)^, first[i * h], h * SizeOf(single))
+          else if not CompareMem(pointer(v), @first[i * h], h * SizeOf(single)) then
+            inc(mism);
+          inc(done);
+          inc(tokTotal, tokc[i]);
+          QueryPerformanceMicroSeconds(t1);
+          if t1 - tLast >= interval * 1000000 then
+          begin
+            ConsoleWrite('% min: pass %, % texts, % tokens/s in the last interval, ' +
+              'RSS % MB (peak %), % vectors differing from pass 1',
+              [(t1 - t0) div 60000000, pass + 1, done,
+               (tokTotal - lastTok) * 1000000 div NotZero(t1 - tLast), RssMB,
+               PeakRssMB, mism]);
+            tLast := t1;
+            lastTok := tokTotal;
+          end;
+          if (t1 - t0 >= soakMin * 60000000) or FileExists(stopFile) then
+          begin
+            stop := true;
+            break;
+          end;
+        end;
+        inc(pass);
+      until stop;
+      ConsoleWrite('soak done: % min, % full passes + % texts, % texts, % tokens, ' +
+        '% tokens/s overall, RSS % MB (peak %), % vectors differing from pass 1',
+        [(t1 - t0) div 60000000, done div n, done mod n, done, tokTotal,
+         tokTotal * 1000000 div NotZero(t1 - t0), RssMB, PeakRssMB, mism]);
+      if mism <> 0 then
+        ExitCode := 1;
+      exit;
+    end;
     tokens := 0;
     minCos := 1;
     below := 0;

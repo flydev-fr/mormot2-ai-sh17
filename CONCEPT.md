@@ -301,8 +301,8 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
    - Token-IDs identisch zu lembed (wörtliche Sondertokens getrennt gegen
      `parse_special = false`);
    - nDCG@10 0,8989 ≥ 0,8863.
-6. Phase 1c, Messung und Umschaltung (aarch64 ✓ 2026-10-14: schneller als lembed bei
-   gleichem Budget, 63 % Speicher; offen x86_64/AVX2):
+6. Phase 1c, Messung und Umschaltung (aarch64 und x86_64 ✓ 2026-10-14, Linux x86_64
+   und Soak-Test grün; offen nur das Umschalten):
    - Default „native";
    - lembed bleibt Fallback und Orakel.
 7. Phase 2, Decoder Qwen3
@@ -593,8 +593,10 @@ Roadmap — DESIGN.md verweist hierher.
      dann Qwen3 hinter `ILlmClient`, dann CUDA. Phase 0 (Referenzdaten, Testrahmen) ✓
      und Phase 1a (BGE-M3 FP32 von Text bis Vektor, trifft PyTorch) ✓ 2026-10-14,
      Phase 1b (dasselbe Q8-GGUF wie lembed, trifft das Orakel, nDCG@10 0,8989) ✓
-     2026-10-14; 1c auf aarch64 ✓ (schneller als lembed), offen AVX2/x86_64 und das
-     Umschalten des Defaults.
+     2026-10-14; 1c ✓ 2026-10-14 bis auf das Umschalten: NEON und AVX2, auf x86_64
+     1,6- bis 2-mal so schnell wie lembed, Linux x86_64 grün, Soak-Test über 90 Minuten
+     bestanden; offen das Umschalten des Defaults im Backend und der Load Governor
+     (Punkt 10.7).
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.
@@ -634,6 +636,17 @@ Roadmap — DESIGN.md verweist hierher.
     5. Die Stale-Zähler der Assertions in README/DESIGN vereinheitlichen.
     6. Ein Build-Skript für die Demos unter Delphi (13 und 7). Heute baut nur
        `scripts/build-demo.sh` (FPC); die Delphi-Skripte decken nur die Testsuiten ab.
+    7. **Load Governor** für Bulk-Embedding (2026-10-14 aufgenommen, gehört zum Umstieg
+       auf den nativen Embedder im Backend):
+       - maximale Threads und ein Tastgrad (Pausen zwischen Batches);
+       - Temperaturschwelle, wo ein Sensor lesbar ist (Linux: `/sys/class/hwmon`,
+         im Docker-Container ohne root); unter WSL2 und Windows gibt es ohne Treiber
+         keinen Sensor;
+       - ohne Sensor eine Heuristik über den Durchsatz: Sinkt er bei gleichen Texten,
+         drosselt die CPU oder konkurriert andere Last (so fiel die Windows-Drosselung
+         auf, siehe docs/native-inference.md).
+       Lüfter und Leistungsgrenzen (PL1/PL2) bleiben bei Firmware und BIOS; von außen
+       begrenzt im Docker-Betrieb `--cpus`.
 
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
