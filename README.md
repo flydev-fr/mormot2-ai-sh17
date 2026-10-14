@@ -32,10 +32,11 @@ crypto are the foundation, not a dependency we tolerate.
   registries are `TSynDictionary`, typed tools build on `TMcpRecordTool`, and the generic
   `TMcpToolBase<T>` is only a shorthand where the compiler has generics.
 - **Written like mORMot2** — unit headers, `{ ****** section }` layout, `RawUtf8`,
-  `TDocVariantData`, `ESynException`, `f`/`a` prefixes, `///` docs. Stricter than mORMot2
-  where Delphi 7 needs it: a non-generic core (generics only as an optional typed shell
-  under `HASGENERICS`), no anonymous methods, no inline variables, no `exit(value)`, and
-  no `with`. The full rule set is in [CONCEPT.md §1](CONCEPT.md).
+  `TDocVariantData`, `ESynException`, `f` field prefix, `///` docs. Stricter than mORMot2
+  where Delphi 7 or readability needs it: a non-generic core (generics only as an optional
+  typed shell under `HASGENERICS`), no anonymous methods, no inline variables, no
+  `exit(value)`, no `with`, and an `a` prefix on our own parameters. The full rule set
+  is in [CONCEPT.md §1](CONCEPT.md).
 - **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
   provider wires) rather than chasing another library's changes.
 - **License MPL/GPL/LGPL** (the mORMot three-license, confirmed 2026-10-14 — also for the

@@ -4,7 +4,7 @@
 // - lets a TLlmAgent drive the very tools a mormot.ai.mcp server exposes: the
 //   bridge talks to the in-process server over JSON-RPC, exactly as a remote
 //   MCP client would, and the same RTTI-generated input schema describes both ends
-// - clean-room from the MCP spec; target license MPL/GPL/LGPL (mORMot contribution)
+// - clean-room from the MCP spec
 unit mormot.ai.agent.mcp;
 
 {

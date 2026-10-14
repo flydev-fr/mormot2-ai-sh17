@@ -2,7 +2,7 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room implementation from public provider API docs (OpenAI/Ollama);
-//   no third-party code, target license MPL/GPL/LGPL (mORMot contribution)
+//   no third-party code
 // - the OpenAI Chat Completions schema is the canonical wire format: LiteLLM and
 //   Ollama expose an OpenAI-compatible endpoint, so one mapping covers all three
 unit mormot.ai.llm.types;

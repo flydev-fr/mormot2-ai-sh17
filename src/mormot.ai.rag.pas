@@ -5,8 +5,18 @@
 //   to the LLM client: ingest chunks the text, embeds and stores it; query
 //   embeds the question, retrieves the nearest chunks and asks the model to
 //   answer grounded in them
-// - clean-room from the RAG pattern; target license MPL/GPL/LGPL
+// - clean-room from the RAG pattern
 unit mormot.ai.rag;
+
+{
+  *****************************************************************************
+
+    - ChunkText: split a text into overlapping chunks for ingestion
+    - TLlmRag: ingest (chunk, embed, store) and grounded query over an
+      IEmbedder, an IVectorStore and an ILlmClient
+
+  *****************************************************************************
+}
 
 interface
 

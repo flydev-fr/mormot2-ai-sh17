@@ -4,8 +4,16 @@
 // - implements IEmbedder against a provider's OpenAI-wire /embeddings endpoint;
 //   owns a TLlmClient built from the given provider config. This unit (not the
 //   IEmbedder interface in mormot.ai.embeddings) is what pulls the LLM client.
-// - clean-room from the OpenAI Embeddings spec; target license MPL/GPL/LGPL
+// - clean-room from the OpenAI Embeddings spec
 unit mormot.ai.embed.provider;
+
+{
+  *****************************************************************************
+
+    - TProviderEmbedder: IEmbedder over a provider's OpenAI-wire /embeddings
+
+  *****************************************************************************
+}
 
 interface
 

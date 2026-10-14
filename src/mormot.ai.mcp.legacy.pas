@@ -1,6 +1,6 @@
 /// MCP Legacy-Era Bridge - the "initialize" handshake for stdio clients
-// - this unit is part of the mormot2-ai project (mormot.ai.* extension)
-// - licensed under MPL/GPL/LGPL three license
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 unit mormot.ai.mcp.legacy;
 
 {

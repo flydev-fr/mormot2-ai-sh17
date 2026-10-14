@@ -1,8 +1,7 @@
 /// LandrixAI LLM Client - tool-calling agent loop
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
-// - clean-room from the OpenAI tool-calling protocol; no third-party code,
-//   target license MPL/GPL/LGPL (mORMot contribution)
+// - clean-room from the OpenAI tool-calling protocol; no third-party code
 unit mormot.ai.agent;
 
 {

@@ -7,8 +7,16 @@
 //     mormot.ai.embed.provider  - TProviderEmbedder (OpenAI-wire /embeddings)
 //     mormot.ai.embed.lembed    - TLembedEmbedder (local GGUF model in SQLite)
 //     mormot.ai.embed.ollama    - TOllamaEmbedder (future, from the merge)
-// - clean-room from the OpenAI Embeddings spec; target license MPL/GPL/LGPL
+// - clean-room from the OpenAI Embeddings spec
 unit mormot.ai.embeddings;
+
+{
+  *****************************************************************************
+
+    - IEmbedder: text -> embedding vector, the seam every embedder implements
+
+  *****************************************************************************
+}
 
 interface
 

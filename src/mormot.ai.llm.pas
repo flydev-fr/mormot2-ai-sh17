@@ -2,7 +2,7 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room from public provider API docs (OpenAI Chat Completions); no
-//   third-party code, target license MPL/GPL/LGPL (mORMot contribution)
+//   third-party code
 // - the OpenAI wire is canonical: the same TLlmClient drives OpenAI, LiteLLM and
 //   Ollama (OpenAI-compatible endpoint) - only the provider config differs
 unit mormot.ai.llm;

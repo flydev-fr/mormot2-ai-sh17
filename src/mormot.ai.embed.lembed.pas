@@ -16,6 +16,15 @@
 // - SQL patterns mirror the public sqlite-lembed interface
 unit mormot.ai.embed.lembed;
 
+{
+  *****************************************************************************
+
+    - TLembedEmbedder: IEmbedder over a GGUF model run inside SQLite (lembed0)
+    - SharedLembedEmbedder: one process-wide embedder per model name
+
+  *****************************************************************************
+}
+
 interface
 
 {$I mormot.defines.inc}

@@ -10,8 +10,18 @@
 //                                        Pascal search, no extension; filterable)
 //     mormot.ai.vectorstore.pgvector   - TPgVectorStore (server/multi-tenant, future)
 //   which backend is wired in is a composition decision (DI), never an {$ifdef}.
-// - clean-room; target license MPL/GPL/LGPL
+// - clean-room
 unit mormot.ai.vectorstore;
+
+{
+  *****************************************************************************
+
+    - TRagHit: one nearest-neighbour hit (id, text, distance)
+    - IVectorStore / IFilteredVectorStore: the backend-neutral store contract
+    - VectorToBlob / BlobToVector: float32 blob encoding of an embedding
+
+  *****************************************************************************
+}
 
 interface
 

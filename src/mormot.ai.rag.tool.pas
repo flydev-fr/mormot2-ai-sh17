@@ -7,7 +7,7 @@
 // - because it is a plain MCP tool, the same implementation serves a remote MCP
 //   client AND - via mormot.ai.agent.mcp's TLlmMcpToolbox bridge - the in-process
 //   TLlmAgent loop; no extra toolbox plumbing is needed
-// - clean-room from the RAG/MCP patterns; target license MPL/GPL/LGPL
+// - clean-room from the RAG/MCP patterns
 unit mormot.ai.rag.tool;
 
 {

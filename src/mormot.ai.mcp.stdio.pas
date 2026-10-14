@@ -1,6 +1,6 @@
 /// MCP Stdio Transport - Standard Input/Output for CLI Integration
-// - this unit is part of the mormot-mcp-server project
-// - licensed under MPL/GPL/LGPL three license
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - adopted into the mormot.ai.* namespace for landrix (LandrixAI) from
 //   flydev-fr/mormot2-extensions
 unit mormot.ai.mcp.stdio;

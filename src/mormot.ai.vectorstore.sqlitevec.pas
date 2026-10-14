@@ -11,6 +11,14 @@
 // - SQL patterns mirror the public sqlite-vec interface
 unit mormot.ai.vectorstore.sqlitevec;
 
+{
+  *****************************************************************************
+
+    - TVec0Store: IVectorStore over the sqlite-vec (vec0) extension
+
+  *****************************************************************************
+}
+
 interface
 
 {$I mormot.defines.inc}

@@ -4,8 +4,7 @@
 // - the OpenAI Chat Completions wire is the suite's lingua franca (mormot.ai.llm);
 //   Anthropic speaks a genuinely different wire (Messages API), so it gets a
 //   native adapter instead of an OpenAI-compatible shim
-// - clean-room from the public Anthropic Messages API docs; no third-party code,
-//   target license MPL/GPL/LGPL (mORMot contribution)
+// - clean-room from the public Anthropic Messages API docs; no third-party code
 unit mormot.ai.llm.anthropic;
 
 {

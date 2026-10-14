@@ -4,7 +4,7 @@
 // - constrains a completion to a record's JSON-Schema and loads the answer back
 //   into that record, reusing the very RTTI schema generator the MCP tools use
 //   (mormot.ai.mcp) - the same machine describes a tool's input and a model's output
-// - clean-room from the OpenAI Structured Outputs spec; target license MPL/GPL/LGPL
+// - clean-room from the OpenAI Structured Outputs spec
 unit mormot.ai.llm.structured;
 
 {

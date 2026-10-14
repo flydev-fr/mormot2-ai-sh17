@@ -11,6 +11,16 @@
 //   native one) never depends on the sqlite-vec unit
 unit mormot.ai.sqlite;
 
+{
+  *****************************************************************************
+
+    - RollbackIfOpen: transaction recovery shared by the SQLite backends
+    - SqliteExtSuffix / EnableSqliteExtensions / LoadSqliteExtension:
+      run-time loading of sqlite-vec and sqlite-lembed
+
+  *****************************************************************************
+}
+
 interface
 
 {$I mormot.defines.inc}

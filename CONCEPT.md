@@ -55,9 +55,8 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
     - `TSynDictionary`, `TSynThread`, `TSynTempBuffer`, `TLightLock`.
   - **Ausnahmen**: eigene Klassen von `ESynException` abgeleitet (Projektstandard), mit
     `CreateUtf8`/`RaiseUtf8` oder `CreateU` für feste Meldungen.
-  - **Benennung**: Felder `f…`, Parameter `a…` (außer in Signaturen, die mORMot
-    vorgibt, etwa `Ctxt`), Klassen `T…`, Zeiger `P…`, Ausnahmen `E…`; `result`/`exit`
-    klein, zwei Leerzeichen Einzug, `begin` in eigener Zeile.
+  - **Benennung**: Felder `f…`, Klassen `T…`, Zeiger `P…`, Ausnahmen `E…`;
+    `result`/`exit` klein, zwei Leerzeichen Einzug, `begin` in eigener Zeile.
   - **Doku**: `///` vor öffentlichen Symbolen, Details als `// - …`-Aufzählung,
     Kommentare englisch.
 
@@ -66,8 +65,15 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
     typisierte Hülle unter `HASGENERICS` über einem nicht-generischen Kern (Beispiel
     `TMcpToolBase<T>` über `TMcpRecordTool`).
   - Keine anonymen Methoden, keine Inline-Variablen, keine Array-Konstruktoren.
-  - Kein `exit(wert)` (Delphi 7) und kein `with`. mORMot nutzt beides vereinzelt, wir
-    nicht.
+  - Kein `exit(wert)` (Delphi 7). mORMot nutzt es vereinzelt.
+  - Kein `with` (Lesbarkeit: jeder Bezeichner zeigt, wem er gehört). mORMot selbst nutzt
+    `with` oft, im Trunk über 200-mal.
+  - Parameter immer mit `a…`. Ausgenommen sind von außen vorgegebene Signaturen
+    (mORMots `Ctxt` und Server-Konstruktoren, `TStream`-Overrides, SQLite-Callbacks)
+    und kleine Helfer im `implementation`-Teil mit kurzen Namen (`c`, `v`, `q`).
+    mORMot schreibt Parameter meist ohne Präfix (`Data`, `Len`), nur gut jeder zehnte
+    trägt es; fest ist dort nur `f` für Felder. Wir halten es durchgängig, damit
+    Parameter, Felder und lokale Variablen auseinanderzuhalten sind.
   - Records mit Methoden als `{$ifdef USERECORDWITHMETHODS}record{$else}object{$endif}`.
   - Quelltext ohne BOM, nur ASCII in String-Literalen.
   - **Leistung**: in heißen Schleifen keine Allokation je Element; amortisiert
@@ -76,11 +82,8 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
   Nachschlagen: Skill `landrix-mormot2` und die mORMot2-Quellen selbst.
 
   **Stand 2026-10-14**:
-  - Der strengere Teil ist erfüllt (Delphi 7 baut).
-  - Offen beim mORMot-Teil:
-    - der Übersichtsblock unter der `unit`-Zeile in den meisten Units;
-    - vereinzelt `integer` statt `PtrInt` als Index (z. B. `TTopK`);
-    - die undokumentierte Beispiel-Unit `mormot.ai.mcp.tools`.
+  - Beide Teile sind erfüllt: Delphi 7 baut, jede Unit hat Kopf, Lizenzzeile und
+    Übersichtsblock, und `TTopK` indiziert mit `PtrInt`.
   - Zeilenenden sind im Repo einheitlich LF (mORMot speichert CRLF). Das ist bewusst so,
     weil die Extension primär unter Linux gebaut wird.
 - **Die eiserne Regel bleibt**: **kein Landrix-Domänenwissen im `mormot.ai.*`-Code.**

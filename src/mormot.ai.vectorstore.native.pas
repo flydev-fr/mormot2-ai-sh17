@@ -34,8 +34,19 @@
 //   application COMMIT fail with SQLITE_BUSY (mORMot sets no busy timeout on the
 //   application side), and an application read blocks the store's writes.
 //   JournalMode reports the mode found at open
-// - clean-room; target license MPL/GPL/LGPL
+// - clean-room
 unit mormot.ai.vectorstore.native;
+
+{
+  *****************************************************************************
+
+    - EVectorStore and TVectorContract: what a stored vector means
+    - TNativeVectorStore: filterable store over plain SQLite tables, with an
+      exact scan and a 1-bit RAM index rescored exactly
+    - VectorContract / VectorContractToJson / IsValidVectorSpace: contract helpers
+
+  *****************************************************************************
+}
 
 interface
 
@@ -104,10 +115,10 @@ type
     /// the key query of SearchWhere must be one read-only, one-column statement
     procedure CheckKeySql(const aKeySql: RawUtf8);
     /// the exact streamed scan (small stores, and the reference for the index)
-    function Scan(const q: TLlmEmbedding; aTopK: integer;
+    function Scan(const aQuery: TLlmEmbedding; aTopK: integer;
       const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
     /// the 1-bit code of a unit vector, as stored in the sign column
-    function SignCode(const q: TLlmEmbedding): RawByteString;
+    function SignCode(const aQuery: TLlmEmbedding): RawByteString;
     /// current generation (bumped by triggers on every change of the items)
     function ReadGen: Int64;
     /// (re)load the RAM index when its generation is not the table's
@@ -123,11 +134,11 @@ type
     function KeyRowIds(const aKeySql: RawUtf8;
       const aParams: array of const): TInt64DynArray;
     /// the index-backed search: Hamming candidates, exact float32 rescoring
-    function IndexSearch(const q: TLlmEmbedding; aTopK: integer;
+    function IndexSearch(const aQuery: TLlmEmbedding; aTopK: integer;
       const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
     /// text + key of the winners, inside the caller's read snapshot
     function FetchHits(const aRowIds: array of Int64;
-      const aScores: array of double; aCount: integer): TRagHitDynArray;
+      const aScores: array of double; aCount: PtrInt): TRagHitDynArray;
     /// shared entry of Search and SearchWhere
     function DoSearch(const aQuery: TLlmEmbedding; aTopK: integer;
       const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
@@ -269,14 +280,14 @@ type
   TTopK = {$ifdef USERECORDWITHMETHODS}record{$else}object{$endif}
     Score: array of double;
     RowId: array of Int64;
-    Count, Capacity: integer;
-    procedure Init(aCapacity: integer);
+    Count, Capacity: PtrInt;
+    procedure Init(aCapacity: PtrInt);
     /// a ranks before b: higher score, then lower rowid (deterministic ties)
-    function Before(aScore: double; aRowId: Int64; aIndex: integer): boolean;
+    function Before(aScore: double; aRowId: Int64; aIndex: PtrInt): boolean;
     procedure Offer(aScore: double; aRowId: Int64);
   end;
 
-procedure TTopK.Init(aCapacity: integer);
+procedure TTopK.Init(aCapacity: PtrInt);
 begin
   Capacity := aCapacity;
   Count := 0;
@@ -286,7 +297,7 @@ begin
   SetLength(RowId, length(Score));
 end;
 
-function TTopK.Before(aScore: double; aRowId: Int64; aIndex: integer): boolean;
+function TTopK.Before(aScore: double; aRowId: Int64; aIndex: PtrInt): boolean;
 begin
   result := (aScore > Score[aIndex]) or
             ((aScore = Score[aIndex]) and (aRowId < RowId[aIndex]));
@@ -294,7 +305,7 @@ end;
 
 procedure TTopK.Offer(aScore: double; aRowId: Int64);
 var
-  i: integer;
+  i: PtrInt;
 begin
   if Count = Capacity then
     if not Before(aScore, aRowId, Count - 1) then
@@ -719,7 +730,7 @@ begin
     result[i] := aVec[i] * scale;
 end;
 
-function TNativeVectorStore.SignCode(const q: TLlmEmbedding): RawByteString;
+function TNativeVectorStore.SignCode(const aQuery: TLlmEmbedding): RawByteString;
 var
   i: PtrInt;
   p: PQWordArray;
@@ -729,8 +740,9 @@ begin
   p := pointer(result);
   FillCharFast(p^, fSignWords * 8, 0);
   // bit test, not "> 0": no float compare (NaN-safe), and -0.0 counts as 0
-  for i := 0 to high(q) do
-    if (PCardinal(@q[i])^ and $80000000 = 0) and (PCardinal(@q[i])^ <> 0) then
+  for i := 0 to high(aQuery) do
+    if (PCardinal(@aQuery[i])^ and $80000000 = 0) and
+       (PCardinal(@aQuery[i])^ <> 0) then
       p^[i shr 6] := p^[i shr 6] or (QWord(1) shl (i and 63));
 end;
 
@@ -1239,12 +1251,12 @@ end;
 
 /// re-raise a SQLITE_AUTH failure as EVectorStore (the read-only authorizer
 // refused something only visible at Step time, e.g. a pragma function)
-procedure RaiseIfAuth(aStore: TObject; E: Exception);
+procedure RaiseIfAuth(aStore: TObject; aError: Exception);
 begin
-  if (E is ESqlite3Exception) and
-     (ESqlite3Exception(E).ErrorCode = SQLITE_AUTH) then
+  if (aError is ESqlite3Exception) and
+     (ESqlite3Exception(aError).ErrorCode = SQLITE_AUTH) then
     EVectorStore.RaiseUtf8('%.SearchWhere: key query uses a forbidden ' +
-      'operation (only reading is allowed): %', [aStore, E.Message]);
+      'operation (only reading is allowed): %', [aStore, aError.Message]);
 end;
 
 function TNativeVectorStore.KeyRowIds(const aKeySql: RawUtf8;
@@ -1301,7 +1313,7 @@ begin
   SetLength(result, n);
 end;
 
-function TNativeVectorStore.IndexSearch(const q: TLlmEmbedding; aTopK: integer;
+function TNativeVectorStore.IndexSearch(const aQuery: TLlmEmbedding; aTopK: integer;
   const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
 var
   idx: TSignIndex;
@@ -1318,7 +1330,7 @@ var
 begin
   result := nil;
   idx := TSignIndex(fIndex);
-  code := SignCode(q);
+  code := SignCode(aQuery);
   if aKeySql <> '' then
   begin
     // only a PRE-selection for the mask: the filter is applied again below,
@@ -1391,7 +1403,7 @@ begin
               if sqlite3.column_bytes(stmt, 1) <> fBlobSize then
                 EVectorStore.RaiseUtf8('%: row % has a corrupt embedding',
                   [self, sqlite3.column_int64(stmt, 0)]);
-              score := DotRow(pointer(q), pointer(sqlite3.column_blob(stmt, 1)),
+              score := DotRow(pointer(aQuery), pointer(sqlite3.column_blob(stmt, 1)),
                 fContract.Dim);
               if PInt64(@score)^ and DOUBLE_EXP_MASK = DOUBLE_EXP_MASK then
                 EVectorStore.RaiseUtf8('%: row % has a corrupt embedding ' +
@@ -1424,10 +1436,10 @@ begin
 end;
 
 function TNativeVectorStore.FetchHits(const aRowIds: array of Int64;
-  const aScores: array of double; aCount: integer): TRagHitDynArray;
+  const aScores: array of double; aCount: PtrInt): TRagHitDynArray;
 var
   r: TSqlRequest;
-  i: integer;
+  i: PtrInt;
 begin
   // text + key for the winners only - called inside the caller's read snapshot
   SetLength(result, aCount);
@@ -1453,7 +1465,7 @@ begin
   end;
 end;
 
-function TNativeVectorStore.Scan(const q: TLlmEmbedding; aTopK: integer;
+function TNativeVectorStore.Scan(const aQuery: TLlmEmbedding; aTopK: integer;
   const aKeySql: RawUtf8; const aParams: array of const): TRagHitDynArray;
 var
   r: TSqlRequest;
@@ -1511,7 +1523,7 @@ begin
             'expected %)', [self, sqlite3.column_int64(stmt, 0),
             sqlite3.column_bytes(stmt, 1), fBlobSize]);
         row := sqlite3.column_blob(stmt, 1);
-        score := DotRow(pointer(q), row, fContract.Dim);
+        score := DotRow(pointer(aQuery), row, fContract.Dim);
         // the query is finite, so a non-finite score means NaN/Inf bytes in
         // the row (a foreign writer) - test the bits: comparing a NaN raises
         // EInvalidOp once the FPU flags are restored

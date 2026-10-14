@@ -1,6 +1,6 @@
 /// Model Context Protocol (MCP) Server Implementation for mORMot v2
-// - this unit is part of the mormot-mcp-server project
-// - licensed under MPL/GPL/LGPL three license
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - adopted into the mormot.ai.* namespace for landrix (LandrixAI) from
 //   flydev-fr/mormot2-extensions
 unit mormot.ai.mcp;
@@ -12,7 +12,7 @@ unit mormot.ai.mcp;
     - IInvokable Interfaces for Tools and Resources
     - RTTI-based Schema Generation
     - JSON-RPC 2.0 Protocol Processor
-    - Generic Tool and Resource Base Classes
+    - Typed Tool and Resource Base Classes
     - Main MCP Server with Tool/Resource Registry
 
   *****************************************************************************
@@ -644,9 +644,9 @@ type
     /// return the JSON schema for input parameters as TDocVariant
     function GetInputSchema: variant;
     /// execute the tool with given arguments and auth context
-    // - Args is a TDocVariantData containing the input parameters
+    // - aArgs is a TDocVariantData containing the input parameters
     // - returns a TDocVariantData with 'content' array field
-    function Execute(const Args: variant; const AuthCtx: TMcpAuthContext): variant;
+    function Execute(const aArgs: variant; const aAuthCtx: TMcpAuthContext): variant;
   end;
 
   /// MCP Resource interface - represents readable data
@@ -672,8 +672,8 @@ type
   IMcpInteractiveTool = interface(IMcpTool)
     ['{1C4A6F2D-9B37-4E58-8A0D-6F3B2E9C4D71}']
     /// execute with the full request context, including any input responses
-    function ExecuteInteractive(const Args: variant;
-      const Context: TMcpCallContext): variant;
+    function ExecuteInteractive(const aArgs: variant;
+      const aContext: TMcpCallContext): variant;
   end;
 
   /// a resource that takes part in Multi Round-Trip Requests
@@ -682,7 +682,7 @@ type
   IMcpInteractiveResource = interface(IMcpResource)
     ['{5B8E1A3C-4D62-4F79-B1E5-8C2A7D0F3B94}']
     /// read with the full request context, including any input responses
-    function ReadInteractive(const Context: TMcpCallContext): RawUtf8;
+    function ReadInteractive(const aContext: TMcpCallContext): RawUtf8;
   end;
 
   /// MCP Prompt interface — a server-defined message template a USER picks
@@ -708,8 +708,8 @@ type
     //   messages array — the server wraps a bare array for convenience
     // - raise EMcpInvalidParams for a missing required argument: "Missing
     //   required arguments: -32602"
-    function Render(const Args: variant;
-      const AuthCtx: TMcpAuthContext): variant;
+    function Render(const aArgs: variant;
+      const aAuthCtx: TMcpAuthContext): variant;
   end;
 
   /// a parameterized resource, published as an RFC 6570 URI template
@@ -761,12 +761,12 @@ type
     // - aValue is what the user typed so far (possibly empty)
     // - return at most 100 entries; the server truncates beyond that and sets
     //   `hasMore`, so an over-eager implementation cannot break the response
-    // - AuthCtx identifies the caller: suggestions ARE data, and a shared
+    // - aAuthCtx identifies the caller: suggestions ARE data, and a shared
     //   server must be able to offer a user only what that user may see. A
     //   completion that ignores it leaks the shape of everything it knows —
     //   file names, record ids — to anyone who can type a prefix.
-    function Complete(const ArgumentName, ArgumentValue: RawUtf8;
-      const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
+    function Complete(const aArgumentName, aArgumentValue: RawUtf8;
+      const aContext: variant; const aAuthCtx: TMcpAuthContext): TRawUtf8DynArray;
   end;
 
   /// a prompt that takes part in Multi Round-Trip Requests
@@ -776,8 +776,8 @@ type
   IMcpInteractivePrompt = interface(IMcpPrompt)
     ['{9A2D6E38-7F41-4B5C-8E0A-2D6B9F3C7A18}']
     /// render with the full request context, including any input responses
-    function RenderInteractive(const Args: variant;
-      const Context: TMcpCallContext): variant;
+    function RenderInteractive(const aArgs: variant;
+      const aContext: TMcpCallContext): variant;
   end;
 
 

@@ -5,6 +5,15 @@
 //   are the same TLlmClient with a different TLlmProviderConfig
 unit mormot.ai.llm.openai;
 
+{
+  *****************************************************************************
+
+    - OpenAIConfig / OllamaConfig / LiteLLMConfig: ready provider configs
+    - LlmConfigFromEnv: pick the provider config from environment variables
+
+  *****************************************************************************
+}
+
 interface
 
 {$I mormot.defines.inc}
