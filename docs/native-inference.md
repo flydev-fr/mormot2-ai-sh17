@@ -5,8 +5,8 @@
 > (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 und x86_64 (AVX2) erledigt:
 > auf x86_64 1,6-mal (Linux) bis doppelt (Windows) so schnell wie lembed, auf aarch64 gleichauf bis schneller, jeweils
 > mit weniger Speicher; unter Linux x86_64 (die Produktion) alle Suiten und das
-> Korpus-Gate grün, Soak-Test über 90 Minuten bestanden. Offen ist das Umschalten des
-> Defaults im Backend.
+> Korpus-Gate grün, Soak-Test über 90 Minuten bestanden; im Backend der empfohlene
+> Provider (`AI_EMBED_PROVIDER=native`). Phase 1c ist damit abgeschlossen.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -421,9 +421,20 @@ Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigen
   2 Mio Texte rund 38 h unter Linux; aus der Einzelmessung mit dem Default von 22
   Threads (861 Tokens/s) rund 33 h, über Dauer nicht gemessen.
 
-**Offen für 1c:** das Umschalten des Defaults im Backend (`native`-Provider), dazu der
-Load Governor (CONCEPT.md §9). Bis dahin bleibt lembed der Produktions-Default; nativ
-ist wählbar.
+- **Umschalten im Backend** (2026-10-14): Provider `native` in
+  `landrix.server.ai.Embedder` - braucht nur `AI_EMBED_MODEL_PATH`, `AI_EMBED_THREADS`
+  optional; `.env.sample`, Docker-Doku und Entrypoint führen ihn als empfohlenen Weg,
+  lembed bleibt Rückfall und Orakel. Der Feature-Schalter bleibt per Default `none`
+  (kein Modell im RAM, solange niemand AI einschaltet). Ein echter Warmup-Test lädt
+  dabei die 32-KB-Fixture `tiny-gguf`.
+- **Load Governor** (`mormot.ai.governor`, im Backend `GetBulkEmbedder` mit
+  `AI_BULK_*`): Tastgrad, Temperaturschwelle über Linux-hwmon, Durchsatz-Heuristik.
+  Review-Fund dabei: sysfs meldet für jede Datei 4096 Bytes, `StringFromFile` lieferte
+  deshalb leere Strings - die Temperatur war nie lesbar; jetzt `StringFromFileNoSize`,
+  mit Regressionstest gegen das echte `/sys` und Gegenprobe.
+
+**Phase 1c ist abgeschlossen.** Offen bleibt nur der erste Aufrufer des Governors (ein
+Indizier-Job im Backend) und ein Lauf auf echter Sensor-Hardware.
 
 ### Phase 2 — Decoder
 

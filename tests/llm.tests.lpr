@@ -21,7 +21,8 @@ uses
   test.llm.structured,
   test.llm.rag,
   test.llm.rag.tool,
-  test.llm.vectorstore.native;
+  test.llm.vectorstore.native,
+  test.llm.governor;
 
 type
   TLlmTests = class(TSynTestsLogged)
@@ -40,7 +41,8 @@ begin
     TTestLlmStructured,
     TTestLlmRag,
     TTestLlmRagTool,
-    TTestVectorStoreNative
+    TTestVectorStoreNative,
+    TTestLoadGovernor
   ]);
 end;
 

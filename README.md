@@ -9,8 +9,9 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > **Status, 2026-10-14:** MCP, LLM clients, agent loop, RAG and the native vector store
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
 > GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
-> it passes all suites and its quality gate on Linux x86_64 too; before it becomes the
-> default it passed a 90-minute soak test; switching the default comes next. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
+> it passes all suites, its quality gate and a 90-minute soak test on Linux x86_64 too,
+> and it is the recommended provider of the consuming backend. Next: decoder LLMs (Qwen3),
+> then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
 
 ## What it does
 
@@ -22,6 +23,7 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 | **Embeddings** | `mormot.ai.embeddings`, `.embed.{native,provider,lembed}` | one `IEmbedder` seam: the native engine, any OpenAI-compatible API, or sqlite-lembed |
 | **Vector search** | `mormot.ai.vectorstore[.native/.sqlitevec]` | native store in mORMot's SQLite: float32 rows as the truth, 1-bit RAM index with exact rescoring, SQL key filters — measured at 2 million × 1024 |
 | **RAG** | `mormot.ai.rag[.tool]` | strict, atomic ingestion; retrieval; RAG as an MCP/agent tool |
+| **Load governor** | `mormot.ai.governor` | paces bulk jobs: duty cycle, CPU temperature threshold (Linux hwmon), throughput heuristic; `TGovernedEmbedder` wraps any `IEmbedder` |
 | **Native inference** | `src/infer/mormot.ai.infer.*` | GGUF and safetensors loaders, Q8_0, SentencePiece/Unigram tokenizer, XLM-RoBERTa encoder, CPU backend with NEON and AVX2 kernels and its own thread pool |
 
 ## Where it runs
@@ -30,19 +32,20 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 656 | 1215 |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 656 | 821 ¹ |
-| Windows x64 | Delphi 13 | 1257 | 659 | 1205 |
-| Windows x86 | **Delphi 7** | 1253 | 647 | 669 |
-| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 | not yet run |
-| Windows ARM64 | FPC 3.3.1 | 1257 | green ² | not yet run |
-| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 656 | 828 ³ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1215 |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ |
+| Windows x64 | Delphi 13 | 1257 | 720 | 1205 |
+| Windows x86 | **Delphi 7** | 1253 | 708 | 669 |
+| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | not yet run |
+| Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
+| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ |
 
 ¹ Without the converted FP32 reference model on that machine; those tests skip.
 ² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
 that target.
 ³ The production target (Docker uses the same FPC 3.2.2), with the BGE-M3 corpus gate
 (`LAI_INFER_GATE=1`) included: nDCG@10 0.8994 on the AVX2 path.
+⁴ Run before the load governor tests were added (they bring about 60 assertions).
 
 Counts differ by compiler because some tests only exist where a feature does (the `vec0`
 extension has no 32-bit build, so Delphi 7 skips that test).
@@ -437,6 +440,7 @@ mormot2-ai/
     mormot.ai.vectorstore[.native|.sqlitevec]
     mormot.ai.sqlite                              SQLite helpers, extension loader
     mormot.ai.rag[.tool]
+    mormot.ai.governor                            load governor for bulk jobs
     infer/mormot.ai.infer.*                       the native inference engine:
       tensor, memory, loader.{gguf,safetensors}, tokenizer.ugm, model.xlmr,
       backend[.cpu], kernels (NEON, AVX2), threads, pipeline.embed
@@ -466,7 +470,8 @@ provider or runtime, not only against tests.
 | Embeddings via provider API | **stable** | |
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
-| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the backend switch comes next |
+| Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
+| Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
 | pgvector backend, Ollama embedder | **not built** | the `IVectorStore` / `IEmbedder` seams exist; built when a deployment needs them |
@@ -490,23 +495,17 @@ Done:
   BGE-M3 in FP32 and from the Q8_0 GGUF, NEON and AVX2 kernels, measured against lembed.
 
 Next, in this order:
-1. **Native embeddings by default** in the consuming backend, with a load governor for
-   bulk jobs; lembed stays as fallback. The 90-minute soak test passed: 79,628 texts
-   (248 full passes over the corpus plus 268 texts), throughput flat at 744–752 tokens/s, memory flat
-   at 437 MB, every vector bit-identical to the first pass.
-2. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
+1. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
    `ILlmClient` as `mormot.ai.llm.native`, with streaming and tool calls; gate: greedy
    output token-identical to `transformers` in FP32.
-3. **Quantisation and speed** — Q4_0, later K-quants, sampling (temperature, top-k,
+2. **Quantisation and speed** — Q4_0, later K-quants, sampling (temperature, top-k,
    top-p), benchmarks per platform.
-4. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
-5. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
+3. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
+4. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
-Alongside: a **load governor** for bulk embedding (maximum threads, a duty cycle, and a
-temperature threshold where a sensor is readable — Linux hwmon — otherwise a heuristic on
-the throughput: a drop on unchanged texts hints at throttling or competing load; fans and
-power limits stay with the firmware), agent loop limits (cancellation, deadlines, context budget),
+Alongside: the first real consumer of the load governor (a bulk indexing job in the
+backend), agent loop limits (cancellation, deadlines, context budget),
 token-based chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
 the single source of truth for open points.
 
