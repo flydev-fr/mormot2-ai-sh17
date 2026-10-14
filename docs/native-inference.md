@@ -2,7 +2,9 @@
 
 > **Status (2026-10-14):** Phase 0, 1a und 1b erledigt: BGE-M3 läuft nativ von Text bis
 > Vektor, in FP32 gegen PyTorch und aus demselben Q8-GGUF wie lembed gegen das Orakel
-> (Token-IDs, Kosinus, nDCG@10 - siehe dort). Als Nächstes 1c (Tempo, Umschalten).
+> (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 erledigt: schneller als
+> lembed bei gleichem CPU-Budget und weniger Speicher; offen sind AVX2 für x86_64 (die
+> Produktion), die Messung dort und das Umschalten des Defaults.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -330,6 +332,47 @@ Blocktyp in `tensor`; `Linear` nimmt typisierte Gewichte (`TInferWeight`). Ergeb
 
 Danach wird **nativ** zum Default. lembed bleibt als expliziter Fallback und als
 unabhängiges Orakel erhalten, bis die nativen Gates auf allen Zielplattformen stehen.
+
+**Stand 2026-10-14: Teil a (aarch64) erledigt.** Neu: `kernels` (NEON, Befehle als
+Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigener Pool),
+`TInferCpuFastBackend` in `backend.cpu`, der Adapter `mormot.ai.embed.native`
+(`TNativeEmbedder`, `SharedNativeEmbedder`) und `demos/infer/embed-bench.lpr`.
+- **Zwei Rechenverträge** (mit Codex entschieden): `Exact = true` rechnet bitgleich zur
+  skalaren double-Referenz, nur auf allen Kernen. Der Default rechnet wie ggml in
+  float-Spuren (Q8_0-Linear: SDOT-Teilsummen, je Block mit dw·dx skaliert, am Zeilenende
+  reduziert; Attention in float; GELU über eine kubische Hermite-Tabelle, Fehler < 1e-9)
+  und wird mit Toleranz gegen die Referenz geprüft. Exakt bleiben in beiden Modi die
+  Quantisierung der Aktivierungen (byte-gleich zu ggml, NEON wie Pascal) und die
+  Integer-Blocksummen. Ein Aufrufer, der den Pool belegt findet, rechnet mit denselben
+  Kernen auf seinem Thread: dieselben Bits, unabhängig von der Last.
+- **erf neu:** eigene Polynomanpassung (`tools/infer-ref/fit_erf.py`, mpmath),
+  relativer Fehler < 1e-14, rund 20 ns statt bis zu 200 ns je Wert.
+- **Qualität (schneller Pfad, ganzer Korpus):** nDCG@10 **0,9004** (lembed 0,8963,
+  Gate 0,8863), Kosinus gegen lembed mindestens 0,99949; der Korpus in 34 s statt
+  51 min auf der Referenz.
+- **Durchsatz** (Snapdragon X, WSL aarch64, ganzer Korpus, im Wechsel gemessen, Modell
+  auf dem Linux-Dateisystem - über `/mnt/d` kostet das Mapping rund 25 %):
+
+  | | lembed | nativ | Anteil |
+  |---|---|---|---|
+  | 4 Kerne (taskset, je 4 Threads), Runde 1 / 2 | 267 / 216 Tokens/s | 284 / 280 | 106 % / 130 % |
+  | ganze Maschine, je Default, Runde 1 / 2 | 251 / 222 | 285 / 238 | 113 % / 107 % |
+  | 1 Kern, 40 Texte | 114 | 96 | 84 % |
+  | Peak-RSS | 760 MB | 480 MB | 63 % |
+
+  Default sind zwei Drittel der Kerne: Alle Kerne spinnen zu lassen ist in der VM
+  langsamer. Unter Dauerlast drosselt der Laptop; deshalb wechseln die Läufe ab.
+- **Hochrechnung Erstindizierung:** 5,6 Texte/s bei ⌀ 51 Tokens ergibt für 2 Mio Texte
+  rund 100 h auf diesem Laptop. Ein echter Langlauf steht noch aus.
+- **Reviews:** Codex und Claude-Finder fanden u. a. einen ABA-Fehler im Pool (Aufträge
+  mit 8, 2, 8 Einträgen konnten Count und Base mischen - jetzt Seqlock), einen
+  Überlauf des Ticketzählers (jetzt Neustart bei 2^30 im Ruhezustand), den verlorenen
+  `Exact`-Modus im seriellen Attention-Pfad, einen Delphi-7-Startfehler (signalisierendes
+  NaN durch die x87-FPU) und Tests, die NaN durchließen. Alle behoben, mit Gegenprobe.
+
+**Offen für 1c:** AVX2-Kernel für x86_64 (Linux-Docker ist die Produktion), Messung auf
+echter x86-Hardware, Langlauf für die Erstindizierung, dann das Umschalten des Defaults
+im Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
 
 ### Phase 2 — Decoder
 

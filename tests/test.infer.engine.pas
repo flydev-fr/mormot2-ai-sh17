@@ -368,11 +368,10 @@ const
 procedure TTestInferEngine.ErfIsAccurate;
 var
   i: PtrInt;
-  worstAbs, worstRel, e: double;
+  worstAbs, worstRel, e, b, lo, hi: double;
 begin
-  // erf and erfc below 2.5: absolute error (erfc = 1 - erf there, so its
-  // relative error grows to ~1e-12 near 2.5 - far below what F32 can see);
-  // erfc from 2.5 on comes from the continued fraction: relative error
+  // erf everywhere and erfc below 1: absolute error (erfc = 1 - erf there);
+  // erfc from 1 on comes from its own pieces: relative error
   worstAbs := 0;
   worstRel := 0;
   for i := 0 to high(ERF_POINTS) do
@@ -380,7 +379,7 @@ begin
     e := Abs(InferErf(ERF_POINTS[i].x) - ERF_POINTS[i].erf);
     if e > worstAbs then
       worstAbs := e;
-    if ERF_POINTS[i].x >= 2.5 then
+    if ERF_POINTS[i].x >= 1 then
     begin
       e := Abs(InferErfc(ERF_POINTS[i].x) / ERF_POINTS[i].erfc - 1);
       if e > worstRel then
@@ -394,7 +393,7 @@ begin
     end;
   end;
   CheckUtf8(worstAbs <= 2e-15, 'erf/erfc max abs error % <= 2e-15', [worstAbs]);
-  CheckUtf8(worstRel <= 1e-13, 'erfc tail max rel error % <= 1e-13', [worstRel]);
+  CheckUtf8(worstRel <= 1e-14, 'erfc tail max rel error % <= 1e-14', [worstRel]);
   // reference values: erf(0.5), erf(1), erf(2), erf(3), erfc(5)
   CheckUtf8(Abs(InferErf(0.5) - 0.52049987781304653768) < 1e-15, 'erf(0.5) %',
     [InferErf(0.5)]);
@@ -408,8 +407,18 @@ begin
     'erfc(5) without cancellation %', [InferErfc(5)]);
   CheckUtf8(InferErf(-1.5) = -InferErf(1.5), 'odd symmetry');
   CheckUtf8(InferErf(0) = 0, 'erf(0) = 0');
-  // both sides of the 2.5 switch agree
-  CheckUtf8(Abs(InferErf(2.4999999) - InferErf(2.5000001)) < 1e-9, 'continuous at 2.5');
+  // both sides of every piece boundary agree (1, 1.5 .. 6), relative to erfc
+  b := 1;
+  while b <= 6 do
+  begin
+    lo := InferErfc(b - 1e-12);
+    hi := InferErfc(b + 1e-12);
+    CheckUtf8(Abs(lo / hi - 1) < 1e-10, 'erfc continuous at %: % / %', [b, lo, hi]);
+    // erf from its pieces and erfc from its own: they must add up to 1
+    CheckUtf8(Abs(InferErf(b - 0.25) + InferErfc(b - 0.25) - 1) < 1e-15,
+      'erf + erfc = 1 at %', [b - 0.25]);
+    b := b + 0.5;
+  end;
 end;
 
 procedure TTestInferEngine.CpuOperationsMatchFixtures;

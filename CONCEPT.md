@@ -301,7 +301,8 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
    - Token-IDs identisch zu lembed (wörtliche Sondertokens getrennt gegen
      `parse_special = false`);
    - nDCG@10 0,8989 ≥ 0,8863.
-6. Phase 1c, Messung und Umschaltung:
+6. Phase 1c, Messung und Umschaltung (aarch64 ✓ 2026-10-14: schneller als lembed bei
+   gleichem Budget, 63 % Speicher; offen x86_64/AVX2):
    - Default „native";
    - lembed bleibt Fallback und Orakel.
 7. Phase 2, Decoder Qwen3
@@ -592,7 +593,8 @@ Roadmap — DESIGN.md verweist hierher.
      dann Qwen3 hinter `ILlmClient`, dann CUDA. Phase 0 (Referenzdaten, Testrahmen) ✓
      und Phase 1a (BGE-M3 FP32 von Text bis Vektor, trifft PyTorch) ✓ 2026-10-14,
      Phase 1b (dasselbe Q8-GGUF wie lembed, trifft das Orakel, nDCG@10 0,8989) ✓
-     2026-10-14; als Nächstes 1c (Tempo, Umschalten).
+     2026-10-14; 1c auf aarch64 ✓ (schneller als lembed), offen AVX2/x86_64 und das
+     Umschalten des Defaults.
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.

@@ -99,6 +99,11 @@ function InferDTypeBytes(aType: TInferDType; aCount: Int64; out aBytes: Int64): 
 // subnormals, infinities and NaN included
 function InferHalfToSingle(aHalf: word): single;
 
+/// the bits of InferHalfToSingle(aHalf) - without passing a NaN through the
+// FPU: Delphi 7 returns a single on the x87 stack, and loading a signaling NaN
+// there raises with the default exception mask
+function InferHalfToSingleBits(aHalf: word): cardinal;
+
 /// a single as IEEE 754 half float (raw bits), rounded to nearest even like
 // the F16C / NEON conversion ggml uses; overflow gives infinity
 function InferSingleToHalf(aValue: single): word;
@@ -151,6 +156,11 @@ begin
 end;
 
 function InferHalfToSingle(aHalf: word): single;
+begin
+  PCardinal(@result)^ := InferHalfToSingleBits(aHalf);
+end;
+
+function InferHalfToSingleBits(aHalf: word): cardinal;
 var
   exp, mant, bits: cardinal;
 begin
@@ -174,8 +184,7 @@ begin
     bits := $7f800000 or (mant shl 13) // infinity or NaN
   else
     bits := ((exp + 127 - 15) shl 23) or (mant shl 13);
-  bits := bits or (cardinal(aHalf and $8000) shl 16);
-  PCardinal(@result)^ := bits;
+  result := bits or (cardinal(aHalf and $8000) shl 16);
 end;
 
 function InferSingleToHalf(aValue: single): word;

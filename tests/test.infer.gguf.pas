@@ -40,6 +40,7 @@ type
   TTestInferGguf = class(TSynTestCase)
   protected
     fCpu: TInferCpuBackend;
+    fFast: TInferCpuFastBackend;
     fHiddenSize: PtrInt;
     fStates: array of TSingleDynArray;
     procedure Setup; override;
@@ -50,7 +51,8 @@ type
     function RealModel: TFileName;
     /// embed corpus texts and compare with the lembed vectors; aAll = whole
     // corpus plus nDCG@10, otherwise the aShort shortest docs and queries
-    procedure CheckCorpus(aAll: boolean; aShort: PtrInt);
+    procedure CheckCorpus(aAll: boolean; aShort: PtrInt; aBackend: TInferBackend;
+      const aName: RawUtf8);
   published
     /// FP16 rounding like ggml_fp32_to_fp16, and every half round-trips
     procedure HalfFloatLikeGgml;
@@ -219,11 +221,13 @@ end;
 procedure TTestInferGguf.Setup;
 begin
   fCpu := TInferCpuBackend.Create;
+  fFast := TInferCpuFastBackend.Create;
 end;
 
 procedure TTestInferGguf.CleanUp;
 begin
-  FreeAndNil(fCpu); // re-entrant, as mORMot requires
+  FreeAndNil(fFast); // re-entrant, as mORMot requires
+  FreeAndNil(fCpu);
 end;
 
 procedure TTestInferGguf.KeepState(aState: PtrInt; aValues: PSingleArray;
@@ -1049,7 +1053,8 @@ begin
   MoveFast(pointer(raw)^, pointer(result)^, length(raw));
 end;
 
-procedure TTestInferGguf.CheckCorpus(aAll: boolean; aShort: PtrInt);
+procedure TTestInferGguf.CheckCorpus(aAll: boolean; aShort: PtrInt;
+  aBackend: TInferBackend; const aName: RawUtf8);
 var
   fn, data: TFileName;
   emb: TInferEmbedder;
@@ -1096,7 +1101,7 @@ begin
   if CheckFailed((docRef <> nil) and (queryRef <> nil), 'lembed vectors read') then
     exit;
   timer.Start;
-  emb := TInferEmbedder.CreateFromGguf(fn, fCpu);
+  emb := TInferEmbedder.CreateFromGguf(fn, aBackend);
   try
     CheckEqual(emb.Dim, h, 'dimension');
     CheckEqual(emb.MaxTokens, 512, 'reference contract v1: 512 tokens');
@@ -1144,8 +1149,8 @@ begin
     emb.Free;
   end;
   CheckEqual(below, 0, 'every vector with cosine >= 0.999 against lembed');
-  AddConsole(FormatString('BGE-M3 Q8: min cosine against lembed %, %',
-    [minCos, timer.Stop]));
+  AddConsole(FormatString('BGE-M3 Q8 (%): min cosine against lembed %, %',
+    [aName, minCos, timer.Stop]));
   if not aAll then
     exit;
   // graded nDCG@10 exactly as the oracle's generator: gain 2^g - 1, log2(rank+1),
@@ -1191,26 +1196,31 @@ begin
       ndcg := ndcg + dcg / idcg;
   end;
   ndcg := ndcg / length(queries);
-  CheckUtf8(ndcg >= GATE_NDCG10, 'nDCG@10 % >= % (lembed %)',
-    [ndcg, GATE_NDCG10, LEMBED_NDCG10]);
-  AddConsole(FormatString('BGE-M3 Q8 gate: nDCG@10 % (lembed %, gate %), min cosine %',
-    [ndcg, LEMBED_NDCG10, GATE_NDCG10, minCos]));
+  CheckUtf8(ndcg >= GATE_NDCG10, '% nDCG@10 % >= % (lembed %)',
+    [aName, ndcg, GATE_NDCG10, LEMBED_NDCG10]);
+  AddConsole(FormatString('BGE-M3 Q8 gate (%): nDCG@10 % (lembed %, gate %), ' +
+    'min cosine %', [aName, ndcg, LEMBED_NDCG10, GATE_NDCG10, minCos]));
 end;
 
 procedure TTestInferGguf.BgeM3Q8ShortTexts;
 begin
-  CheckCorpus(false, 3);
+  CheckCorpus(false, 3, fCpu, 'reference');
+  CheckCorpus(false, 3, fFast, 'fast');
 end;
 
 procedure TTestInferGguf.BgeM3Q8CorpusGate;
 begin
   if GetEnvironmentVariable('LAI_INFER_GATE') <> '1' then
   begin
-    AddConsole('SKIP BGE-M3 Q8 corpus gate: set LAI_INFER_GATE=1 (slow on the ' +
-      'scalar reference)');
+    AddConsole('SKIP BGE-M3 Q8 corpus gate: set LAI_INFER_GATE=1 (fast backend, ' +
+      'a few minutes; LAI_INFER_GATE_REF=1 adds the scalar reference, an hour)');
     exit;
   end;
-  CheckCorpus(true, 0);
+  // what ships: the fast backend; LAI_INFER_GATE_REF=1 adds the scalar reference
+  // (about an hour)
+  CheckCorpus(true, 0, fFast, 'fast');
+  if GetEnvironmentVariable('LAI_INFER_GATE_REF') = '1' then
+    CheckCorpus(true, 0, fCpu, 'reference');
 end;
 
 end.

@@ -83,6 +83,10 @@ never a build input.
            -> mormot.ai.infer.tensor / mormot.ai.infer.backend.cpu. Checked
            against the ggml build of the lembed oracle (sha256 below), not
            against this commit's sources.
+  Followed (phase 1c, written anew): the arithmetic of ggml-cpu's NEON Q8_0 path
+           (SDOT lane sums scaled per block in float lanes, FCVTNS activation
+           quantization) -> src/infer/mormot.ai.infer.kernels.pas. The erf/erfc
+           polynomials are our own fits (tools/infer-ref/fit_erf.py).
 
 ## Native inference engine: reference data and models
 
