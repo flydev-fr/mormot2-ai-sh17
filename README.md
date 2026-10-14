@@ -8,9 +8,9 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
 > **Status, 2026-10-14:** MCP, LLM clients, agent loop, RAG and the native vector store
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
-> GGUF file as `lembed`, with the same quality and **about twice its speed on x86_64**;
-> before it becomes the default it still has to pass a run on Linux x86_64 and a long
-> indexing run. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
+> GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
+> it passes all suites and its quality gate on Linux x86_64 too; before it becomes the
+> default it still needs a long indexing run. Next: decoder LLMs (Qwen3), then CUDA. Three test suites, about 3100 assertions, green wherever they have run (table below).
 
 ## What it does
 
@@ -36,13 +36,13 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 | Windows x86 | **Delphi 7** | 1253 | 647 | 669 |
 | macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 | not yet run |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² | not yet run |
-| Linux x86_64 | FPC 3.2.2 | — | — | pending ³ |
+| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 656 | 828 ³ |
 
 ¹ Without the converted FP32 reference model on that machine; those tests skip.
 ² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
 that target.
-³ The production target (Docker). sqlite-vec and lembed are verified there; the SIMD
-kernels are built for the System V convention but have not run on hardware yet.
+³ The production target (Docker uses the same FPC 3.2.2), with the BGE-M3 corpus gate
+(`LAI_INFER_GATE=1`) included: nDCG@10 0.8994 on the AVX2 path.
 
 Counts differ by compiler because some tests only exist where a feature does (the `vec0`
 extension has no 32-bit build, so Delphi 7 skips that test).
@@ -80,8 +80,8 @@ end.
 (`tools/infer-ref/`, data under `tests/data/infer-ref/`); token ids match lembed on all
 1318 cases without special-token literals (those are deliberately treated as text and
 checked against SentencePiece instead); on a German retrieval corpus the embeddings reach
-nDCG@10 **0.9004** (lembed 0.8963) with a cosine of at least 0.9991 against lembed's
-vectors. The backend has two arithmetic contracts: `Exact = true` is bit-identical to the
+nDCG@10 **0.9004** on the NEON path and **0.8994** on the AVX2 path (lembed 0.8963,
+gate 0.8863), with a cosine of at least 0.9991 against lembed's vectors. The backend has two arithmetic contracts: `Exact = true` is bit-identical to the
 scalar double reference on all cores; the default computes in float lanes like ggml and
 is tested against the reference with stated tolerances.
 
@@ -107,6 +107,15 @@ Switching off execution-speed throttling for the process
 (`SetProcessInformation(ProcessPowerThrottling)`) restored the numbers above;
 `embed-bench` does so unless `LAI_THROTTLE` is set. A Windows service doing bulk
 embedding may want the same.
+
+**x86_64 Linux, AVX2** — the same i9-14900K, Ubuntu 24.04 under WSL2, FPC 3.2.2,
+2026-10-14:
+
+| | lembed | native | native / lembed |
+|---|---|---|---|
+| default threads, run 1 / 2 | 544 / 545 tokens/s | 861 / 860 tokens/s (22 threads) | 1.58x / 1.58x |
+| native with 8 / 16 / 24 / 32 threads | | 640 / 755 / 877 / 709 tokens/s | |
+| peak RSS | 755 MB | 439 MB | 0.58x |
 
 **aarch64, NEON dot product** — Snapdragon X (12 cores), WSL2, FPC 3.2.4, model on the
 Linux file system, 2026-10-14:
@@ -457,7 +466,7 @@ provider or runtime, not only against tests.
 | Embeddings via provider API | **stable** | |
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
-| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates; AVX2 and NEON kernels; waits for the Linux x86_64 run and a long indexing run |
+| Native embeddings (`mormot.ai.embed.native`) | **works, not the default yet** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; waits for a long indexing run |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
 | pgvector backend, Ollama embedder | **not built** | the `IVectorStore` / `IEmbedder` seams exist; built when a deployment needs them |
@@ -481,8 +490,8 @@ Done:
   BGE-M3 in FP32 and from the Q8_0 GGUF, NEON and AVX2 kernels, measured against lembed.
 
 Next, in this order:
-1. **Native embeddings by default** — run the suite on Linux x86_64, a long run for a
-   first indexing of 2 million texts, then switch the default; lembed stays as fallback.
+1. **Native embeddings by default** — a long run for a first indexing of 2 million
+   texts, then switch the default; lembed stays as fallback.
 2. **Decoder LLMs** — Qwen3-0.6B first (byte-level BPE, KV cache, GQA, Q/K norm) behind
    `ILlmClient` as `mormot.ai.llm.native`, with streaming and tool calls; gate: greedy
    output token-identical to `transformers` in FP32.

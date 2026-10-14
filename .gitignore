@@ -14,6 +14,9 @@ demos/.env
 # GGUF-Embedding-Modelle (gross, maschinenlokal) - nie einchecken, per Pfad referenzieren.
 /vendor/models/
 *.gguf
+# Ausnahme: die winzige, selbst erzeugte Test-Fixture (32 KB) gehoert ins Repo -
+# ohne sie scheitert die Inferenz-Suite auf jedem frischen Klon.
+!/tests/data/infer-ref/**/*.gguf
 
 # SQLite-Extension-Binaries (vec0/lembed0, .so/.dll je Arch) - lokal beschaffen.
 /vendor/sqlite-ext/

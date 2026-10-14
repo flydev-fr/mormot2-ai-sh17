@@ -3,9 +3,9 @@
 > **Status (2026-10-14):** Phase 0, 1a und 1b erledigt: BGE-M3 läuft nativ von Text bis
 > Vektor, in FP32 gegen PyTorch und aus demselben Q8-GGUF wie lembed gegen das Orakel
 > (Token-IDs, Kosinus, nDCG@10 - siehe dort). 1c auf aarch64 und x86_64 (AVX2) erledigt:
-> auf x86_64 doppelt so schnell wie lembed, auf aarch64 gleichauf bis schneller, jeweils
-> mit weniger Speicher. Offen sind der Lauf unter Linux x86_64 (die Produktion), der
-> Langlauf und das Umschalten des Defaults.
+> auf x86_64 1,6-mal (Linux) bis doppelt (Windows) so schnell wie lembed, auf aarch64 gleichauf bis schneller, jeweils
+> mit weniger Speicher; unter Linux x86_64 (die Produktion) alle Suiten und das
+> Korpus-Gate grün. Offen sind der Langlauf und das Umschalten des Defaults.
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -395,9 +395,16 @@ Kodierung, weil FPC 3.2 keine NEON-Registerlisten assembliert), `threads` (eigen
 - **Erstindizierung, hochgerechnet:** 20 Texte/s bei ⌀ 51 Tokens ergeben für 2 Mio Texte
   rund 28 h auf dem i9.
 
-**Offen für 1c:** der Lauf der Suite unter Linux x86_64 (System-V-Pfad, bisher nur
-übersetzt), der Langlauf für die Erstindizierung, dann das Umschalten des Defaults im
-Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
+- **Linux x86_64** (Ubuntu 24.04 unter WSL2 auf dem i9, FPC 3.2.2 wie im Docker-Build,
+  2026-10-14): MCP 1257, LLM 656, Inferenz 828 mit Korpus-Gate (nDCG@10 0,8994, Kosinus
+  ≥ 0,99918), der System-V-Pfad damit erstmals auf Hardware gelaufen. Durchsatz nativ
+  861 gegen lembed 544 Tokens/s (×1,58), 439 gegen 755 MB.
+- **Fund dabei:** Die Fixture `tests/data/infer-ref/tiny-gguf/model.gguf` fiel unter
+  `*.gguf` in `.gitignore` und fehlte in jedem frischen Klon (26 Fehlschläge). Jetzt mit
+  Ausnahme eingecheckt.
+
+**Offen für 1c:** der Langlauf für die Erstindizierung, dann das Umschalten des Defaults
+im Backend. Bis dahin bleibt lembed der Produktions-Default; nativ ist wählbar.
 
 ### Phase 2 — Decoder
 
@@ -450,6 +457,7 @@ Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding, MoE.
 | Plattform | Compiler | Ergebnis |
 |---|---|---|
 | WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, Inferenz 1215, alle Demos) |
+| WSL2 Linux x86_64 auf dem RTX-Rechner (Ubuntu 24.04) | FPC 3.2.2 (wie Docker) | grün aus einem sauberen `git archive`: MCP 1257, LLM 656, Inferenz 828 mit Korpus-Gate |
 | macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen) |
 | Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
 | Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659, Inferenz 1205) |
@@ -470,7 +478,7 @@ geprüft. Grüne Ergebnisse aus übersprungenen Tests darf es nicht geben:
 | WSL aarch64, FPC 3.2.4 + 3.2.2 | Hauptkorrektheit; Differenztests Skalar ↔ NEON |
 | macOS M2 | Mapping, Dateisystem, NEON-Korrektheit; native Benchmarks |
 | Windows x64 (RTX-Rechner) | AVX2-Korrektheit und native x64-Leistung (auch POPCNT für den Store); CUDA-Differenztests und -Leistung |
-| Linux x64 | Deploy-Ziel (Docker); auf dem RTX-Rechner über WSL2 möglich (noch nicht eingerichtet) |
+| Linux x64 | Deploy-Ziel (Docker); auf dem RTX-Rechner über WSL2 (Ubuntu 24.04, FPC 3.2.2, Konto `rtx5090`), seit 2026-10-14 eingerichtet |
 | Delphi 13 Win64 | Compiler/ABI und Laufzeitkorrektheit |
 | Delphi 7 Win32 | Build plus kleine Tests zu RTTI, Unicode, Numerik und Speichergrenzen; **kein** Leistungs-Gate |
 | Windows ARM, FPC 3.3.1 | experimentell, bis Skript und SQLite-DLL geregelt sind |
