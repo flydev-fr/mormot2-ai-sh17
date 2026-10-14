@@ -32,6 +32,8 @@ type
 
   /// element type of a tensor
   // - names follow safetensors: F32, F16, BF16, I32, I64, U8, I8
+  // - idtQ8_0 is a block type of GGUF files: 32 elements share one FP16 scale
+  // (see TInferBlockQ8_0) - only GGUF files hold it, safetensors never
   TInferDType = (
     idtUnknown,
     idtF32,
@@ -40,7 +42,19 @@ type
     idtI32,
     idtI64,
     idtU8,
-    idtI8);
+    idtI8,
+    idtQ8_0);
+
+  /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
+  // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
+  TInferBlockQ8_0 = packed record
+    d: word;
+    qs: array[0..31] of shortint;
+  end;
+  PInferBlockQ8_0 = ^TInferBlockQ8_0;
+  TInferBlockQ8_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ8_0)) - 1] of
+    TInferBlockQ8_0;
+  PInferBlockQ8_0Array = ^TInferBlockQ8_0Array;
 
   /// a named, typed, shaped view on elements owned by someone else
   TInferTensor = record
@@ -52,7 +66,7 @@ type
     Shape: TInt64DynArray;
     /// number of elements = product of Shape
     Count: Int64;
-    /// size in bytes = Count * element size
+    /// size in bytes = Count div block * block size
     Bytes: Int64;
     /// first element - owned by the file or buffer the view was taken from
     Data: pointer;
@@ -61,16 +75,39 @@ type
   TInferTensorDynArray = array of TInferTensor;
 
 const
-  /// size in bytes of one element of each type (0 = unknown)
+  /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1);
+    0, 4, 2, 2, 4, 8, 1, 1, 34);
 
-  /// the safetensors name of each type
+  /// elements per block of each type: 1 for plain element types
+  INFER_DTYPE_BLOCK: array[TInferDType] of byte = (
+    0, 1, 1, 1, 1, 1, 1, 1, 32);
+
+  /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
-    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8');
+    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0');
 
 /// the element type of a safetensors dtype name, idtUnknown if not supported
+// - block types are no safetensors types and never returned
 function InferDTypeFromName(const aName: RawUtf8): TInferDType;
+
+/// bytes of aCount elements of aType - false if aCount is no whole number of
+// blocks (a block type) or the type is unknown
+function InferDTypeBytes(aType: TInferDType; aCount: Int64; out aBytes: Int64): boolean;
+
+/// an IEEE 754 half float (raw bits) as single - exact for every value,
+// subnormals, infinities and NaN included
+function InferHalfToSingle(aHalf: word): single;
+
+/// a single as IEEE 754 half float (raw bits), rounded to nearest even like
+// the F16C / NEON conversion ggml uses; overflow gives infinity
+function InferSingleToHalf(aValue: single): word;
+
+/// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
+// - F32 is copied, Q8_0 dequantized (d * q, exact in single); aCols must be a
+// multiple of the block size
+procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
+  aDst: PSingleArray);
 
 /// product of aShape, refused (false) when a dimension is negative or the product
 // would exceed aLimit - checked before multiplying, so it can never overflow
@@ -93,12 +130,130 @@ var
   t: TInferDType;
 begin
   for t := succ(low(t)) to high(t) do
-    if INFER_DTYPE_NAME[t] = aName then
+    if (INFER_DTYPE_BLOCK[t] = 1) and (INFER_DTYPE_NAME[t] = aName) then
     begin
       result := t;
       exit;
     end;
   result := idtUnknown;
+end;
+
+function InferDTypeBytes(aType: TInferDType; aCount: Int64; out aBytes: Int64): boolean;
+begin
+  result := false;
+  aBytes := 0;
+  if (aType = idtUnknown) or (aCount < 0) or
+     (aCount mod INFER_DTYPE_BLOCK[aType] <> 0) then
+    exit;
+  // callers bound aCount by the file size: the product cannot overflow
+  aBytes := (aCount div INFER_DTYPE_BLOCK[aType]) * INFER_DTYPE_SIZE[aType];
+  result := true;
+end;
+
+function InferHalfToSingle(aHalf: word): single;
+var
+  exp, mant, bits: cardinal;
+begin
+  exp := (aHalf shr 10) and $1f;
+  mant := aHalf and $3ff;
+  if exp = 0 then
+    if mant = 0 then
+      bits := 0
+    else
+    begin
+      // subnormal half: normalise into a single exponent
+      exp := 127 - 15 + 1;
+      while mant and $400 = 0 do
+      begin
+        mant := mant shl 1;
+        dec(exp);
+      end;
+      bits := (exp shl 23) or ((mant and $3ff) shl 13);
+    end
+  else if exp = $1f then
+    bits := $7f800000 or (mant shl 13) // infinity or NaN
+  else
+    bits := ((exp + 127 - 15) shl 23) or (mant shl 13);
+  bits := bits or (cardinal(aHalf and $8000) shl 16);
+  PCardinal(@result)^ := bits;
+end;
+
+function InferSingleToHalf(aValue: single): word;
+var
+  bits, sign, mant, rest, half: cardinal;
+  exp: integer;
+begin
+  bits := PCardinal(@aValue)^;
+  sign := (bits shr 16) and $8000;
+  exp := integer((bits shr 23) and $ff);
+  mant := bits and $7fffff;
+  if exp = $ff then
+  begin
+    // infinity, or NaN kept quiet with its top payload bits
+    if mant = 0 then
+      result := sign or $7c00
+    else
+      result := sign or $7e00 or (mant shr 13);
+    exit;
+  end;
+  exp := exp - 127 + 15;
+  if exp >= $1f then
+  begin
+    result := sign or $7c00; // too large: infinity
+    exit;
+  end;
+  if exp <= 0 then
+  begin
+    // subnormal half (or zero): shift the implicit bit in, round to even
+    if exp < -10 then
+    begin
+      result := sign; // below half the smallest subnormal
+      exit;
+    end;
+    mant := mant or $800000;
+    rest := 14 - exp; // bits dropped: 13 + (1 - exp)
+    half := mant shr rest;
+    mant := mant and ((cardinal(1) shl rest) - 1);
+    if (mant > cardinal(1) shl (rest - 1)) or
+       ((mant = cardinal(1) shl (rest - 1)) and (half and 1 <> 0)) then
+      inc(half);
+    result := sign or half;
+    exit;
+  end;
+  half := (cardinal(exp) shl 10) or (mant shr 13);
+  rest := mant and $1fff;
+  // round to nearest even; a carry into the exponent is the correct result,
+  // up to infinity
+  if (rest > $1000) or ((rest = $1000) and (half and 1 <> 0)) then
+    inc(half);
+  result := sign or half;
+end;
+
+procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
+  aDst: PSingleArray);
+var
+  b, j, nb: PtrInt;
+  blk: PInferBlockQ8_0;
+  d: single;
+begin
+  case aType of
+    idtF32:
+      MoveFast(PSingleArray(aData)^[aRow * aCols], aDst^[0], aCols * SizeOf(single));
+    idtQ8_0:
+      begin
+        nb := aCols div 32;
+        blk := @PInferBlockQ8_0Array(aData)^[aRow * nb];
+        for b := 0 to nb - 1 do
+        begin
+          d := InferHalfToSingle(blk^.d);
+          for j := 0 to 31 do
+            aDst^[b * 32 + j] := d * blk^.qs[j];
+          inc(blk);
+        end;
+      end;
+  else
+    EInferError.RaiseUtf8('InferRowToF32: % not supported', [INFER_DTYPE_NAME[aType]]);
+  end;
 end;
 
 function InferShapeCount(const aShape: TInt64DynArray; aLimit: Int64;

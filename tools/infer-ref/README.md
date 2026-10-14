@@ -21,9 +21,23 @@ VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirement
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py tokens     # nur Tokenizer
 ```
 
-Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate).
+Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate),
+dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens`.
 Mit `bge-m3` oder `tokens` lädt das Skript BAAI/bge-m3 in der festen Revision
 `5617a9f61b028005a4858fdac845db406aefb181` (rund 2,3 GB in den Hugging-Face-Cache).
+
+Die Ziele der Phase 1b rechnen mit **ggml selbst**, nicht mit einer Nachbildung: Sie laden
+`libggml-base.so` und `libggml-cpu.so` aus `vendor/sqlite-ext/aarch64-linux/` (der Build
+des lembed-Orakels, mit `LAI_GGML_DIR` umlenkbar) und rufen deren exportierte Funktionen
+auf (`quantize_row_q8_0`, `ggml_vec_dot_q8_0_q8_0`, `quantize_row_q8_0_ref`,
+`dequantize_row_q8_0`, `ggml_fp32_to_fp16`). Die SHA-256 der Bibliotheken stehen in den
+Manifesten. `lembed-tokens` lädt zusätzlich `lembed0.so` in Pythons `sqlite3` und das
+GGUF `vendor/models/bge-m3-q8_0.gguf` (mit `LAI_GGUF` umlenkbar); das Skript bricht ab,
+wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
+
+```bash
+LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 tiny-gguf lembed-tokens
+```
 
 ## Was das Skript festlegt
 

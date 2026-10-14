@@ -27,16 +27,18 @@
 // - behaviour = SentencePiece with parse_special=false: control and special
 //   pieces (<s> </s> <pad> <unk> <mask>) never match text; this differs from the
 //   Hugging Face tokenizer, which reads "<s>" in text as a control token
-// - data from tokenizer.json (Hugging Face): its precompiled charsmap, vocabulary
-//   and scores are those of the SentencePiece model; the file must describe
-//   exactly this pipeline, otherwise it is refused
+// - data from tokenizer.json (Hugging Face) or from the metadata of a GGUF file
+//   (tokenizer.ggml.model "t5", as llama.cpp reads it): both carry the precompiled
+//   charsmap, vocabulary and scores of the SentencePiece model; the source must
+//   describe exactly this pipeline, otherwise it is refused
 // - thread-safe after loading: Encode uses only local state
 unit mormot.ai.infer.tokenizer.ugm;
 
 {
   *****************************************************************************
 
-    - TUgmTokenizer: load tokenizer.json, Normalize and Encode text to ids
+    - TUgmTokenizer: load tokenizer.json or GGUF metadata, Normalize and
+      Encode text to ids
 
   *****************************************************************************
 }
@@ -53,7 +55,8 @@ uses
   mormot.core.text,
   mormot.core.buffers,
   mormot.core.variants,
-  mormot.ai.infer.tensor;
+  mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.gguf;
 
 type
   /// a SentencePiece Unigram tokenizer
@@ -72,8 +75,9 @@ type
     fXcdaCount: PtrInt;
     fReplacements: PUtf8Char;
     fReplacementsLen: PtrInt;
-    procedure LoadCharsMap(const aBase64: RawUtf8);
+    procedure LoadCharsMap(const aCharsMap: RawByteString);
     procedure BuildIndex;
+    procedure Finish(const aCharsMap: RawByteString);
     function PieceId(p: PUtf8Char; aLen: PtrInt): integer;
     function NormalizePrefix(p: PUtf8Char; aLen: PtrInt;
       out aRepl: PUtf8Char; out aReplLen: PtrInt): PtrInt;
@@ -82,6 +86,10 @@ type
     // Precompiled + Replace(" {2,}"), Metaspace(add_prefix_space), Unigram
     // - raises EInferError otherwise
     constructor Create(const aFileName: TFileName);
+    /// load and validate the tokenizer.ggml.* metadata of a GGUF file: model
+    // "t5" (Unigram) with space prefix, folded whitespace, <s> ... </s> added
+    // - raises EInferError otherwise; aGguf is only read during the call
+    constructor CreateFromGguf(aGguf: TGgufFile);
     /// the SentencePiece-normalized text: charsmap applied, whitespace folded,
     // U+2581 before each word (what Encode segments)
     function Normalize(const aText: RawUtf8): RawUtf8;
@@ -190,7 +198,6 @@ var
   doc: TDocVariantData;
   norm, list, step, pre, model, vocab, entry, added: PDocVariantData;
   i, n, id: PtrInt;
-  minScore, unknown: single;
   replaceOk: boolean;
   post, single: PDocVariantData;
   charsmap: RawUtf8;
@@ -274,24 +281,126 @@ begin
   fMatchable[fUnkId] := false;
   if (fBosId < 0) or (fEosId < 0) then
     EInferError.RaiseUtf8('%: no <s> / </s> special tokens', [self]);
+  Finish(Base64ToBin(charsmap));
+end;
+
+const
+  // llama.cpp's token types (LLAMA_TOKEN_TYPE_*)
+  TT_NORMAL = 1;
+  TT_UNKNOWN = 2;
+  TT_CONTROL = 3;
+  TT_USER_DEFINED = 4;
+  TT_UNUSED = 5;
+  TT_BYTE = 6;
+
+constructor TUgmTokenizer.CreateFromGguf(aGguf: TGgufFile);
+var
+  i, n: PtrInt;
+  count: Int64;
+  scores: PSingleArray;
+  types: PIntegerArray;
+
+  function Id(const aKey: RawUtf8): integer;
+  var
+    v: Int64;
+  begin
+    v := aGguf.Int(aKey);
+    if (v < 0) or (v >= n) then
+      EInferError.RaiseUtf8('%: % = % outside the vocabulary', [self, aKey, v]);
+    result := v;
+  end;
+
+begin
+  inherited Create;
+  if aGguf = nil then
+    EInferError.RaiseUtf8('%.CreateFromGguf: no file', [self]);
+  // the pipeline this class implements, and nothing else - flags llama.cpp
+  // defaults when absent are required explicitly where the default differs
+  if aGguf.Str('tokenizer.ggml.model') <> 't5' then
+    EInferError.RaiseUtf8('%: tokenizer.ggml.model "%" is not t5 (Unigram)',
+      [self, aGguf.Str('tokenizer.ggml.model')]);
+  if aGguf.Has('tokenizer.ggml.pre') and
+     (aGguf.Str('tokenizer.ggml.pre') <> 'default') then
+    EInferError.RaiseUtf8('%: pre-tokenizer "%" not supported',
+      [self, aGguf.Str('tokenizer.ggml.pre')]);
+  if not aGguf.BoolDef('tokenizer.ggml.add_space_prefix', true) or
+     not aGguf.Bool('tokenizer.ggml.remove_extra_whitespaces') or
+     not aGguf.BoolDef('tokenizer.ggml.escape_whitespaces', true) or
+     aGguf.BoolDef('tokenizer.ggml.treat_whitespace_as_suffix', false) then
+    EInferError.RaiseUtf8('%: whitespace handling is not prefix + folded', [self]);
+  // <s> A </s> is hard-wired in Encode: the file must say exactly that
+  if not aGguf.Bool('tokenizer.ggml.add_bos_token') or
+     not aGguf.Bool('tokenizer.ggml.add_eos_token') then
+    EInferError.RaiseUtf8('%: <s> and </s> are not both added', [self]);
+  fPieces := aGguf.Strings('tokenizer.ggml.tokens');
+  n := length(fPieces);
+  if n = 0 then
+    EInferError.RaiseUtf8('%: empty vocabulary', [self]);
+  count := n;
+  scores := aGguf.Floats32('tokenizer.ggml.scores', count);
+  types := aGguf.Ints32('tokenizer.ggml.token_type', count);
+  fUnkId := Id('tokenizer.ggml.unknown_token_id');
+  fBosId := Id('tokenizer.ggml.bos_token_id');
+  fEosId := Id('tokenizer.ggml.eos_token_id');
+  fPadId := -1;
+  if aGguf.Has('tokenizer.ggml.padding_token_id') then
+    fPadId := Id('tokenizer.ggml.padding_token_id');
+  SetLength(fScores, n);
+  SetLength(fMatchable, n);
+  for i := 0 to n - 1 do
+  begin
+    fScores[i] := scores^[i];
+    case types^[i] of
+      TT_NORMAL:
+        fMatchable[i] := fPieces[i] <> '';
+      TT_UNKNOWN:
+        if i <> fUnkId then
+          EInferError.RaiseUtf8('%: piece % is a second unknown token', [self, i]);
+      TT_CONTROL, TT_UNUSED:
+        // never matched in text: control pieces by parse_special=false, unused
+        // ones as the oracle does (lembed reads "[PAD250000]" of BGE-M3 as
+        // plain text - lembed-tokens, extra cases)
+        ;
+      TT_USER_DEFINED, TT_BYTE:
+        // matched in the normalizer, or byte fallback: not implemented, so
+        // refused instead of mis-tokenized
+        EInferError.RaiseUtf8('%: piece "%" of type % not supported',
+          [self, fPieces[i], types^[i]]);
+    else
+      EInferError.RaiseUtf8('%: piece % has unknown type %', [self, i, types^[i]]);
+    end;
+  end;
+  if types^[fUnkId] <> TT_UNKNOWN then
+    EInferError.RaiseUtf8('%: unknown_token_id % is no unknown piece', [self, fUnkId]);
+  if (types^[fBosId] <> TT_CONTROL) or (types^[fEosId] <> TT_CONTROL) or
+     ((fPadId >= 0) and (types^[fPadId] <> TT_CONTROL)) then
+    EInferError.RaiseUtf8('%: <s> </s> <pad> must be control pieces', [self]);
+  Finish(aGguf.Bytes('tokenizer.ggml.precompiled_charsmap'));
+end;
+
+procedure TUgmTokenizer.Finish(const aCharsMap: RawByteString);
+var
+  i: PtrInt;
+  minScore, unknown: single;
+begin
   // unknown code points score below every normal piece - computed in single,
   // like llama.cpp (min_score - 10.0f), then widened: an extra double digit
   // could resolve a near-tie differently
   minScore := 3.4e38;
-  for i := 0 to n - 1 do
+  for i := 0 to high(fScores) do
     if fMatchable[i] and (fScores[i] < minScore) then
       minScore := fScores[i];
   unknown := minScore - 10;
   fUnknownScore := unknown;
-  LoadCharsMap(charsmap);
+  LoadCharsMap(aCharsMap);
   BuildIndex;
 end;
 
-procedure TUgmTokenizer.LoadCharsMap(const aBase64: RawUtf8);
+procedure TUgmTokenizer.LoadCharsMap(const aCharsMap: RawByteString);
 var
   xcdaBytes: cardinal;
 begin
-  fCharsMap := Base64ToBin(aBase64);
+  fCharsMap := aCharsMap;
   if length(fCharsMap) < 4 then
     EInferError.RaiseUtf8('%: precompiled charsmap missing or too short', [self]);
   MoveFast(pointer(fCharsMap)^, xcdaBytes, 4);

@@ -1,8 +1,9 @@
 # Native Inferenz in Pascal — Plan
 
-> **Status (2026-10-14):** Phase 0 und Phase 1a erledigt: BGE-M3 läuft in FP32 nativ
-> von Text bis Vektor und trifft die PyTorch-Referenz (siehe dort). Als Nächstes 1b
-> (GGUF/Q8). Grundlage ist der Entwurf des Nutzers
+> **Status (2026-10-14):** Phase 0, 1a und 1b erledigt: BGE-M3 läuft nativ von Text bis
+> Vektor, in FP32 gegen PyTorch und aus demselben Q8-GGUF wie lembed gegen das Orakel
+> (Token-IDs, Kosinus, nDCG@10 - siehe dort). Als Nächstes 1c (Tempo, Umschalten).
+> Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
 > „Option D") zusammengeführt und mit Codex abgestimmt, das gegen Code, Modelldatei und
@@ -41,7 +42,7 @@ heute kennen sie nur `src/`.
 | Unit | Inhalt |
 |---|---|
 | `mormot.ai.infer.tensor` | Tensor, Datentypen (F32, F16, BF16, Q8_0, Q4_0 …), Formen |
-| `mormot.ai.infer.memory` | Memory-Mapping (auch in Fenstern für Win32), Scratch-Puffer |
+| `mormot.ai.infer.memory` | Memory-Mapping (Fenster für Win32 erst bei Modellen über 1,5 GB), Scratch-Puffer |
 | `mormot.ai.infer.loader.safetensors` | safetensors-Leser |
 | `mormot.ai.infer.loader.gguf` | GGUF-v3-Leser, robust gegen beschädigte Dateien |
 | `mormot.ai.infer.backend` | Backend-Schnittstelle, Fähigkeitsabfrage, Fallback |
@@ -282,6 +283,41 @@ Der Referenzvertrag v1 ist an **genau dieses** Q8-GGUF, 512 Tokens und das Verha
 Sondertokens gebunden. Ein bestandener FP32-Test (1a) beweist deshalb noch **keine**
 Verträglichkeit mit bereits gespeicherten Vektoren. Beide Referenzen behalten getrennte
 Identitäten (Vertrag, Fingerprint).
+
+**Erledigt (2026-10-14).** Neu: `loader.gguf`; GGUF-Konstruktoren in `model.xlmr`,
+`tokenizer.ugm` und `pipeline.embed` (`TInferEmbedder.CreateFromGguf`); Q8_0 als
+Blocktyp in `tensor`; `Linear` nimmt typisierte Gewichte (`TInferWeight`). Ergebnis:
+- **Rechenweg, gemessen vor dem Bau** (PyTorch mit den Q8-Gewichten gegen die
+  lembed-Vektoren der 320 Korpustexte): Q8-Gewichte mit F32-Aktivierungen erreichen
+  nur Kosinus 0,99829 (ein Text unter 0,999). Erst wenn die Aktivierungen wie bei ggml
+  vor jeder Matrixmultiplikation auf Q8_0 quantisiert werden, liegt jeder Text darüber
+  (min 0,99949). Die FP16-Tanh-GELU-Tabelle von ggml war schlechter (min 0,99883),
+  daher bleibt die exakte GELU. Die Engine rechnet also wie ggml-cpu auf aarch64:
+  Skala `max|x|/127` in FP16, `x·(1/d)` auf die nächste gerade Zahl gerundet
+  (NEON und AVX runden so, die C-Referenz von ggml nicht), ganzzahlige Blocksummen.
+  Der AVX-Pfad bildet den Kehrwert als `127/max|x|` und kann einen Grenzfall um eine
+  Stufe verschieben: bytegleich zum aarch64-Orakel, nicht zu jedem ggml-Build.
+- **Positionen:** Der Konverter von llama.cpp lässt die ersten pad + 1 Zeilen weg
+  (8192 statt 8194). Die Regel steht je Format im Code (`FirstPosition`: pad + 1 bei
+  safetensors, 0 bei GGUF) und ist mit Gegenprobe getestet.
+- **Token-IDs:** alle 1318 Fälle ohne Sondertoken-Literal identisch zu lembed, alle
+  1348 identisch zu SentencePiece. Die 30 Literal-Fälle prüft der Test getrennt: lembed
+  liest dort in 24 Fällen Steuertokens, die Engine Text (`parse_special = false`).
+  Stücke vom Typ UNUSED (`[PAD250000]`) erkennt auch lembed nie im Text (Extra-Fälle).
+- **Vektoren und Gate** (ganzer Korpus, `LAI_INFER_GATE=1`): Kosinus gegen lembed
+  mindestens 0,99953 (alle 320 Texte über 0,999), **nDCG@10 0,8989**
+  (Gate 0,8863, lembed 0,8963).
+- **Beschädigte Dateien:** rund 30 gezielte Defekte (Zählungen, Typen, NUL, Schachtelung,
+  Ausrichtung, Überlappung, Lücken, Reihenfolge), jede Kürzung der Tiny-Datei und 4096
+  gekippte Header-Bytes enden in `EInferError`, nie in einem anderen Fehler.
+- **Fixtures aus ggml selbst** (`q8`, `tiny-gguf`, `lembed-tokens`): FP16-Rundung,
+  Aktivierungsquantisierung byte-genau, Q8_0-Skalarprodukt, ein Tiny-XLM-R als GGUF
+  mit 64-Stück-Tokenizer.
+- **Plattformen:** `infer.tests` grün unter FPC 3.2.4/3.2.2, Delphi 13 und Delphi 7.
+  Unter Delphi 7/Win32 läuft jetzt auch das echte Modell: Das Q8-GGUF (634 MB) passt
+  ganz in den Adressraum, Mapping in Fenstern braucht erst ein größeres Modell.
+- **Tempo** (skalar, ein Thread, aarch64): der ganze Korpus in rund 51 min;
+  lembed braucht rund 72 s. Das ist Thema von 1c.
 
 **1c. Tempo, Messung, Umschalten** (vorher „Schritte 5 und 6")
 - Minimal-SIMD für das Q8_0-Skalarprodukt (NEON, AVX2) und Threads über Zeilenblöcke.

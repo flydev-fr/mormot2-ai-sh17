@@ -18,7 +18,8 @@ uses
   test.infer,
   test.infer.engine,
   test.infer.xlmr,
-  test.infer.tokenizer;
+  test.infer.tokenizer,
+  test.infer.gguf;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -32,7 +33,8 @@ begin
     TTestInferReference,
     TTestInferEngine,
     TTestInferXlmr,
-    TTestInferTokenizer
+    TTestInferTokenizer,
+    TTestInferGguf
   ]);
 end;
 

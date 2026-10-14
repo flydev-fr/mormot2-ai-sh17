@@ -37,6 +37,13 @@ type
     ioAttention,
     ioL2Normalize);
 
+  /// a weight matrix [out, in] as stored in the file: its first byte and type
+  // - F32 holds out * in singles, Q8_0 out rows of in div 32 blocks
+  TInferWeight = record
+    Data: pointer;
+    DType: TInferDType;
+  end;
+
   /// abstract backend: typed operations on caller-owned F32 buffers
   // - layout is always row-major; "rows" are tokens, "cols" are features
   TInferBackend = class
@@ -44,9 +51,10 @@ type
     /// true when this backend implements aOp for weights of type aWeights
     function Supports(aOp: TInferOp; aWeights: TInferDType): boolean; virtual; abstract;
     /// y[rows, out] = x[rows, in] * w[out, in]^T + bias[out]
-    // - w is stored as nn.Linear stores it: one row per output feature
+    // - w is stored as nn.Linear stores it: one row per output feature, of the
+    // type w.DType (see Supports); a Q8_0 row needs aIn to be a multiple of 32
     // - bias may be nil; y must not overlap x
-    procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; w: PSingleArray;
+    procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); virtual; abstract;
     /// y[rows, cols] = (x - mean) / sqrt(var + eps) * gamma + beta, per row
     // - population variance; y may be x
@@ -72,7 +80,16 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); virtual; abstract;
   end;
 
+/// a TInferWeight from its parts
+function InferWeight(aData: pointer; aType: TInferDType): TInferWeight;
+
 
 implementation
+
+function InferWeight(aData: pointer; aType: TInferDType): TInferWeight;
+begin
+  result.Data := aData;
+  result.DType := aType;
+end;
 
 end.

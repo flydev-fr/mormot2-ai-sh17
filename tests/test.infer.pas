@@ -57,8 +57,9 @@ type
 implementation
 
 const
-  DATASETS: array[0..4] of RawUtf8 = (
-    'ops', 'tiny-xlmr', 'bge-m3', 'bge-m3-embed-de', 'bge-m3-tokens');
+  DATASETS: array[0..7] of RawUtf8 = (
+    'ops', 'tiny-xlmr', 'bge-m3', 'bge-m3-embed-de', 'bge-m3-tokens',
+    'q8', 'tiny-gguf', 'lembed-tokens');
 
 /// v / ||v|| in double, stored as single
 procedure Normalized(aValues: PSingleArray; aCount: PtrInt;
@@ -248,7 +249,10 @@ begin
           w^.U['sha256'], 'tiny model.safetensors sha256');
         CheckEqual(Sha256(StringFromFile(dir + 'config.json')),
           s.Manifest^.U['config_sha256'], 'tiny config.json sha256');
-      end;
+      end
+      else if DATASETS[i] = 'tiny-gguf' then
+        CheckEqual(Sha256(StringFromFile(dir + 'model.gguf')),
+          s.Manifest^.O['model']^.U['sha256'], 'tiny model.gguf sha256');
     finally
       s.Free;
     end;

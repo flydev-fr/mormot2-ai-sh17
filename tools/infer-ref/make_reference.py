@@ -21,6 +21,7 @@ import math
 import os
 import platform
 import shutil
+import struct
 import sys
 from datetime import datetime, timezone
 
@@ -720,9 +721,425 @@ def ops():
                                                   "stored as f32 (round to nearest)"})
 
 
+# ---------------------------------------------------------------- GGUF / Q8_0 (phase 1b)
+
+GGML_DIR = os.environ.get("LAI_GGML_DIR") or os.path.join(ROOT, "vendor", "sqlite-ext",
+                                                          "aarch64-linux")
+GGUF_Q8 = os.environ.get("LAI_GGUF") or os.path.join(ROOT, "vendor", "models",
+                                                     "bge-m3-q8_0.gguf")
+# the file of reference contract v1 (tests/data/embed-de/reference/manifest.json)
+GGUF_Q8_SHA256 = "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173"
+Q8_BLOCK = 34  # bytes of one Q8_0 block: FP16 scale + 32 int8
+
+
+class Ggml:
+    """ggml's own Q8_0 arithmetic, from the libraries of the lembed oracle build
+
+    quantize_row_q8_0 and ggml_vec_dot_q8_0_q8_0 are the ggml-cpu kernels lembed runs
+    (on aarch64 the NEON paths: activations round to nearest even); the weights are
+    quantized with quantize_row_q8_0_ref like any GGUF writer would.
+    """
+
+    def __init__(self):
+        import ctypes
+        self.ct = ctypes
+        self.base = ctypes.CDLL(os.path.join(GGML_DIR, "libggml-base.so"), mode=ctypes.RTLD_GLOBAL)
+        self.cpu = ctypes.CDLL(os.path.join(GGML_DIR, "libggml-cpu.so"), mode=ctypes.RTLD_GLOBAL)
+        self.cpu.ggml_cpu_init.restype = None
+        self.cpu.ggml_cpu_init()
+        vp, fp, i64 = ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int64
+        for lib, name in [(self.cpu, "quantize_row_q8_0"), (self.base, "quantize_row_q8_0_ref")]:
+            getattr(lib, name).argtypes = [fp, vp, i64]
+            getattr(lib, name).restype = None
+        self.base.dequantize_row_q8_0.argtypes = [vp, fp, i64]
+        self.base.dequantize_row_q8_0.restype = None
+        self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes = [ctypes.c_int, fp, ctypes.c_size_t, vp,
+                                                    ctypes.c_size_t, vp, ctypes.c_size_t,
+                                                    ctypes.c_int]
+        self.cpu.ggml_vec_dot_q8_0_q8_0.restype = None
+        self.base.ggml_fp32_to_fp16.argtypes = [ctypes.c_float]
+        self.base.ggml_fp32_to_fp16.restype = ctypes.c_uint16
+        self.libs = {n: sha256_file(os.path.join(GGML_DIR, n))
+                     for n in ["libggml-base.so", "libggml-cpu.so"]}
+
+    def _quant(self, fn, x):
+        x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
+        if x.size % 32:
+            raise ValueError("Q8_0 needs whole blocks")
+        out = self.ct.create_string_buffer(x.size // 32 * Q8_BLOCK)
+        fn(x.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), out, x.size)
+        return out.raw
+
+    def quant(self, x):
+        """activations, as ggml-cpu quantizes them before a Q8_0 matmul"""
+        return self._quant(self.cpu.quantize_row_q8_0, x)
+
+    def quant_ref(self, x):
+        """weights, as a GGUF writer quantizes them"""
+        return self._quant(self.base.quantize_row_q8_0_ref, x)
+
+    def dequant(self, raw, n):
+        y = np.zeros(n, dtype=np.float32)
+        self.base.dequantize_row_q8_0(raw, y.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), n)
+        return y
+
+    def dot(self, n, a, b):
+        s = self.ct.c_float()
+        self.cpu.ggml_vec_dot_q8_0_q8_0(n, self.ct.byref(s), 0, a, 0, b, 0, 1)
+        return s.value
+
+    def f16(self, v):
+        return self.base.ggml_fp32_to_fp16(float(v))
+
+    def linear(self, x, wq, n_in, n_out, bias):
+        """y = x W^T + b with Q8_0 weights wq (n_out rows of blocks) - ggml's way"""
+        rb = n_in // 32 * Q8_BLOCK
+        y = np.zeros((x.shape[0], n_out), dtype=np.float64)
+        for r in range(x.shape[0]):
+            xq = self.quant(x[r])
+            for o in range(n_out):
+                y[r, o] = self.dot(n_in, wq[o * rb:(o + 1) * rb], xq)
+        return y + bias.astype(np.float64)
+
+
+def q8():
+    """Q8_0 fixtures from ggml itself: FP16 rounding, activation quantization, the
+    integer block dot product, dequantization"""
+    print("q8")
+    g = Ggml()
+    rng = np.random.default_rng(TINY_SEED + 8)
+    f32 = lambda a: np.asarray(a, dtype=np.float32)
+    blob = Blob()
+    # half precision: ties to even, overflow, subnormals, underflow
+    half = [0.0, -0.0, 1.0, -2.0, 1 + 2 ** -11, 1 + 3 * 2 ** -11, 1 + 2 ** -11 + 2 ** -20,
+            65504.0, 65519.0, 65520.0, -65520.0, 1e10, 2 ** -14, 2 ** -24, 2 ** -25,
+            2 ** -25 + 2 ** -40, 3 * 2 ** -25, 2 ** -26, 1e-8, -1e-8, 0.1, 1 / 3, 1 / 127,
+            127 / 127.0 / 127, 2 ** -15 + 2 ** -25, 2 ** -15 + 3 * 2 ** -25]
+    half += list(rng.standard_normal(40) * 10.0 ** rng.integers(-9, 5, 40))
+    half = f32(half)
+    blob.add("half/x", half, "singles, incl. ties, overflow, subnormals")
+    blob.add("half/bits", np.array([g.f16(v) for v in half], dtype=np.int64),
+             "ggml_fp32_to_fp16: IEEE half bits, round to nearest even")
+    # activation quantization: ties (amax 127 -> d 1), a zero block, tiny and large rows
+    x = f32(rng.standard_normal((5, 96)))
+    x[0, :8] = [127, 2.5, -3.5, 0.5, -0.5, 1.5, -1.5, 126.5]
+    x[1, 32:64] = 0
+    x[2] *= 1e-6
+    x[3] *= 1e4
+    x[4, 64:96] = f32(rng.standard_normal(32) * 1e-30)
+    blob.add("quant/x", x)
+    blob.add("quant/blocks", np.frombuffer(b"".join(g.quant(r) for r in x), dtype=np.uint8)
+             .reshape(5, 3 * Q8_BLOCK), "ggml-cpu quantize_row_q8_0 per row")
+    # Q8_0 linear: weights from the reference quantizer, activations quantized by ggml-cpu
+    n_in, n_out = 96, 5
+    x = f32(rng.standard_normal((3, n_in)))
+    w = f32(rng.standard_normal((n_out, n_in)) * 0.2)
+    b = f32(rng.standard_normal(n_out))
+    wq = b"".join(g.quant_ref(r) for r in w)
+    blob.add("linear/x", x)
+    blob.add("linear/weight", np.frombuffer(wq, dtype=np.uint8).reshape(n_out, -1),
+             "[out, in/32 blocks] Q8_0")
+    blob.add("linear/bias", b)
+    blob.add("linear/y", g.linear(x, wq, n_in, n_out, b),
+             "ggml_vec_dot_q8_0_q8_0 (float sums) + bias in float64")
+    blob.add("dequant/y", np.stack([g.dequant(wq[o * 3 * Q8_BLOCK:(o + 1) * 3 * Q8_BLOCK], n_in)
+                                    for o in range(n_out)]), "dequantize_row_q8_0 of the weights")
+    blob.write(os.path.join(OUT, "q8"), {
+        "dataset": "q8", "environment": environment(),
+        "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
+                 "note": "the ggml build of the lembed oracle"}})
+
+
+# --- a minimal GGUF v3 writer (format: ggml docs/gguf.md)
+
+GT = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6, "bool": 7,
+      "str": 8, "arr": 9, "u64": 10, "i64": 11, "f64": 12}
+GT_FMT = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q",
+          12: "d"}
+
+
+def gguf_str(s):
+    b = s.encode("utf-8")
+    return struct.pack("<Q", len(b)) + b
+
+
+def gguf_value(t, v):
+    if t == GT["str"]:
+        return gguf_str(v)
+    return struct.pack("<" + GT_FMT[t], v)
+
+
+def gguf_write(path, kvs, tensors, alignment=32):
+    """kvs: [(key, type name, value)] - arrays as ("arr", (elem type name, [values]));
+    tensors: [(name, ggml type, ne innermost first, raw bytes)]"""
+    head = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kvs))
+    for k, t, v in kvs:
+        head += gguf_str(k) + struct.pack("<I", GT[t])
+        if t == "arr":
+            et, vals = v
+            head += struct.pack("<IQ", GT[et], len(vals))
+            head += b"".join(gguf_value(GT[et], x) for x in vals)
+        else:
+            head += gguf_value(GT[t], v)
+    off, data = 0, b""
+    for name, gtype, ne, raw in tensors:
+        pad = (-off) % alignment
+        data += b"\0" * pad
+        off += pad
+        head += gguf_str(name) + struct.pack("<I", len(ne)) + struct.pack(f"<{len(ne)}Q", *ne)
+        head += struct.pack("<IQ", gtype, off)
+        data += raw
+        off += len(raw)
+    head += b"\0" * ((-len(head)) % alignment)
+    with open(path, "wb") as f:
+        f.write(head + data)
+
+
+def tiny_tokenizer(vocab):
+    """tokenizer.ggml.* metadata of a 64-piece Unigram vocabulary for tiny-gguf: lets
+    the tokenizer and the embedder load from the always-present fixture (their real
+    gate is BGE-M3); the charsmap is one XCDA unit that matches nothing"""
+    space = "\u2581"
+    normal = [space] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    normal += [space + w for w in ["a", "ab", "abc", "the", "in", "er", "on", "b", "c"]]
+    normal += ["ab", "abc", "bc", "cd", "de", "th", "he", "in", "er", "on", "an", "re",
+               "the", "ing", "ion", "and", "ent", "ed", "es", "st", "or", "at", "en"]
+    pieces = ["<s>", "<pad>", "</s>", "<unk>"] + normal
+    pieces = pieces[:vocab - 1] + ["<mask>"]
+    if len(pieces) != vocab or len(set(pieces)) != vocab:
+        raise ValueError("tiny vocabulary does not fill the model rows")
+    types = [3, 3, 3, 2] + [1] * (vocab - 5) + [3]
+    scores = [0.0, 0.0, 0.0, 0.0] + [-1.0 - 0.125 * i for i in range(vocab - 5)] + [0.0]
+    charsmap = list(struct.pack("<II", 4, 0))
+    return [("tokenizer.ggml.model", "str", "t5"),
+            ("tokenizer.ggml.pre", "str", "default"),
+            ("tokenizer.ggml.tokens", "arr", ("str", pieces)),
+            ("tokenizer.ggml.scores", "arr", ("f32", scores)),
+            ("tokenizer.ggml.token_type", "arr", ("i32", types)),
+            ("tokenizer.ggml.add_space_prefix", "bool", True),
+            ("tokenizer.ggml.remove_extra_whitespaces", "bool", True),
+            ("tokenizer.ggml.precompiled_charsmap", "arr", ("u8", charsmap)),
+            ("tokenizer.ggml.bos_token_id", "u32", 0),
+            ("tokenizer.ggml.eos_token_id", "u32", 2),
+            ("tokenizer.ggml.unknown_token_id", "u32", 3),
+            ("tokenizer.ggml.add_bos_token", "bool", True),
+            ("tokenizer.ggml.add_eos_token", "bool", True)]
+
+
+def tiny_gguf():
+    """tiny-xlmr as llama.cpp's converter writes XLM-R: architecture bert, Q8_0 matrices,
+    the first pad + 1 position rows dropped (positions count from 0); expected states
+    computed with ggml's Q8_0 kernels for every matmul, everything else in float64 and
+    rounded to f32 after each operation like the engine's buffers"""
+    print("tiny-gguf")
+    g = Ggml()
+    src = load_file(os.path.join(OUT, "tiny-xlmr", "model.safetensors"))
+    cfg = json.load(open(os.path.join(OUT, "tiny-xlmr", "config.json"), encoding="utf-8"))
+    sd = {k: v.numpy().astype(np.float32) for k, v in src.items()}
+    h, f, layers = cfg["hidden_size"], cfg["intermediate_size"], cfg["num_hidden_layers"]
+    heads, pad = cfg["num_attention_heads"], cfg["pad_token_id"]
+    eps = cfg["layer_norm_eps"]
+    tensors, w = [], {}
+
+    def add_f32(name, a):
+        a = np.ascontiguousarray(a, dtype=np.float32)
+        tensors.append((name, 0, list(reversed(a.shape)), a.tobytes()))
+        w[name] = a
+
+    def add_q8(name, a):
+        raw = b"".join(g.quant_ref(r) for r in a)
+        tensors.append((name, 8, list(reversed(a.shape)), raw))
+        w[name] = raw
+
+    add_f32("position_embd.weight", sd["embeddings.position_embeddings.weight"][pad + 1:])
+    add_q8("token_embd.weight", sd["embeddings.word_embeddings.weight"])
+    add_f32("token_embd_norm.bias", sd["embeddings.LayerNorm.bias"])
+    add_f32("token_embd_norm.weight", sd["embeddings.LayerNorm.weight"])
+    add_f32("token_types.weight", sd["embeddings.token_type_embeddings.weight"][0])
+    names = {"attn_q": "attention.self.query", "attn_k": "attention.self.key",
+             "attn_v": "attention.self.value", "attn_output": "attention.output.dense",
+             "attn_output_norm": "attention.output.LayerNorm", "ffn_up": "intermediate.dense",
+             "ffn_down": "output.dense", "layer_output_norm": "output.LayerNorm"}
+    for i in range(layers):
+        for gname in sorted(names):
+            hname = f"encoder.layer.{i}.{names[gname]}"
+            add_f32(f"blk.{i}.{gname}.bias", sd[hname + ".bias"])
+            if gname.endswith("norm"):
+                add_f32(f"blk.{i}.{gname}.weight", sd[hname + ".weight"])
+            else:
+                add_q8(f"blk.{i}.{gname}.weight", sd[hname + ".weight"])
+    n_pos = cfg["max_position_embeddings"] - pad - 1
+    kvs = [("general.architecture", "str", "bert"),
+           ("general.name", "str", "tiny-xlmr"),
+           ("bert.block_count", "u32", layers),
+           ("bert.context_length", "u32", n_pos),
+           ("bert.embedding_length", "u32", h),
+           ("bert.feed_forward_length", "u32", f),
+           ("bert.attention.head_count", "u32", heads),
+           ("bert.attention.layer_norm_epsilon", "f32", eps),
+           ("bert.attention.causal", "bool", False),
+           ("bert.pooling_type", "u32", 2),
+           ("tokenizer.ggml.padding_token_id", "u32", pad),
+           ("general.file_type", "u32", 7)]
+    kvs += tiny_tokenizer(cfg["vocab_size"])
+    folder = os.path.join(OUT, "tiny-gguf")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "model.gguf")
+    gguf_write(path, kvs, tensors)
+
+    vocab = cfg["vocab_size"]
+    word = np.stack([g.dequant(w["token_embd.weight"][i * h // 32 * Q8_BLOCK:
+                                                      (i + 1) * h // 32 * Q8_BLOCK], h)
+                     for i in range(vocab)])
+    r32 = lambda a: np.asarray(a, dtype=np.float32)
+
+    def ln(x, gname):
+        xd = x.astype(np.float64)
+        mu = xd.mean(-1, keepdims=True)
+        var = ((xd - mu) ** 2).mean(-1, keepdims=True)
+        return r32((xd - mu) / np.sqrt(var + eps) * w[gname + ".weight"] + w[gname + ".bias"])
+
+    def lin(x, name, n_in, n_out):
+        return r32(g.linear(x, w[name + ".weight"], n_in, n_out, w[name + ".bias"]))
+
+    def fwd(ids, keep):
+        n = len(ids)
+        pos, seen = [], 0
+        for t in ids:
+            if t == pad:
+                pos.append(0)
+            else:
+                pos.append(seen)
+                seen += 1
+        x = r32(word[ids].astype(np.float64) + w["position_embd.weight"][pos] +
+                w["token_types.weight"])
+        x = ln(x, "token_embd_norm")
+        states = [x]
+        hd = h // heads
+        for i in range(layers):
+            p = f"blk.{i}."
+            q, k, v = (lin(x, p + n, h, h) for n in ["attn_q", "attn_k", "attn_v"])
+            ctx = np.zeros((n, h), dtype=np.float64)
+            for hh in range(heads):
+                c = slice(hh * hd, (hh + 1) * hd)
+                s = q[:, c].astype(np.float64) @ k[:, c].astype(np.float64).T / math.sqrt(hd)
+                s = np.where(keep[None, :] == 1, s, -np.inf)
+                e = np.exp(s - s.max(-1, keepdims=True))
+                ctx[:, c] = (e / e.sum(-1, keepdims=True)) @ v[:, c].astype(np.float64)
+            a = lin(r32(ctx), p + "attn_output", h, h)
+            x = ln(r32(a.astype(np.float64) + x), p + "attn_output_norm")
+            u = lin(x, p + "ffn_up", h, f).astype(np.float64)
+            u = r32(0.5 * u * np.vectorize(math.erfc)(-u / math.sqrt(2)))
+            d = lin(u, p + "ffn_down", f, h)
+            x = ln(r32(d.astype(np.float64) + x), p + "layer_output_norm")
+            states.append(x)
+        return states
+
+    blob = Blob()
+    singles = [[0, 7, 2], [0, 5, 9, 33, 12, 2], [0, 63, 4, 4, 17, 50, 21, 8, 2]]
+    for i, seq in enumerate(singles):
+        hs = fwd(np.array(seq), np.ones(len(seq), dtype=np.int64))
+        blob.add(f"single/{i}/input_ids", np.array(seq))
+        for k, s in enumerate(hs):
+            blob.add(f"single/{i}/hidden.{k}", s)
+        cls = hs[-1][0].astype(np.float64)
+        blob.add(f"single/{i}/embedding", cls / np.linalg.norm(cls))
+    width = max(len(s) for s in singles)
+    batch = [s + [pad] * (width - len(s)) for s in singles]
+    blob.add("batch/input_ids", np.array(batch))
+    for r, seq in enumerate(batch):
+        hs = fwd(np.array(seq), (np.array(seq) != pad).astype(np.int64))
+        blob.add(f"batch/{r}/hidden.{layers}", hs[-1], "padded positions are not meaningful")
+    blob.write(folder, {
+        "dataset": "tiny-gguf",
+        "note": "tiny-xlmr converted like llama.cpp converts XLM-R (architecture bert, "
+                "positions from 0, Q8_0 matrices and word embedding); expected states use "
+                "ggml's Q8_0 kernels (activations quantized per row) for every matmul, "
+                "float64 for the rest, f32 after each operation, exact (erf) GELU",
+        "model": {"file": "model.gguf", "sha256": sha256_file(path),
+                  "from": "tiny-xlmr/model.safetensors"},
+        "ggml": {"sha256": g.libs},
+        "environment": environment()})
+
+
+def lembed_tokens():
+    """lembed_tokenize_json for every case of bge-m3-tokens: the token oracle of phase 1b"""
+    print("lembed tokens")
+    import sqlite3
+    if sha256_file(GGUF_Q8) != GGUF_Q8_SHA256:
+        raise ValueError(f"{GGUF_Q8}: not the file of reference contract v1")
+    src = os.path.join(OUT, "bge-m3-tokens")
+    man = json.load(open(os.path.join(src, "manifest.json"), encoding="utf-8"))
+    raw = open(os.path.join(src, "tensors.bin"), "rb").read()
+    t = {e["name"]: e for e in man["tensors"]}
+    def arr(name, dt):
+        e = t[name]
+        return np.frombuffer(raw[e["offset"]:e["offset"] + e["bytes"]], dtype=dt)
+    texts, toff = arr("texts", np.uint8).tobytes(), arr("text_offsets", "<i4")
+    ref, roff = arr("ids", "<i4"), arr("offsets", "<i4")
+    db = sqlite3.connect(":memory:")
+    db.enable_load_extension(True)
+    db.load_extension(os.path.join(GGML_DIR, "lembed0"))
+    version = db.execute("select lembed_version()").fetchone()[0]
+    db.execute("INSERT INTO temp.lembed_models(name, model) VALUES ('m', lembed_model_from_file(?))",
+               (GGUF_Q8,))
+    flat, offsets, literal, same = [], [], [], 0
+    specials = ["<s>", "</s>", "<pad>", "<unk>", "<mask>"]
+    for i, c in enumerate(man["cases"]):
+        text = texts[toff[i]:toff[i + 1]].decode("utf-8")
+        ids = json.loads(db.execute("select lembed_tokenize_json('m', ?)", (text,)).fetchone()[0])
+        offsets.append(len(flat))
+        flat += ids
+        lit = any(s in text for s in specials)
+        literal.append(int(lit))
+        if ids == list(ref[roff[i]:roff[i + 1]]):
+            same += 1
+        elif not lit:
+            raise ValueError(f"case {c['id']}: lembed {ids} differs from SentencePiece "
+                             f"{list(ref[roff[i]:roff[i + 1]])} without a special literal")
+    offsets.append(len(flat))
+    # extra cases: pieces of other token types as text (BGE-M3 has the UNUSED
+    # piece [PAD250000], id 250000) - the oracle never matches them
+    extra = ["[PAD250000]", "x[PAD250000]y", "a [PAD250000] b"]
+    ex_bytes, ex_offsets, ex_ids, ex_id_offsets = bytearray(), [], [], []
+    for text in extra:
+        ex_offsets.append(len(ex_bytes))
+        ex_bytes += text.encode("utf-8")
+        ids = json.loads(db.execute("select lembed_tokenize_json('m', ?)", (text,)).fetchone()[0])
+        if 250000 in ids:
+            raise ValueError(f"{text!r}: lembed matched the unused piece")
+        ex_id_offsets.append(len(ex_ids))
+        ex_ids += ids
+    ex_offsets.append(len(ex_bytes))
+    ex_id_offsets.append(len(ex_ids))
+    blob = Blob()
+    blob.add("extra/texts", np.frombuffer(bytes(ex_bytes), dtype=np.uint8),
+             "extra case texts: an UNUSED piece of the vocabulary as plain text")
+    blob.add("extra/text_offsets", np.array(ex_offsets, dtype=np.int64))
+    blob.add("extra/ids", np.array(ex_ids, dtype=np.int64), "lembed ids of the extra cases")
+    blob.add("extra/offsets", np.array(ex_id_offsets, dtype=np.int64))
+    blob.add("ids", np.array(flat, dtype=np.int64), "all cases concatenated")
+    blob.add("offsets", np.array(offsets, dtype=np.int64), "case i = ids[offsets[i] .. offsets[i+1]-1]")
+    blob.add("special_literal", np.array(literal, dtype=np.int64),
+             "1 = the text contains <s> </s> <pad> <unk> or <mask>: lembed reads it as a "
+             "control token (parse_special=true), the native tokenizer must not")
+    blob.write(os.path.join(OUT, "lembed-tokens"), {
+        "dataset": "lembed-tokens",
+        "note": "token ids of the lembed oracle for the cases of bge-m3-tokens (same order); "
+                "every case without a special literal equals the SentencePiece reference",
+        "cases_from": "bge-m3-tokens", "cases_sha256": man["blob"]["sha256"],
+        "cases": len(man["cases"]), "equal_to_sentencepiece": same,
+        "special_literal_cases": int(sum(literal)),
+        "oracle": {"lembed": version, "sqlite": sqlite3.sqlite_version,
+                   "model_file": os.path.basename(GGUF_Q8), "model_sha256": GGUF_Q8_SHA256,
+                   "ggml_sha256": Ggml().libs},
+        "environment": environment()})
+
+
 def main():
     setup_determinism()
-    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens"}
+    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens", "q8", "tiny-gguf",
+                                 "lembed-tokens"}
     if "ops" in what:
         ops()
     if "tiny" in what:
@@ -733,6 +1150,12 @@ def main():
         embed_de(tok, model, manifest)
     if "tokens" in what:
         tokens(fetch_model())
+    if "q8" in what:
+        q8()
+    if "tiny-gguf" in what:
+        tiny_gguf()
+    if "lembed-tokens" in what:
+        lembed_tokens()
 
 
 if __name__ == "__main__":

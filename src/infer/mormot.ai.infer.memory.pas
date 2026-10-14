@@ -3,9 +3,10 @@
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - weights are mapped read-only, never copied: the OS pages them in on demand
 //   and shares them between processes
-// - phase 1a maps a file as a whole; a file that cannot fit the address space of
-//   a 32-bit process is refused with a clear message instead of failing somewhere
-//   inside the OS call (windowed mapping for Win32 comes with the Q8 files)
+// - a file is mapped as a whole; one that cannot fit the address space of a
+//   32-bit process is refused with a clear message instead of failing somewhere
+//   inside the OS call. The Q8_0 BGE-M3 (634 MB) fits and runs on Win32; windowed
+//   mapping is only needed for larger models (the decoder phase)
 unit mormot.ai.infer.memory;
 
 {

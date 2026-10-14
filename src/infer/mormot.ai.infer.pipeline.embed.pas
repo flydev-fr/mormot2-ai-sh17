@@ -3,7 +3,10 @@
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - tokenizer + encoder + pooling: CLS of the last hidden state, L2-normalised
 //   (BGE-M3 dense, verified against the revision's 1_Pooling/config.json by the
-//   reference generator)
+//   reference generator; a GGUF file must say bert.pooling_type = 2, CLS)
+// - two sources: a Hugging Face folder (tokenizer.json, config.json,
+//   model.safetensors) or one GGUF file holding tokenizer and weights - the
+//   Q8_0 file of the lembed oracle (reference contract v1)
 // - a text longer than MaxTokens (512 incl. <s> </s>, reference contract v1) is
 //   refused, never cut silently: the caller chunks before
 // - immutable after loading: Embed may run on several threads, each call uses its
@@ -28,6 +31,7 @@ uses
   mormot.core.text,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.tokenizer.ugm,
   mormot.ai.infer.model.xlmr;
 
@@ -42,10 +46,14 @@ type
     fTokenizer: TUgmTokenizer;
     fModel: TXlmrModel;
     fMaxTokens: PtrInt;
+    procedure Check;
   public
     /// load <aFolder>tokenizer.json, config.json and model.safetensors
     // - aBackend is not owned
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend);
+    /// load tokenizer and weights from one GGUF file (e.g. bge-m3-q8_0.gguf)
+    // - aBackend is not owned
+    constructor CreateFromGguf(const aFileName: TFileName; aBackend: TInferBackend);
     /// release tokenizer and weights
     destructor Destroy; override;
     /// the unit-length vectors of aTexts, one row of Dim singles per text
@@ -78,6 +86,24 @@ begin
   folder := IncludeTrailingPathDelimiter(aFolder);
   fTokenizer := TUgmTokenizer.Create(folder + 'tokenizer.json');
   fModel := TXlmrModel.Create(folder, aBackend);
+  Check;
+end;
+
+constructor TInferEmbedder.CreateFromGguf(const aFileName: TFileName;
+  aBackend: TInferBackend);
+begin
+  inherited Create;
+  fModel := TXlmrModel.CreateFromGguf(aFileName, aBackend);
+  // CLS pooling is what Embed computes: mean or last-token pooling is refused
+  if fModel.Gguf.Int('bert.pooling_type') <> 2 then
+    EInferError.RaiseUtf8('%: bert.pooling_type % is not CLS (2)',
+      [self, fModel.Gguf.Int('bert.pooling_type')]);
+  fTokenizer := TUgmTokenizer.CreateFromGguf(fModel.Gguf);
+  Check;
+end;
+
+procedure TInferEmbedder.Check;
+begin
   if fTokenizer.VocabSize <> fModel.Config.VocabSize then
     EInferError.RaiseUtf8('%: tokenizer has % pieces, the model % rows',
       [self, fTokenizer.VocabSize, fModel.Config.VocabSize]);
@@ -85,7 +111,7 @@ begin
   if fTokenizer.PadId <> fModel.Config.PadId then
     EInferError.RaiseUtf8('%: tokenizer <pad> is %, the model pad_token_id %',
       [self, fTokenizer.PadId, fModel.Config.PadId]);
-  fMaxTokens := INFER_EMBED_MAX_TOKENS;
+  fMaxTokens := MinPtrInt(INFER_EMBED_MAX_TOKENS, fModel.MaxTokens);
 end;
 
 destructor TInferEmbedder.Destroy;

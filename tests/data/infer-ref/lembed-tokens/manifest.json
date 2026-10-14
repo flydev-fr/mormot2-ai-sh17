@@ -1,0 +1,122 @@
+{
+ "dataset": "lembed-tokens",
+ "note": "token ids of the lembed oracle for the cases of bge-m3-tokens (same order); every case without a special literal equals the SentencePiece reference",
+ "cases_from": "bge-m3-tokens",
+ "cases_sha256": "87810896e2ef049096e977bd0da91eaf88c10fd1aaebdb9096b8e99186533429",
+ "cases": 1348,
+ "equal_to_sentencepiece": 1324,
+ "special_literal_cases": 30,
+ "oracle": {
+  "lembed": "v0.0.1-alpha.8-landrix.1",
+  "sqlite": "3.50.4",
+  "model_file": "bge-m3-q8_0.gguf",
+  "model_sha256": "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173",
+  "ggml_sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "environment": {
+  "created_utc": "2026-10-14T13:17:09Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 157360,
+  "sha256": "4202c8db4802427930ec4b8cafde826ad04ed13f45b8258d85860ee4b993c575",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "extra/texts",
+   "dtype": "u8",
+   "shape": [
+    39
+   ],
+   "offset": 0,
+   "bytes": 39,
+   "sha256": "92b25bb7128d38292755d43269d569ea14bd62e87f41b937933152b0aac27a61",
+   "note": "extra case texts: an UNUSED piece of the vocabulary as plain text"
+  },
+  {
+   "name": "extra/text_offsets",
+   "dtype": "i32",
+   "shape": [
+    4
+   ],
+   "offset": 40,
+   "bytes": 16,
+   "sha256": "528ad3ebf63d18307186f9ad8a3a2f3d0151336d2b553b2067ff0d1e5e05223b"
+  },
+  {
+   "name": "extra/ids",
+   "dtype": "i32",
+   "shape": [
+    25
+   ],
+   "offset": 56,
+   "bytes": 100,
+   "sha256": "dd9b9021bd664408e7c9e9554d17ee4cbd5d4f5d302d159355fc48a6ff299674",
+   "note": "lembed ids of the extra cases"
+  },
+  {
+   "name": "extra/offsets",
+   "dtype": "i32",
+   "shape": [
+    4
+   ],
+   "offset": 156,
+   "bytes": 16,
+   "sha256": "ef32ca1ddab3e075b53520eddea48ac261f7040d7fbcb65002d25686940fe57d"
+  },
+  {
+   "name": "ids",
+   "dtype": "i32",
+   "shape": [
+    36600
+   ],
+   "offset": 172,
+   "bytes": 146400,
+   "sha256": "b596eda2e033af028e33041a9771739e982e92f9c8324ea1f6c0dc1fb13b2a47",
+   "note": "all cases concatenated"
+  },
+  {
+   "name": "offsets",
+   "dtype": "i32",
+   "shape": [
+    1349
+   ],
+   "offset": 146572,
+   "bytes": 5396,
+   "sha256": "f9015dd5c3b1f5f7abccdaf1f2cb6a853c7a5eb28a1f3d3f151a0a8730d22963",
+   "note": "case i = ids[offsets[i] .. offsets[i+1]-1]"
+  },
+  {
+   "name": "special_literal",
+   "dtype": "i32",
+   "shape": [
+    1348
+   ],
+   "offset": 151968,
+   "bytes": 5392,
+   "sha256": "603fc2f0043e93515bf4366d005c9918428d19f99754a15693b2e6c314c07c18",
+   "note": "1 = the text contains <s> </s> <pad> <unk> or <mask>: lembed reads it as a control token (parse_special=true), the native tokenizer must not"
+  }
+ ]
+}

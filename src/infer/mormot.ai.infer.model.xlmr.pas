@@ -5,18 +5,24 @@
 //   modeling_xlm_roberta.py and candle, no code taken): embeddings (word +
 //   position + token type 0, LayerNorm), then per layer post-norm self-attention
 //   and a GELU feed-forward block; dropout is an identity at inference
-// - XLM-R positions: real tokens count from pad + 1, padding sits at pad - they
-//   derive from the token ids, not from the attention mask
+// - two sources, each with its own position rule, kept explicit per format:
+//   * config.json + model.safetensors (Hugging Face): XLM-R positions - real
+//     tokens count from pad + 1, padding sits at pad; they derive from the token
+//     ids, not from the attention mask. BERT is refused on purpose there: it
+//     numbers positions from 0 and would load fine but compute wrong vectors
+//   * GGUF (architecture "bert", as llama.cpp converts XLM-R): the converter
+//     dropped the first pad + 1 position rows, so the real tokens count from 0
+//     (8192 rows instead of 8194 for BGE-M3) - never "corrected" by an offset
+// - weight matrices keep the type of the file (F32, or Q8_0 from GGUF); the word
+//   embedding rows are dequantized when looked up
 // - the model is immutable after loading and may serve several threads; every
 //   call brings its own TXlmrContext with the scratch buffers
-// - BERT is refused on purpose: it numbers positions from 0, not from pad + 1,
-//   and would load fine but compute wrong vectors
 unit mormot.ai.infer.model.xlmr;
 
 {
   *****************************************************************************
 
-    - TXlmrConfig: the encoder hyper-parameters, read from config.json
+    - TXlmrConfig: the encoder hyper-parameters, from config.json or GGUF
     - TXlmrModel: weights validated at load, batched forward pass
     - TXlmrContext: per-call scratch buffers, reusable between calls
 
@@ -36,6 +42,7 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.safetensors,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.backend;
 
 type
@@ -51,13 +58,16 @@ type
     TypeVocab: PtrInt;
     PadId: PtrInt;
     LayerNormEps: double;
+    /// the position row of the first real token: PadId + 1 for XLM-R
+    // (safetensors), 0 for a GGUF file
+    FirstPosition: PtrInt;
   end;
 
   /// the weights of one encoder layer - views into the mapped file
   TXlmrLayer = record
-    Q, QBias, K, KBias, V, VBias: PSingleArray;
-    AttnOut, AttnOutBias, AttnNorm, AttnNormBias: PSingleArray;
-    Inter, InterBias, Output, OutputBias, OutNorm, OutNormBias: PSingleArray;
+    Q, K, V, AttnOut, Inter, Output: TInferWeight;
+    QBias, KBias, VBias, AttnOutBias, AttnNorm, AttnNormBias: PSingleArray;
+    InterBias, OutputBias, OutNorm, OutNormBias: PSingleArray;
   end;
   TXlmrLayerDynArray = array of TXlmrLayer;
 
@@ -86,24 +96,35 @@ type
       read fHiddenCount;
   end;
 
-  /// an XLM-RoBERTa encoder over a safetensors file
+  /// an XLM-RoBERTa encoder over a safetensors or a GGUF file
   TXlmrModel = class
   protected
     fConfig: TXlmrConfig;
     fFile: TSafeTensorsFile;
+    fGguf: TGgufFile;
     fBackend: TInferBackend;
-    fWord, fPosition, fTokenType, fEmbNorm, fEmbNormBias: PSingleArray;
+    fWord: TInferWeight;
+    fPosition, fTokenType, fEmbNorm, fEmbNormBias: PSingleArray;
     fLayer: TXlmrLayerDynArray;
     procedure LoadConfig(const aConfigFile: TFileName);
     procedure LoadWeights;
+    procedure LoadGgufConfig;
+    procedure LoadGgufWeights;
+    procedure Validate(const aSource: RawUtf8);
     procedure Prepare(aCtx: TXlmrContext; aRows, aWidth: PtrInt);
   public
     /// load <aFolder>config.json and <aFolder>model.safetensors
     // - raises EInferError when a setting is unsupported or a weight is missing
     // or shaped otherwise; aBackend is not owned
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend);
+    /// load a GGUF file of architecture "bert" (XLM-R as llama.cpp converts it)
+    // - the file stays mapped and is reachable by the Gguf property, e.g. for
+    // its tokenizer; raises EInferError like Create
+    constructor CreateFromGguf(const aFileName: TFileName; aBackend: TInferBackend);
     /// unmap the weights
     destructor Destroy; override;
+    /// the longest sequence, in tokens
+    function MaxTokens: PtrInt;
     /// encode aRows sequences of aWidth token ids each (right-padded with PadId)
     // - aIds is [aRows, aWidth]; aKeep[r * aWidth + c] = 0 marks padding, nil
     // derives it from aIds <> PadId
@@ -117,6 +138,9 @@ type
     /// the backend the model computes with (not owned)
     property Backend: TInferBackend
       read fBackend;
+    /// the GGUF file of CreateFromGguf, nil otherwise
+    property Gguf: TGgufFile
+      read fGguf;
   end;
 
 
@@ -138,10 +162,157 @@ begin
   LoadWeights;
 end;
 
+constructor TXlmrModel.CreateFromGguf(const aFileName: TFileName;
+  aBackend: TInferBackend);
+begin
+  inherited Create;
+  if aBackend = nil then
+    EInferError.RaiseUtf8('%.CreateFromGguf: no backend', [self]);
+  fBackend := aBackend;
+  fGguf := TGgufFile.Create(aFileName);
+  LoadGgufConfig;
+  LoadGgufWeights;
+end;
+
 destructor TXlmrModel.Destroy;
 begin
   fFile.Free;
+  fGguf.Free;
   inherited Destroy;
+end;
+
+function TXlmrModel.MaxTokens: PtrInt;
+begin
+  result := fConfig.MaxPositions - fConfig.FirstPosition;
+end;
+
+procedure TXlmrModel.Validate(const aSource: RawUtf8);
+begin
+  if (fConfig.VocabSize <= 0) or (fConfig.Hidden <= 0) or (fConfig.Layers <= 0) or
+     (fConfig.Heads <= 0) or (fConfig.Intermediate <= 0) or
+     (fConfig.MaxPositions <= fConfig.FirstPosition) or (fConfig.TypeVocab <= 0) or
+     (fConfig.PadId < 0) or (fConfig.PadId >= fConfig.VocabSize) or
+     not (fConfig.LayerNormEps > 0) or (fConfig.Hidden mod fConfig.Heads <> 0) then
+    EInferError.RaiseUtf8('%: inconsistent hyper-parameters in %', [self, aSource]);
+  fConfig.HeadDim := fConfig.Hidden div fConfig.Heads;
+end;
+
+procedure TXlmrModel.LoadGgufConfig;
+var
+  t: PInferTensor;
+
+  // checked as Int64 BEFORE the PtrInt assignment: on 32-bit targets a value
+  // like -4294967264 would otherwise truncate to a plausible 32
+  function Bounded(const aKey: RawUtf8; aMin, aMax: Int64): PtrInt;
+  var
+    v: Int64;
+  begin
+    v := fGguf.Int(aKey);
+    if (v < aMin) or (v > aMax) then
+      EInferError.RaiseUtf8('%: % = % out of range [%..%]',
+        [self, aKey, v, aMin, aMax]);
+    result := v;
+  end;
+
+begin
+  if fGguf.Str('general.architecture') <> 'bert' then
+    EInferError.RaiseUtf8('%: architecture "%" is not bert',
+      [self, fGguf.Str('general.architecture')]);
+  // a causal (decoder) mask has the same weights but another computation
+  if fGguf.BoolDef('bert.attention.causal', false) then
+    EInferError.RaiseUtf8('%: causal attention is not supported', [self]);
+  if fGguf.Has('bert.attention.head_count_kv') and
+     (fGguf.Int('bert.attention.head_count_kv') <>
+      fGguf.Int('bert.attention.head_count')) then
+    EInferError.RaiseUtf8('%: grouped key/value heads are not supported', [self]);
+  // bounded before they size anything: a hostile file cannot overflow below
+  fConfig.Layers := Bounded('bert.block_count', 1, 1024);
+  fConfig.Hidden := Bounded('bert.embedding_length', 1, 1 shl 16);
+  fConfig.Intermediate := Bounded('bert.feed_forward_length', 1, 1 shl 18);
+  fConfig.Heads := Bounded('bert.attention.head_count', 1, 1 shl 12);
+  fConfig.MaxPositions := Bounded('bert.context_length', 1, 1 shl 20);
+  fConfig.LayerNormEps := fGguf.Float('bert.attention.layer_norm_epsilon');
+  // the converter keeps one token type row, stored as a vector
+  fConfig.TypeVocab := 1;
+  fConfig.FirstPosition := 0;
+  // the vocabulary is the row count of the word embedding
+  t := fGguf.Tensor('token_embd.weight');
+  if length(t^.Shape) <> 2 then
+    EInferError.RaiseUtf8('%: token_embd.weight is not a matrix', [self]);
+  fConfig.VocabSize := t^.Shape[0]; // a dimension: bounded by the file size
+  // padding is a tokenizer setting in GGUF; masking needs it
+  fConfig.PadId := Bounded('tokenizer.ggml.padding_token_id', 0,
+    fConfig.VocabSize - 1);
+  Validate(StringToUtf8(ExtractFileName(fGguf.FileName)));
+end;
+
+procedure TXlmrModel.LoadGgufWeights;
+var
+  i: PtrInt;
+  h, f: Int64;
+  p: RawUtf8;
+  l: ^TXlmrLayer;
+
+  function Matrix(const aName: RawUtf8; aOut, aIn: Int64): TInferWeight;
+  var
+    t: PInferTensor;
+  begin
+    // every matrix of a file may have its own type: F32 or Q8_0
+    t := fGguf.Tensor(aName);
+    if not (t^.DType in [idtF32, idtQ8_0]) or
+       not fBackend.Supports(ioLinear, t^.DType) then
+      EInferError.RaiseUtf8('%: % is % - not supported', [self, aName,
+        INFER_DTYPE_NAME[t^.DType]]);
+    result.DType := t^.DType;
+    result.Data := fGguf.Weight(aName, t^.DType, [aOut, aIn]);
+  end;
+
+  function Vector(const aName: RawUtf8; aCount: Int64): PSingleArray;
+  begin
+    result := fGguf.Weight(aName, idtF32, [aCount]);
+  end;
+
+begin
+  h := fConfig.Hidden;
+  f := fConfig.Intermediate;
+  fWord.DType := fGguf.Tensor('token_embd.weight')^.DType;
+  if not (fWord.DType in [idtF32, idtQ8_0]) then
+    EInferError.RaiseUtf8('%: token_embd.weight is % - not supported',
+      [self, INFER_DTYPE_NAME[fWord.DType]]);
+  fWord.Data := fGguf.Weight('token_embd.weight', fWord.DType,
+    [fConfig.VocabSize, h]);
+  fPosition := fGguf.Weight('position_embd.weight', idtF32,
+    [fConfig.MaxPositions, h]);
+  fTokenType := Vector('token_types.weight', h);
+  fEmbNorm := Vector('token_embd_norm.weight', h);
+  fEmbNormBias := Vector('token_embd_norm.bias', h);
+  SetLength(fLayer, fConfig.Layers);
+  for i := 0 to fConfig.Layers - 1 do
+  begin
+    p := FormatUtf8('blk.%.', [i]);
+    l := @fLayer[i];
+    l^.Q := Matrix(p + 'attn_q.weight', h, h);
+    l^.QBias := Vector(p + 'attn_q.bias', h);
+    l^.K := Matrix(p + 'attn_k.weight', h, h);
+    l^.KBias := Vector(p + 'attn_k.bias', h);
+    l^.V := Matrix(p + 'attn_v.weight', h, h);
+    l^.VBias := Vector(p + 'attn_v.bias', h);
+    l^.AttnOut := Matrix(p + 'attn_output.weight', h, h);
+    l^.AttnOutBias := Vector(p + 'attn_output.bias', h);
+    l^.AttnNorm := Vector(p + 'attn_output_norm.weight', h);
+    l^.AttnNormBias := Vector(p + 'attn_output_norm.bias', h);
+    l^.Inter := Matrix(p + 'ffn_up.weight', f, h);
+    l^.InterBias := Vector(p + 'ffn_up.bias', f);
+    l^.Output := Matrix(p + 'ffn_down.weight', h, f);
+    l^.OutputBias := Vector(p + 'ffn_down.bias', h);
+    l^.OutNorm := Vector(p + 'layer_output_norm.weight', h);
+    l^.OutNormBias := Vector(p + 'layer_output_norm.bias', h);
+  end;
+  // an unknown tensor means a model we do not understand (e.g. a gated FFN or
+  // a classifier head), not something to ignore silently
+  if length(fGguf.Tensors) <> 5 + 16 * fConfig.Layers then
+    EInferError.RaiseUtf8('%: % tensors in the file, % understood',
+      [self, length(fGguf.Tensors), 5 + 16 * fConfig.Layers]);
 end;
 
 const
@@ -185,13 +356,8 @@ begin
   fConfig.TypeVocab := doc.I['type_vocab_size'];
   fConfig.PadId := doc.I['pad_token_id'];
   fConfig.LayerNormEps := doc.D['layer_norm_eps'];
-  if (fConfig.VocabSize <= 0) or (fConfig.Hidden <= 0) or (fConfig.Layers <= 0) or
-     (fConfig.Heads <= 0) or (fConfig.Intermediate <= 0) or
-     (fConfig.MaxPositions <= fConfig.PadId + 1) or (fConfig.TypeVocab <= 0) or
-     (fConfig.PadId < 0) or (fConfig.LayerNormEps <= 0) or
-     (fConfig.Hidden mod fConfig.Heads <> 0) then
-    EInferError.RaiseUtf8('%: inconsistent hyper-parameters in %', [self, aConfigFile]);
-  fConfig.HeadDim := fConfig.Hidden div fConfig.Heads;
+  fConfig.FirstPosition := fConfig.PadId + 1; // XLM-R
+  Validate(StringToUtf8(aConfigFile));
 end;
 
 procedure TXlmrModel.LoadWeights;
@@ -204,7 +370,8 @@ var
 begin
   h := fConfig.Hidden;
   f := fConfig.Intermediate;
-  fWord := fFile.F32('embeddings.word_embeddings.weight', [fConfig.VocabSize, h]);
+  fWord := InferWeight(fFile.F32('embeddings.word_embeddings.weight',
+    [fConfig.VocabSize, h]), idtF32);
   fPosition := fFile.F32('embeddings.position_embeddings.weight',
     [fConfig.MaxPositions, h]);
   fTokenType := fFile.F32('embeddings.token_type_embeddings.weight',
@@ -217,19 +384,21 @@ begin
   begin
     p := FormatUtf8('encoder.layer.%.', [i]);
     l := @fLayer[i];
-    l^.Q := fFile.F32(p + 'attention.self.query.weight', [h, h]);
+    l^.Q := InferWeight(fFile.F32(p + 'attention.self.query.weight', [h, h]), idtF32);
     l^.QBias := fFile.F32(p + 'attention.self.query.bias', [h]);
-    l^.K := fFile.F32(p + 'attention.self.key.weight', [h, h]);
+    l^.K := InferWeight(fFile.F32(p + 'attention.self.key.weight', [h, h]), idtF32);
     l^.KBias := fFile.F32(p + 'attention.self.key.bias', [h]);
-    l^.V := fFile.F32(p + 'attention.self.value.weight', [h, h]);
+    l^.V := InferWeight(fFile.F32(p + 'attention.self.value.weight', [h, h]), idtF32);
     l^.VBias := fFile.F32(p + 'attention.self.value.bias', [h]);
-    l^.AttnOut := fFile.F32(p + 'attention.output.dense.weight', [h, h]);
+    l^.AttnOut := InferWeight(fFile.F32(p + 'attention.output.dense.weight',
+      [h, h]), idtF32);
     l^.AttnOutBias := fFile.F32(p + 'attention.output.dense.bias', [h]);
     l^.AttnNorm := fFile.F32(p + 'attention.output.LayerNorm.weight', [h]);
     l^.AttnNormBias := fFile.F32(p + 'attention.output.LayerNorm.bias', [h]);
-    l^.Inter := fFile.F32(p + 'intermediate.dense.weight', [f, h]);
+    l^.Inter := InferWeight(fFile.F32(p + 'intermediate.dense.weight', [f, h]),
+      idtF32);
     l^.InterBias := fFile.F32(p + 'intermediate.dense.bias', [f]);
-    l^.Output := fFile.F32(p + 'output.dense.weight', [h, f]);
+    l^.Output := InferWeight(fFile.F32(p + 'output.dense.weight', [h, f]), idtF32);
     l^.OutputBias := fFile.F32(p + 'output.dense.bias', [h]);
     l^.OutNorm := fFile.F32(p + 'output.LayerNorm.weight', [h]);
     l^.OutNormBias := fFile.F32(p + 'output.LayerNorm.bias', [h]);
@@ -283,15 +452,15 @@ procedure TXlmrModel.Forward(aCtx: TXlmrContext; aIds: PIntegerArray;
 var
   r, c, i, n, h, f, id, seen, off: PtrInt;
   l: ^TXlmrLayer;
-  dst, wordRow, posRow: PSingleArray;
+  dst, posRow: PSingleArray;
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
   if (aRows <= 0) or (aWidth <= 0) then
     EInferError.RaiseUtf8('%.Forward: empty batch', [self]);
-  if aWidth > fConfig.MaxPositions - fConfig.PadId - 1 then
+  if aWidth > MaxTokens then
     EInferError.RaiseUtf8('%.Forward: % tokens exceed the % positions',
-      [self, aWidth, fConfig.MaxPositions - fConfig.PadId - 1]);
+      [self, aWidth, MaxTokens]);
   // every buffer is tokens * max(hidden, intermediate) singles, the attention
   // scratch width * width: refuse a batch whose size would overflow PtrInt (a
   // real limit on 32-bit targets)
@@ -305,7 +474,8 @@ begin
   n := aRows * aWidth;
   h := fConfig.Hidden;
   f := fConfig.Intermediate;
-  // keep mask and XLM-R positions: per row, real tokens count from pad + 1
+  // keep mask and positions: per row, real tokens count from FirstPosition;
+  // padding takes the row before it (pad for XLM-R), masked anyway
   for r := 0 to aRows - 1 do
   begin
     seen := 0;
@@ -321,11 +491,11 @@ begin
       else
         aCtx.fKeep[i] := ord(id <> fConfig.PadId);
       if id = fConfig.PadId then
-        aCtx.fPos[i] := fConfig.PadId
+        aCtx.fPos[i] := MaxPtrInt(fConfig.FirstPosition - 1, 0)
       else
       begin
+        aCtx.fPos[i] := fConfig.FirstPosition + seen;
         inc(seen);
-        aCtx.fPos[i] := seen + fConfig.PadId;
       end;
     end;
   end;
@@ -333,10 +503,10 @@ begin
   for i := 0 to n - 1 do
   begin
     dst := @aCtx.fHidden[i * h];
-    wordRow := @fWord^[aIds^[i] * h];
+    InferRowToF32(fWord.Data, fWord.DType, aIds^[i], h, dst);
     posRow := @fPosition^[aCtx.fPos[i] * h];
     for c := 0 to h - 1 do
-      dst^[c] := wordRow^[c] + posRow^[c] + fTokenType^[c];
+      dst^[c] := dst^[c] + posRow^[c] + fTokenType^[c];
   end;
   fBackend.LayerNorm(pointer(aCtx.fHidden), n, h, fEmbNorm, fEmbNormBias,
     fConfig.LayerNormEps, pointer(aCtx.fHidden));

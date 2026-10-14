@@ -172,6 +172,7 @@ the server and its tools do not know which transport they are behind. Full examp
 bash scripts/run-fpc-tests.sh        # MCP suite
 bash scripts/run-fpc-llm-tests.sh    # LLM suite
 bash scripts/run-fpc-infer-tests.sh  # native inference suite (reference data, no model needed)
+LAI_INFER_GATE=1 bash scripts/run-fpc-infer-tests.sh  # + BGE-M3 Q8 corpus gate (nDCG@10, ~1 h scalar)
 bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agent.lpr)
 # VERBOSE=1 for the full compiler/test log; logs land in bin/fpc/
 ```
@@ -250,7 +251,7 @@ provider or runtime, not only against tests.
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | pgvector backend | **not built** | phase E — the `IVectorStore` seam exists, the implementation does not |
 | Ollama embedder | **not built** | phase E |
-| Native inference engine (embeddings, then LLMs) | **planned** | own Pascal engine, replaces `lembed` and every foreign `.so` — [docs/native-inference.md](docs/native-inference.md) |
+| Native inference engine (embeddings, then LLMs) | **in progress** | own Pascal engine, replaces `lembed` and every foreign `.so`; BGE-M3 runs from the same Q8 GGUF as lembed and passes its gates (not the default yet) — [docs/native-inference.md](docs/native-inference.md) |
 
 Two things follow from the "needs a native library" rows: those features are **optional at
 runtime** (missing library ⇒ skip, never crash), and the libraries are **not in git** —

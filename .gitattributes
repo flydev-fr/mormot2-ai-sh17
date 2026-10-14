@@ -28,3 +28,4 @@ tests/data/**/*.json text eol=lf
 # safetensors-Gewichte, jede Umwandlung zerstoert sie.
 *.bin binary
 *.safetensors binary
+*.gguf binary

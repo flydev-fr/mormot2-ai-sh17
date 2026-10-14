@@ -426,7 +426,7 @@ begin
   w := fOps.F32('linear/weight', n);
   b := fOps.F32('linear/bias', n);
   SetLength(y, 12);
-  fCpu.Linear(x, 3, 5, w, 4, b, pointer(y));
+  fCpu.Linear(x, 3, 5, InferWeight(w, idtF32), 4, b, pointer(y));
   CheckOp('linear/y', pointer(y), 1e-6, 1e-6);
   // layernorm, including a nearly constant and a constant row
   x := fOps.F32('layernorm/x', n);

@@ -9,6 +9,12 @@ set -euo pipefail
 #
 #   run-fpc-infer-tests.sh            # bauen + ausfuehren
 #   VERBOSE=1 run-fpc-infer-tests.sh  # vollen Compiler-/Testlog zeigen
+#   LAI_INFER_GATE=1 run-fpc-infer-tests.sh  # + Korpus-Gate BGE-M3 Q8 (nDCG@10,
+#                                    # skalar rund 1 h; braucht das lembed-GGUF)
+#
+# Mit vorhandenen Modellen (vendor/models/bge-m3/, vendor/models/bge-m3-q8_0.gguf)
+# laufen zusaetzlich die Tests gegen das echte BGE-M3, sonst SKIP;
+# LAI_REQUIRE_MODEL=1 macht ein fehlendes Modell zum Fehler.
 #
 # Logs: bin/fpc/infer.tests.buildlog (Compiler)
 #       bin/fpc/infer.tests.log      (Testlauf)

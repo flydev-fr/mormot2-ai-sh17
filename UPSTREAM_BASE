@@ -76,6 +76,13 @@ never a build input.
   Ported:  src/llama-vocab.cpp, llm_tokenizer_ugm + llm_tokenizer_ugm_session
            (charsmap XCDA lookup, whitespace folding, Viterbi, unknown merging)
            -> src/infer/mormot.ai.infer.tokenizer.ugm.pas
+  Followed (format and arithmetic, written anew - no code taken):
+           docs/gguf.md (GGUF v3 layout) -> src/infer/mormot.ai.infer.loader.gguf.pas;
+           the Q8_0 block (FP16 scale + 32 int8) and ggml-cpu's activation
+           quantization (d = amax/127, ties to even) and block dot product
+           -> mormot.ai.infer.tensor / mormot.ai.infer.backend.cpu. Checked
+           against the ggml build of the lembed oracle (sha256 below), not
+           against this commit's sources.
 
 ## Native inference engine: reference data and models
 
@@ -95,5 +102,13 @@ never a build input.
     sentencepiece.bpe.model  cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865
   Converted: vendor/models/bge-m3/model.safetensors (F32, gitignored)
              993b2248881724788dcab8c644a91dfd63584b6e5604ff2037cb5541e1e38e7e
+  Oracle (phase 1b, reference contract v1 - tests/data/embed-de/reference):
+    sqlite-lembed v0.0.1-alpha.8-landrix.1 with its llama.cpp/ggml build in
+    vendor/sqlite-ext/aarch64-linux (gitignored):
+      libggml-base.so  8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893
+      libggml-cpu.so   c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659
+    vendor/models/bge-m3-q8_0.gguf (gitignored)
+                     aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173
+    Datasets from it: q8, tiny-gguf, lembed-tokens.
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.

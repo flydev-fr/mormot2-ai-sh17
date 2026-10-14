@@ -1,0 +1,249 @@
+{
+ "dataset": "tiny-gguf",
+ "note": "tiny-xlmr converted like llama.cpp converts XLM-R (architecture bert, positions from 0, Q8_0 matrices and word embedding); expected states use ggml's Q8_0 kernels (activations quantized per row) for every matmul, float64 for the rest, f32 after each operation, exact (erf) GELU",
+ "model": {
+  "file": "model.gguf",
+  "sha256": "0d921d261a61da403fb961c9bc917ea99e41e21381c859949d8b9f89e52c1df3",
+  "from": "tiny-xlmr/model.safetensors"
+ },
+ "ggml": {
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "environment": {
+  "created_utc": "2026-10-14T13:13:29Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 10932,
+  "sha256": "7bd6e50dcb93136d4bb42261daf1e1f4098e1f3d76e215a89ae1c6d6cce79802",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "single/0/input_ids",
+   "dtype": "i32",
+   "shape": [
+    3
+   ],
+   "offset": 0,
+   "bytes": 12,
+   "sha256": "14eebb0b1651c66dd22a4a622afa40ec3c87d395187fa78442587491fa13fc33"
+  },
+  {
+   "name": "single/0/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 12,
+   "bytes": 384,
+   "sha256": "d846d0c335c5853b8c554b2c48e58f6fbc6d402513bc3482d27026f49350aebd"
+  },
+  {
+   "name": "single/0/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 396,
+   "bytes": 384,
+   "sha256": "9139890bd9e73e41a81d54761ff18f555c747dfadfcdc122eecc7b588c97ac43"
+  },
+  {
+   "name": "single/0/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 780,
+   "bytes": 384,
+   "sha256": "506de1d7970efd9a20ef7622c67cfd47845a4e510aaa7c1415704e5488810edc"
+  },
+  {
+   "name": "single/0/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 1164,
+   "bytes": 128,
+   "sha256": "0d8b70de25bfcda72f27fe08612be20149d645af84e8a815ce06f1c108c82e48"
+  },
+  {
+   "name": "single/1/input_ids",
+   "dtype": "i32",
+   "shape": [
+    6
+   ],
+   "offset": 1292,
+   "bytes": 24,
+   "sha256": "3fe99cd4d625377317422a559f582c69fff1f495698d0006c3a5773d0dea3959"
+  },
+  {
+   "name": "single/1/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 1316,
+   "bytes": 768,
+   "sha256": "9066b911ac7c09cb23ff59fca32b868c75bec91202e9ed641a1ecddf8e408bdd"
+  },
+  {
+   "name": "single/1/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 2084,
+   "bytes": 768,
+   "sha256": "92ab1b29e41a35b1d7dc30f1bca67d4b0762d96dd93c7fb3b231a6139d44f946"
+  },
+  {
+   "name": "single/1/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 2852,
+   "bytes": 768,
+   "sha256": "10cd939213d461736297e1258359a149a63894b07fb9c7289a91ae45d8f8d04e"
+  },
+  {
+   "name": "single/1/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 3620,
+   "bytes": 128,
+   "sha256": "7653b18178d6f4b35067a2dcea313b18bba4ca1028d12983e98620746c9fdf8e"
+  },
+  {
+   "name": "single/2/input_ids",
+   "dtype": "i32",
+   "shape": [
+    9
+   ],
+   "offset": 3748,
+   "bytes": 36,
+   "sha256": "5df7294264ce8149f171a5909fe10e18ce2a853c3bfb1687341a27e1f673ec34"
+  },
+  {
+   "name": "single/2/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 3784,
+   "bytes": 1152,
+   "sha256": "5d06b617cc25c206950381513c9f1336b88a3c758a721e140a711646a467996a"
+  },
+  {
+   "name": "single/2/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 4936,
+   "bytes": 1152,
+   "sha256": "109ae2cc73ddd8a7f452f7c63deef605514e1d376fbaaa928065a5c879b3877c"
+  },
+  {
+   "name": "single/2/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 6088,
+   "bytes": 1152,
+   "sha256": "403da6111f71b5d000dc1e7cf1f3228e7924411ab15f9bddb840b5e527ae6b23"
+  },
+  {
+   "name": "single/2/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 7240,
+   "bytes": 128,
+   "sha256": "6251cc35c2c72646c5ecc4c045bf3f6fe6109738032d1f44d235dc7be53429f0"
+  },
+  {
+   "name": "batch/input_ids",
+   "dtype": "i32",
+   "shape": [
+    3,
+    9
+   ],
+   "offset": 7368,
+   "bytes": 108,
+   "sha256": "f2827cf38194ccd23806c2fca9653cdd85f77d8649324faace0879892dd2b4db"
+  },
+  {
+   "name": "batch/0/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 7476,
+   "bytes": 1152,
+   "sha256": "52a46861d50a97c22eb48058f062a141560595a90c7612715b1b1452473debd2",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/1/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 8628,
+   "bytes": 1152,
+   "sha256": "325983c2ae57a03170eed846e58f91c501b2380e6058d40db49a984e2a2e862e",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/2/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 9780,
+   "bytes": 1152,
+   "sha256": "403da6111f71b5d000dc1e7cf1f3228e7924411ab15f9bddb840b5e527ae6b23",
+   "note": "padded positions are not meaningful"
+  }
+ ]
+}
