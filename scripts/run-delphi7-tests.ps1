@@ -9,7 +9,7 @@
   Rtti.RegisterFromText, AnsiString-Text-I/O und Win32 verhalten sich anders.
 
   Beispiele:
-    .\scripts\run-delphi7-tests.ps1                 # MCP- + LLM-Suite
+    .\scripts\run-delphi7-tests.ps1                 # alle Suiten (MCP, LLM, Inferenz)
     .\scripts\run-delphi7-tests.ps1 -Suite mcp      # eine Suite
     .\scripts\run-delphi7-tests.ps1 -ShowAll        # voller Compiler- + Testlog
     .\scripts\run-delphi7-tests.ps1 -Delphi7 'C:\Borland\Delphi7' -FastMM4 'C:\lib\FastMM4'
@@ -25,7 +25,7 @@
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('all', 'mcp', 'llm')]
+  [ValidateSet('all', 'mcp', 'llm', 'infer')]
   [string]$Suite = 'all',
   [string]$Delphi7 = $env:DELPHI7,
   [string]$FastMM4 = $env:FASTMM4,
@@ -65,7 +65,7 @@ $src = Join-Path $mormot2 'src'
 $units = @((Join-Path $Delphi7 'Lib'), (Join-Path $Delphi7 'Lib\Obj'), $FastMM4, $src) +
   @('core', 'lib', 'crypt', 'net', 'db', 'orm', 'rest', 'soa', 'app', 'misc', 'script', 'tools\mget' |
     ForEach-Object { Join-Path $src $_ }) +
-  @((Join-Path $lai 'src'), (Join-Path $lai 'tests'), (Join-Path $lai 'vendor'))
+  @((Join-Path $lai 'src'), (Join-Path $lai 'src\infer'), (Join-Path $lai 'tests'), (Join-Path $lai 'vendor'))
 $inc = @($src, (Join-Path $src 'core'), (Join-Path $src 'net'), $FastMM4)
 $out = Join-Path $lai 'bin\delphi7'
 $dcu = Join-Path $out 'dcu'
@@ -88,7 +88,7 @@ if (-not $env:SQLITE_EXT_DIR) {
   Write-Host '>>> kein Win32-vec0: der vec0-Test der LLM-Suite wird uebersprungen'
 }
 
-$suites = if ($Suite -eq 'all') { @('mcp', 'llm') } else { @($Suite) }
+$suites = if ($Suite -eq 'all') { @('mcp', 'llm', 'infer') } else { @($Suite) }
 $failed = 0
 foreach ($s in $suites) {
   $prog = "$s.tests"

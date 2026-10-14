@@ -1,0 +1,197 @@
+{
+ "dataset": "ops",
+ "environment": {
+  "created_utc": "2026-10-14T11:01:28Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "note": "inputs f32, outputs computed in float64 and stored as f32 (round to nearest)",
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 1148,
+  "sha256": "1b37ce04b4bccf1e59e21d32a45c29d071f2badd9f33e8cf2d91f03043ba2835",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "linear/x",
+   "dtype": "f32",
+   "shape": [
+    3,
+    5
+   ],
+   "offset": 0,
+   "bytes": 60,
+   "sha256": "27bfa170389a06ef46828912c66e5ea512f39e8164906b133db2e669d3d2b96b"
+  },
+  {
+   "name": "linear/weight",
+   "dtype": "f32",
+   "shape": [
+    4,
+    5
+   ],
+   "offset": 60,
+   "bytes": 80,
+   "sha256": "34ea2f7e219765e37d84ad22e80120147ea10a4db6d8b2476e6de1e42d028cf5",
+   "note": "[out, in], used transposed"
+  },
+  {
+   "name": "linear/bias",
+   "dtype": "f32",
+   "shape": [
+    4
+   ],
+   "offset": 140,
+   "bytes": 16,
+   "sha256": "8dd06dae38faac94eebede68857b265e3fcfe496ce9801ed1a8c82124dae2b75"
+  },
+  {
+   "name": "linear/y",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ],
+   "offset": 156,
+   "bytes": 48,
+   "sha256": "3150db537c4a12567ebf0748a0e5bac9b5a42da8697a59aad9e1923cde39eca5"
+  },
+  {
+   "name": "layernorm/x",
+   "dtype": "f32",
+   "shape": [
+    4,
+    8
+   ],
+   "offset": 204,
+   "bytes": 128,
+   "sha256": "c8a258557f703eace518739e2366332c1cb758442a9fcf84770f988c532cdd51"
+  },
+  {
+   "name": "layernorm/gamma",
+   "dtype": "f32",
+   "shape": [
+    8
+   ],
+   "offset": 332,
+   "bytes": 32,
+   "sha256": "952ee7d10a14ff96e69848855aa40a1ac4aabbbd1b8dd6fc51d6371c60957fdb"
+  },
+  {
+   "name": "layernorm/beta",
+   "dtype": "f32",
+   "shape": [
+    8
+   ],
+   "offset": 364,
+   "bytes": 32,
+   "sha256": "cc378840d4cafe3759af54c85ea9f9e8bdcb8125613bb0a110772a2bd70923a8"
+  },
+  {
+   "name": "layernorm/y",
+   "dtype": "f32",
+   "shape": [
+    4,
+    8
+   ],
+   "offset": 396,
+   "bytes": 128,
+   "sha256": "7380acfbbffde898bfaaa00cc4383282ab548431cd20553c3d4d1361ec30360f",
+   "note": "eps = 1e-5"
+  },
+  {
+   "name": "softmax/scores",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ],
+   "offset": 524,
+   "bytes": 72,
+   "sha256": "2722e251e0981434950c4bf92e46180805cc754571413f73367cc450ddafdf11"
+  },
+  {
+   "name": "softmax/keep",
+   "dtype": "i32",
+   "shape": [
+    3,
+    6
+   ],
+   "offset": 596,
+   "bytes": 72,
+   "sha256": "9694d29017b40d6f3e9a1af57407181f473ee2a12e826a15197b0d2c7c010ed4",
+   "note": "1 = attend, 0 = masked"
+  },
+  {
+   "name": "softmax/y",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ],
+   "offset": 668,
+   "bytes": 72,
+   "sha256": "839f68798b5bc00fd9c54223d8b838d6bed342b61eea96b4f1e3217acdd9df4e",
+   "note": "masked entries are exactly 0"
+  },
+  {
+   "name": "gelu/x",
+   "dtype": "f32",
+   "shape": [
+    30
+   ],
+   "offset": 740,
+   "bytes": 120,
+   "sha256": "beeee5d0c22f61acd1b2578cc1cd38f986cda46024e1ede22f34c0debf11bc3a"
+  },
+  {
+   "name": "gelu/y",
+   "dtype": "f32",
+   "shape": [
+    30
+   ],
+   "offset": 860,
+   "bytes": 120,
+   "sha256": "52a3849e765451386e92293b05d86dd69ea1f257277baf0976c917889f127ccd",
+   "note": "exact: 0.5 x (1 + erf(x / sqrt 2)), not the tanh approximation"
+  },
+  {
+   "name": "l2/x",
+   "dtype": "f32",
+   "shape": [
+    3,
+    7
+   ],
+   "offset": 980,
+   "bytes": 84,
+   "sha256": "9dccc9d063d0d02d8c44f7e295c3a54516a0dc1778acc99f5dcf377c9001fd2e",
+   "note": "row 2 has a tiny norm (1e-20 scale): must not underflow to NaN"
+  },
+  {
+   "name": "l2/y",
+   "dtype": "f32",
+   "shape": [
+    3,
+    7
+   ],
+   "offset": 1064,
+   "bytes": 84,
+   "sha256": "3bcc90409a872c851683eabe52e5f855c14bb29ef6642900362bdbd312cb9abf"
+  }
+ ]
+}

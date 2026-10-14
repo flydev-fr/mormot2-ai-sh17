@@ -1,0 +1,551 @@
+{
+ "dataset": "tiny-xlmr",
+ "note": "seeded random XLM-R with the BGE-M3 conventions (pad 1, bos 0, eos 2, type_vocab 1, eps 1e-5, exact GELU, absolute positions); the weights in model.safetensors are the contract, the seed only documents their origin",
+ "seed": 20261014,
+ "weights": {
+  "file": "model.safetensors",
+  "sha256": "bfca70a891c11f802ff32606cee4c42a31ece6fbde8ff33d5d9812f98b127cc1",
+  "tensors": [
+   [
+    "embeddings.LayerNorm.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "embeddings.LayerNorm.weight",
+    [
+     32
+    ]
+   ],
+   [
+    "embeddings.position_embeddings.weight",
+    [
+     40,
+     32
+    ]
+   ],
+   [
+    "embeddings.token_type_embeddings.weight",
+    [
+     1,
+     32
+    ]
+   ],
+   [
+    "embeddings.word_embeddings.weight",
+    [
+     64,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.output.LayerNorm.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.output.LayerNorm.weight",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.output.dense.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.output.dense.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.key.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.key.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.query.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.query.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.value.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.attention.self.value.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.intermediate.dense.bias",
+    [
+     64
+    ]
+   ],
+   [
+    "encoder.layer.0.intermediate.dense.weight",
+    [
+     64,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.output.LayerNorm.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.output.LayerNorm.weight",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.output.dense.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.0.output.dense.weight",
+    [
+     32,
+     64
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.output.LayerNorm.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.output.LayerNorm.weight",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.output.dense.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.output.dense.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.key.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.key.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.query.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.query.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.value.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.attention.self.value.weight",
+    [
+     32,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.intermediate.dense.bias",
+    [
+     64
+    ]
+   ],
+   [
+    "encoder.layer.1.intermediate.dense.weight",
+    [
+     64,
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.output.LayerNorm.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.output.LayerNorm.weight",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.output.dense.bias",
+    [
+     32
+    ]
+   ],
+   [
+    "encoder.layer.1.output.dense.weight",
+    [
+     32,
+     64
+    ]
+   ]
+  ]
+ },
+ "config_sha256": "32249c3038f65594b74507b1408a075f0a20e62e2a7a7a854e3e719f554a814e",
+ "environment": {
+  "created_utc": "2026-10-14T11:01:28Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 11988,
+  "sha256": "7a388b2f790ce40d50231944a5289c4b849d697c62eeda57f77599e21f4f9d59",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "single/0/input_ids",
+   "dtype": "i32",
+   "shape": [
+    3
+   ],
+   "offset": 0,
+   "bytes": 12,
+   "sha256": "14eebb0b1651c66dd22a4a622afa40ec3c87d395187fa78442587491fa13fc33"
+  },
+  {
+   "name": "single/0/position_ids",
+   "dtype": "i32",
+   "shape": [
+    3
+   ],
+   "offset": 12,
+   "bytes": 12,
+   "sha256": "a10494d90314704e24ca5786f6376a6097558f10bb7880b539c8b80312dca080"
+  },
+  {
+   "name": "single/0/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 24,
+   "bytes": 384,
+   "sha256": "06e7280edd2803cb3845ec062ffdee7e1cd350856464678890842f3e9bbb3bda"
+  },
+  {
+   "name": "single/0/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 408,
+   "bytes": 384,
+   "sha256": "0deb5cce60791ff7c149aa9245cee18b30cce9a3652e093f206a442bfc2364bf"
+  },
+  {
+   "name": "single/0/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 792,
+   "bytes": 384,
+   "sha256": "f85d28b7d33d6098068093484181d3d756707603f6bddb64d3e8e77570868b4d"
+  },
+  {
+   "name": "single/0/cls",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 1176,
+   "bytes": 128,
+   "sha256": "502f1edf65e2ce6544b548d9388e3f69914b3ed11c060167856a261a0408a28c"
+  },
+  {
+   "name": "single/0/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 1304,
+   "bytes": 128,
+   "sha256": "f0ffbb23142e13363ebf672131f75169cd664418b72e6a6c647640e2e3f5cd43"
+  },
+  {
+   "name": "single/1/input_ids",
+   "dtype": "i32",
+   "shape": [
+    6
+   ],
+   "offset": 1432,
+   "bytes": 24,
+   "sha256": "3fe99cd4d625377317422a559f582c69fff1f495698d0006c3a5773d0dea3959"
+  },
+  {
+   "name": "single/1/position_ids",
+   "dtype": "i32",
+   "shape": [
+    6
+   ],
+   "offset": 1456,
+   "bytes": 24,
+   "sha256": "4ba701952eedc19088f529500d3dc367a4e5091c0df14113b650eb85d30be463"
+  },
+  {
+   "name": "single/1/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 1480,
+   "bytes": 768,
+   "sha256": "6a83becb49096e094d8dbd94b97ab877f9b1ec4b5c666bed50cf208513651069"
+  },
+  {
+   "name": "single/1/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 2248,
+   "bytes": 768,
+   "sha256": "1df2392b8fa7fd2b423ee1f516439c9782fe25219345a0f09fbe0e389fe9e1d7"
+  },
+  {
+   "name": "single/1/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ],
+   "offset": 3016,
+   "bytes": 768,
+   "sha256": "5c4d16fb59572dff075f81153f9bd20812b8c28d57e684c240af53c6481b45b2"
+  },
+  {
+   "name": "single/1/cls",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 3784,
+   "bytes": 128,
+   "sha256": "e436eeabd285c8e634c54f8cc14a8eefbe860177c7c8dfefd36c291debc3291c"
+  },
+  {
+   "name": "single/1/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 3912,
+   "bytes": 128,
+   "sha256": "b68c01bbceea310e28df9ad209d8486076fa158178aedf13d213d826d3a0151b"
+  },
+  {
+   "name": "single/2/input_ids",
+   "dtype": "i32",
+   "shape": [
+    9
+   ],
+   "offset": 4040,
+   "bytes": 36,
+   "sha256": "5df7294264ce8149f171a5909fe10e18ce2a853c3bfb1687341a27e1f673ec34"
+  },
+  {
+   "name": "single/2/position_ids",
+   "dtype": "i32",
+   "shape": [
+    9
+   ],
+   "offset": 4076,
+   "bytes": 36,
+   "sha256": "bc2bdb6bfeb12a43c44c41281a6f5f3e30ee639efc00a17c3ae89bb24c750c61"
+  },
+  {
+   "name": "single/2/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 4112,
+   "bytes": 1152,
+   "sha256": "c228c5dea310d352d4dbce09c52f0257038e4ee7ec9e933876a2aec36a475528"
+  },
+  {
+   "name": "single/2/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 5264,
+   "bytes": 1152,
+   "sha256": "8b2ad6cf4f979b2257afcb1fde0804c5bccb2f594cb6bf1fbb85b6ba6707f35f"
+  },
+  {
+   "name": "single/2/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    9,
+    32
+   ],
+   "offset": 6416,
+   "bytes": 1152,
+   "sha256": "511beb984093a4264e0f81f640f6c8dd6caad70a2bb4d1039e7fdd972b0387d7"
+  },
+  {
+   "name": "single/2/cls",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 7568,
+   "bytes": 128,
+   "sha256": "24218c11c9d33a7652c23c17e65fa81b05fb8018773f55f4e8d8bbb7f5f5b026"
+  },
+  {
+   "name": "single/2/embedding",
+   "dtype": "f32",
+   "shape": [
+    32
+   ],
+   "offset": 7696,
+   "bytes": 128,
+   "sha256": "3968f90e5f8165bf8111455c5f41079a57727b667e4fe0be29d3f2844f0d736a"
+  },
+  {
+   "name": "batch/input_ids",
+   "dtype": "i32",
+   "shape": [
+    3,
+    9
+   ],
+   "offset": 7824,
+   "bytes": 108,
+   "sha256": "f2827cf38194ccd23806c2fca9653cdd85f77d8649324faace0879892dd2b4db"
+  },
+  {
+   "name": "batch/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    3,
+    9
+   ],
+   "offset": 7932,
+   "bytes": 108,
+   "sha256": "34df681fc1f3c7c61f2d17eeea300a7d6751db582fdf5e4e91dde0bac3bb4a36"
+  },
+  {
+   "name": "batch/position_ids",
+   "dtype": "i32",
+   "shape": [
+    3,
+    9
+   ],
+   "offset": 8040,
+   "bytes": 108,
+   "sha256": "1523c3ce867d0116bdd97970c09a18818de3456c15e96f02395770b383172d6b"
+  },
+  {
+   "name": "batch/hidden.last",
+   "dtype": "f32",
+   "shape": [
+    3,
+    9,
+    32
+   ],
+   "offset": 8148,
+   "bytes": 3456,
+   "sha256": "dd603ecc06ef506e45388433d103c26238ede55757b503cac39a5df5a7ef6b2f"
+  },
+  {
+   "name": "batch/embedding",
+   "dtype": "f32",
+   "shape": [
+    3,
+    32
+   ],
+   "offset": 11604,
+   "bytes": 384,
+   "sha256": "38c90e416f21ac5f01f58f749b0f53d7c0f00497077fb0080260979d809af597"
+  }
+ ]
+}

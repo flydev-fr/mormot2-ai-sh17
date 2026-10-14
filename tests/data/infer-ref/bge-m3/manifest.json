@@ -1,0 +1,2456 @@
+{
+ "dataset": "bge-m3",
+ "model": {
+  "id": "BAAI/bge-m3",
+  "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+  "files": {
+   "config.json": "26159e7ad065073448460117eb24b7a4572f6f4e78eadff65dc0a11c052449fa",
+   "tokenizer.json": "21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08",
+   "tokenizer_config.json": "a62b2b6784f990259fddef5f16388693a8043be4f69179e6a5257eeb3f9abac4",
+   "special_tokens_map.json": "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835",
+   "sentencepiece.bpe.model": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+   "pytorch_model.bin": "b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38",
+   "1_Pooling/config.json": "e54c164a07274f2eb45bb724f54a79d1efcc90c41573887cd9a29aeee0597352",
+   "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+   "sentence_bert_config.json": "eb9b44b13c0f52a3b3685c3b1cbdea1ba8b04bea123b98f61610048940776eb1"
+  },
+  "converted": {
+   "file": "vendor/models/bge-m3/model.safetensors",
+   "sha256": "993b2248881724788dcab8c644a91dfd63584b6e5604ff2037cb5541e1e38e7e",
+   "dtype": "F32",
+   "tensors": 391,
+   "unused_by_dense": [
+    "pooler.dense.bias",
+    "pooler.dense.weight"
+   ]
+  },
+  "config": {
+   "model_type": "xlm-roberta",
+   "vocab_size": 250002,
+   "hidden_size": 1024,
+   "num_hidden_layers": 24,
+   "num_attention_heads": 16,
+   "intermediate_size": 4096,
+   "hidden_act": "gelu",
+   "max_position_embeddings": 8194,
+   "type_vocab_size": 1,
+   "layer_norm_eps": 1e-05,
+   "pad_token_id": 1,
+   "bos_token_id": 0,
+   "eos_token_id": 2
+  }
+ },
+ "pipeline": {
+  "pooling": "cls of last_hidden_state (not pooler_output)",
+  "normalize": "l2",
+  "position_ids": "cumsum(ids != pad) * (ids != pad) + pad",
+  "token_type_ids": "all 0 (its embedding row is still added)",
+  "tokenizer": "SentencePiece (sentencepiece.bpe.model) with fairseq ids: id + 1, <unk> 0->3, <s> 1->0, </s> 2->2; <s> text </s>; no truncation; batch padded right",
+  "parse_special": false,
+  "hf_tokenizer_check": "equal to the HF tokenizer for every text without literal special-token text (checked)",
+  "sentence_transformers": {
+   "pooling": {
+    "pooling_mode_cls_token": true,
+    "pooling_mode_mean_tokens": false,
+    "pooling_mode_max_tokens": false,
+    "pooling_mode_mean_sqrt_len_tokens": false
+   },
+   "modules": [
+    "sentence_transformers.models.Transformer",
+    "sentence_transformers.models.Pooling",
+    "sentence_transformers.models.Normalize"
+   ]
+  }
+ },
+ "environment": {
+  "created_utc": "2026-10-14T11:08:52Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "cases": [
+  {
+   "id": "empty",
+   "text": "",
+   "note": "no text: only <s> </s>",
+   "tokens": 2
+  },
+  {
+   "id": "whitespace",
+   "text": "   ",
+   "note": "whitespace only",
+   "tokens": 2
+  },
+  {
+   "id": "trade",
+   "text": "Kupferrohr 15 mm in Wand verlegen",
+   "note": "short German trade text",
+   "tokens": 12
+  },
+  {
+   "id": "unicode",
+   "text": "Fuge \u2265 3 mm, Gr\u00f6\u00dfe 30\u00d760, 5 \u20ac",
+   "note": ">=, umlaut, sharp s, multiplication sign, euro (exactly 16 tokens)",
+   "tokens": 16
+  },
+  {
+   "id": "multilingual",
+   "text": "Install the radiator. \u0420\u0430\u0434\u0438\u0430\u0442\u043e\u0440. \u6563\u70ed\u5668",
+   "note": "English, Russian, Chinese",
+   "tokens": 13
+  },
+  {
+   "id": "special_literal",
+   "text": "Text mit <s> und <pad>",
+   "note": "literal special-token text: plain text for the reference tokenizer (parse_special=false); HF differs, see tokenizer_checks",
+   "tokens": 11
+  }
+ ],
+ "batch": {
+  "texts": [
+   "Kupferrohr 15 mm in Wand verlegen",
+   "Heizk\u00f6rper montieren"
+  ],
+  "max_abs_diff_to_single": [
+   0.0,
+   1.2665987014770508e-07
+  ]
+ },
+ "tokenizer_checks": [
+  {
+   "text": "<s>",
+   "reference": [
+    4426,
+    7,
+    2740
+   ],
+   "hf_default": [
+    0
+   ],
+   "hf_split_special_tokens": [
+    6,
+    0
+   ],
+   "hf_encode_special_tokens": [
+    6,
+    0
+   ]
+  },
+  {
+   "text": "</s>",
+   "reference": [
+    6,
+    42946,
+    7,
+    2740
+   ],
+   "hf_default": [
+    2
+   ],
+   "hf_split_special_tokens": [
+    6,
+    2
+   ],
+   "hf_encode_special_tokens": [
+    6,
+    2
+   ]
+  },
+  {
+   "text": "<pad>",
+   "reference": [
+    4426,
+    4299,
+    2740
+   ],
+   "hf_default": [
+    1
+   ],
+   "hf_split_special_tokens": [
+    6,
+    1
+   ],
+   "hf_encode_special_tokens": [
+    6,
+    1
+   ]
+  },
+  {
+   "text": "<unk>",
+   "reference": [
+    4426,
+    3678,
+    2740
+   ],
+   "hf_default": [
+    3
+   ],
+   "hf_split_special_tokens": [
+    6,
+    3
+   ],
+   "hf_encode_special_tokens": [
+    6,
+    3
+   ]
+  },
+  {
+   "text": "<mask>",
+   "reference": [
+    4426,
+    1510,
+    92,
+    2740
+   ],
+   "hf_default": [
+    250001
+   ],
+   "hf_split_special_tokens": [
+    6,
+    250001
+   ],
+   "hf_encode_special_tokens": [
+    6,
+    250001
+   ]
+  },
+  {
+   "text": "a<s>b",
+   "reference": [
+    10,
+    16093,
+    7,
+    2740,
+    275
+   ],
+   "hf_default": [
+    10,
+    0,
+    876
+   ],
+   "hf_split_special_tokens": [
+    10,
+    0,
+    275
+   ],
+   "hf_encode_special_tokens": [
+    10,
+    0,
+    275
+   ]
+  }
+ ],
+ "tokenizer_checks_note": "reference = SentencePiece, literal text stays text (parse_special=false, what the native tokenizer must do); hf_default, hf_split_special_tokens and hf_encode_special_tokens still map '<s>' to id 0, because '<s>' is a piece of the Unigram vocabulary",
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 5899200,
+  "sha256": "6ca8197c50a1cc501d7d7c580a467581ea81edd14f6bff1170c060e9bcc2a495",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "case/empty/input_ids",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 0,
+   "bytes": 8,
+   "sha256": "2fcd151b8295e8b3bf8ec64ede173523417960a8db6cbc569de9a25a458f9135"
+  },
+  {
+   "name": "case/empty/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 8,
+   "bytes": 8,
+   "sha256": "64ed86b909d6d0502b64b28db0ea1272ffb358e20e9b1d88b63ccb07fa900cf5"
+  },
+  {
+   "name": "case/empty/position_ids",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 16,
+   "bytes": 8,
+   "sha256": "0c40fc912bea3d01b4dbad07de4c8cf177ac0c424bc11d622d2239c0e5988986"
+  },
+  {
+   "name": "case/empty/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 24,
+   "bytes": 8192,
+   "sha256": "29456080c6201c202d71eaf5db2309b33617af70c1d66507dfa6e7cbaf73d7b9",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/empty/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 8216,
+   "bytes": 8192,
+   "sha256": "fb2cc4d3b4435ec1218e998c249a67d40f04cb083497208c3f63eb973057fc71",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/empty/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 16408,
+   "bytes": 8192,
+   "sha256": "3061f47e347d51e6b6ac8720246d3ce0b06f857a4d646192f49ca43cf024e514",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/empty/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 24600,
+   "bytes": 8192,
+   "sha256": "8c8d693918314cfcfd82b249574c126eecce23cc8df6cdb6f6dcd741bf1c185e",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/empty/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 32792,
+   "bytes": 8192,
+   "sha256": "ad33a2f1f35e871544ec0bf7ce39ab3608e43fc097e5dc9eea99d61ab0484f9b",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/empty/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 40984,
+   "bytes": 8192,
+   "sha256": "9607f00d3c0690c9bae39a2260fcdf6065ff3de55071d174305c8a8148258a62",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/empty/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 49176,
+   "bytes": 8192,
+   "sha256": "21f79b90a12c60b2d38df62f4fc18c1ed6b11570915520e41b159f4e193194fc",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/empty/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 57368,
+   "bytes": 8192,
+   "sha256": "5e19a136e3bff9abd2fa5a11d99ce8d7ac690316803de5925f28e2622d195cc5",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/empty/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 65560,
+   "bytes": 8192,
+   "sha256": "9f1f96d0bf60f9b08ebbb323ee2e37a5f6bd4af1e479577cd54b8c86620a2d4a",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/empty/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 73752,
+   "bytes": 8192,
+   "sha256": "06f9ea3c4408ac6187f68399750af49d046f8f0ac781aeae06f3e8fc7105d61f",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/empty/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 81944,
+   "bytes": 8192,
+   "sha256": "1d3dec872a4a1e0f481925e1923dbf0dbd6019c1b21aa5644ebe49c5409561c9",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/empty/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 90136,
+   "bytes": 8192,
+   "sha256": "fb4e735af6f94cc06206d43e3bffa1dfbb19a8d37134052785c27abfbed7c8fd",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/empty/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 98328,
+   "bytes": 8192,
+   "sha256": "2bfe19d1a2b28651be01f26a832b0809c0ba9b20c2dd5fb282e0a5723abb4215",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/empty/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 106520,
+   "bytes": 8192,
+   "sha256": "ecf448f2c3a02d4d29071b90318d2e29cfec622b4bbe1e1646a108d31a3344f4",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/empty/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 114712,
+   "bytes": 8192,
+   "sha256": "81d928726444afcab2a687feb3beab2fdaa231baef660f042fd8e2f7e1637135",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/empty/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 122904,
+   "bytes": 8192,
+   "sha256": "fb2cef5d19960439f95c0199ec6f5687dfd7eb2dfeebf0f7a50d84d8ea31f7f5",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/empty/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 131096,
+   "bytes": 8192,
+   "sha256": "3eabc5f685c1a979cadf73cb3eb8dbc37f5d189ee587c1d32338d64da3a18949",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/empty/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 139288,
+   "bytes": 8192,
+   "sha256": "505e9962431952491540269cb4b9a7a53fc8da82c8e7505f7caf58b60216c635",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/empty/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 147480,
+   "bytes": 8192,
+   "sha256": "61cc320802ad82039500bdb676ecf9680f6cf61240bd8c9e7c87975385ad8305",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/empty/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 155672,
+   "bytes": 8192,
+   "sha256": "920607101540795a75eb77471c8412c26b2db88c1dd6514663436d03f4e50848",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/empty/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 163864,
+   "bytes": 8192,
+   "sha256": "5aa76e848fbfa0b59044d4090f5945ab8f3d3f5dc4c680152e470c6b3b47c6f9",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/empty/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 172056,
+   "bytes": 8192,
+   "sha256": "06b6d14693604a046bbbcadc7f2b720e3428f5b74bf87614be2277c98433dcdc",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/empty/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 180248,
+   "bytes": 8192,
+   "sha256": "daf8f907773008569b2f88e6651ad1b98fee0b24fd0e4c5c6bb089c77077df6a",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/empty/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 188440,
+   "bytes": 8192,
+   "sha256": "ac56bfa0c729dfb110743a0b2f44c36239c62e4765f5c458ceb69b77ae375e0a",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/empty/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 196632,
+   "bytes": 8192,
+   "sha256": "92ee7e1e794dd8eacb0b139becdcddc1c6f7a6830dea150363be4c29129a8f90",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/empty/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 204824,
+   "bytes": 4096,
+   "sha256": "9c9c7797d4d67ee2bf5442ceea023f33b20b2da53498c43346728b3d7619e26f",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/empty/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 208920,
+   "bytes": 4096,
+   "sha256": "b95331f505f6e24810f5c89818dd57860b8a5143938b2758812e555c326cac3d",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "case/whitespace/input_ids",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 213016,
+   "bytes": 8,
+   "sha256": "2fcd151b8295e8b3bf8ec64ede173523417960a8db6cbc569de9a25a458f9135"
+  },
+  {
+   "name": "case/whitespace/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 213024,
+   "bytes": 8,
+   "sha256": "64ed86b909d6d0502b64b28db0ea1272ffb358e20e9b1d88b63ccb07fa900cf5"
+  },
+  {
+   "name": "case/whitespace/position_ids",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 213032,
+   "bytes": 8,
+   "sha256": "0c40fc912bea3d01b4dbad07de4c8cf177ac0c424bc11d622d2239c0e5988986"
+  },
+  {
+   "name": "case/whitespace/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 213040,
+   "bytes": 8192,
+   "sha256": "29456080c6201c202d71eaf5db2309b33617af70c1d66507dfa6e7cbaf73d7b9",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/whitespace/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 221232,
+   "bytes": 8192,
+   "sha256": "fb2cc4d3b4435ec1218e998c249a67d40f04cb083497208c3f63eb973057fc71",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/whitespace/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 229424,
+   "bytes": 8192,
+   "sha256": "3061f47e347d51e6b6ac8720246d3ce0b06f857a4d646192f49ca43cf024e514",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/whitespace/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 237616,
+   "bytes": 8192,
+   "sha256": "8c8d693918314cfcfd82b249574c126eecce23cc8df6cdb6f6dcd741bf1c185e",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/whitespace/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 245808,
+   "bytes": 8192,
+   "sha256": "ad33a2f1f35e871544ec0bf7ce39ab3608e43fc097e5dc9eea99d61ab0484f9b",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/whitespace/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 254000,
+   "bytes": 8192,
+   "sha256": "9607f00d3c0690c9bae39a2260fcdf6065ff3de55071d174305c8a8148258a62",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/whitespace/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 262192,
+   "bytes": 8192,
+   "sha256": "21f79b90a12c60b2d38df62f4fc18c1ed6b11570915520e41b159f4e193194fc",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/whitespace/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 270384,
+   "bytes": 8192,
+   "sha256": "5e19a136e3bff9abd2fa5a11d99ce8d7ac690316803de5925f28e2622d195cc5",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/whitespace/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 278576,
+   "bytes": 8192,
+   "sha256": "9f1f96d0bf60f9b08ebbb323ee2e37a5f6bd4af1e479577cd54b8c86620a2d4a",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/whitespace/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 286768,
+   "bytes": 8192,
+   "sha256": "06f9ea3c4408ac6187f68399750af49d046f8f0ac781aeae06f3e8fc7105d61f",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/whitespace/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 294960,
+   "bytes": 8192,
+   "sha256": "1d3dec872a4a1e0f481925e1923dbf0dbd6019c1b21aa5644ebe49c5409561c9",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/whitespace/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 303152,
+   "bytes": 8192,
+   "sha256": "fb4e735af6f94cc06206d43e3bffa1dfbb19a8d37134052785c27abfbed7c8fd",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/whitespace/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 311344,
+   "bytes": 8192,
+   "sha256": "2bfe19d1a2b28651be01f26a832b0809c0ba9b20c2dd5fb282e0a5723abb4215",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/whitespace/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 319536,
+   "bytes": 8192,
+   "sha256": "ecf448f2c3a02d4d29071b90318d2e29cfec622b4bbe1e1646a108d31a3344f4",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/whitespace/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 327728,
+   "bytes": 8192,
+   "sha256": "81d928726444afcab2a687feb3beab2fdaa231baef660f042fd8e2f7e1637135",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/whitespace/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 335920,
+   "bytes": 8192,
+   "sha256": "fb2cef5d19960439f95c0199ec6f5687dfd7eb2dfeebf0f7a50d84d8ea31f7f5",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/whitespace/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 344112,
+   "bytes": 8192,
+   "sha256": "3eabc5f685c1a979cadf73cb3eb8dbc37f5d189ee587c1d32338d64da3a18949",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/whitespace/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 352304,
+   "bytes": 8192,
+   "sha256": "505e9962431952491540269cb4b9a7a53fc8da82c8e7505f7caf58b60216c635",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/whitespace/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 360496,
+   "bytes": 8192,
+   "sha256": "61cc320802ad82039500bdb676ecf9680f6cf61240bd8c9e7c87975385ad8305",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/whitespace/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 368688,
+   "bytes": 8192,
+   "sha256": "920607101540795a75eb77471c8412c26b2db88c1dd6514663436d03f4e50848",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/whitespace/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 376880,
+   "bytes": 8192,
+   "sha256": "5aa76e848fbfa0b59044d4090f5945ab8f3d3f5dc4c680152e470c6b3b47c6f9",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/whitespace/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 385072,
+   "bytes": 8192,
+   "sha256": "06b6d14693604a046bbbcadc7f2b720e3428f5b74bf87614be2277c98433dcdc",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/whitespace/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 393264,
+   "bytes": 8192,
+   "sha256": "daf8f907773008569b2f88e6651ad1b98fee0b24fd0e4c5c6bb089c77077df6a",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/whitespace/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 401456,
+   "bytes": 8192,
+   "sha256": "ac56bfa0c729dfb110743a0b2f44c36239c62e4765f5c458ceb69b77ae375e0a",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/whitespace/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 409648,
+   "bytes": 8192,
+   "sha256": "92ee7e1e794dd8eacb0b139becdcddc1c6f7a6830dea150363be4c29129a8f90",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/whitespace/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 417840,
+   "bytes": 4096,
+   "sha256": "9c9c7797d4d67ee2bf5442ceea023f33b20b2da53498c43346728b3d7619e26f",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/whitespace/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 421936,
+   "bytes": 4096,
+   "sha256": "b95331f505f6e24810f5c89818dd57860b8a5143938b2758812e555c326cac3d",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "case/trade/input_ids",
+   "dtype": "i32",
+   "shape": [
+    12
+   ],
+   "offset": 426032,
+   "bytes": 48,
+   "sha256": "ad92d9b719bb0478fb97b11a56656eddf69fc361f72020cc5adf23710526e8ac"
+  },
+  {
+   "name": "case/trade/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    12
+   ],
+   "offset": 426080,
+   "bytes": 48,
+   "sha256": "7aa5c1c5c3c2cfe80fee1813b7630f46246156459d79d56e9e9c2648fc1c7db9"
+  },
+  {
+   "name": "case/trade/position_ids",
+   "dtype": "i32",
+   "shape": [
+    12
+   ],
+   "offset": 426128,
+   "bytes": 48,
+   "sha256": "63fb03ec5573bbd8a623d41b6d89d06a339e103ab10feed91a1dd4155a157c4b"
+  },
+  {
+   "name": "case/trade/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 426176,
+   "bytes": 49152,
+   "sha256": "89232da96143ce859f4eec085c580c05a59363d900cada0ab3b7c6ff4aed9b14",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/trade/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 475328,
+   "bytes": 49152,
+   "sha256": "c301b5e9345a0c36f1413b914ff22e15b3eaa6e769192982a2b4e0cdd69bad67",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/trade/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 524480,
+   "bytes": 49152,
+   "sha256": "2e5c13250510be0cea110c67067bdf88a3c6e93eec047050fe6967ff96abdbad",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/trade/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 573632,
+   "bytes": 49152,
+   "sha256": "d5898a9153aaf792c1422f110ad48aff64023ae499b733133bca4b868015c32e",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/trade/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 622784,
+   "bytes": 49152,
+   "sha256": "916bfb4fb5b39123215d34707dc607049d498ea3a121e762e875847a1ed924ff",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/trade/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 671936,
+   "bytes": 49152,
+   "sha256": "89b7d206a6063f879df437bdb76ed64d202515fb47e4f24d595144dbd92751c0",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/trade/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 721088,
+   "bytes": 49152,
+   "sha256": "bd335bc83c55996d7ece229bc4278ecec5e00366208f919aa03cd2c812698e95",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/trade/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 770240,
+   "bytes": 49152,
+   "sha256": "b4f5ad3bb317121e641dd80160ebbbd1c75560ebb8dfbe0ba1a6a7c1ee68f83e",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/trade/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 819392,
+   "bytes": 49152,
+   "sha256": "fb586105b2efb210006ac3e4ef4488b6ceeff09376ab46972b7615832beee68e",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/trade/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 868544,
+   "bytes": 49152,
+   "sha256": "a3e80611d987d6bd544f76ebc4ed2a3431a1c7f8ca7bdca7a9b74c7ac3657cbd",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/trade/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 917696,
+   "bytes": 49152,
+   "sha256": "51e346773013df69ff4458b23a975703d65bada013ba1e962fc858e1c8296cc9",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/trade/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 966848,
+   "bytes": 49152,
+   "sha256": "df1b2c8b3ae176ea1c840f47ed73b40bef7bdfc5fb50c638683ade82edd62e99",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/trade/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1016000,
+   "bytes": 49152,
+   "sha256": "17336bd7ce61521b8f5a93d9a77acb0e93456afb00a7dc6b1bed130b0b7b0b56",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/trade/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1065152,
+   "bytes": 49152,
+   "sha256": "b1715007a63d543964f2f605c2c5cc1e5c9a303919b5a75a772bfe611347c2ab",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/trade/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1114304,
+   "bytes": 49152,
+   "sha256": "55c0e7d2d65c7b6606e93efdd85441242c5d7ffe13387252deb177eca5ae4b87",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/trade/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1163456,
+   "bytes": 49152,
+   "sha256": "fed710c6325ddbae27ccf6f448ee7a2e1a274355482e816a28495cd0a8a9408b",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/trade/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1212608,
+   "bytes": 49152,
+   "sha256": "25e04de75e5fad194872bba94e9223db49c7a673e36a947547dee35fe394dbc6",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/trade/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1261760,
+   "bytes": 49152,
+   "sha256": "861d15177fd67a2760873a8650816427590500f2b589935fe91ae2d18799fb06",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/trade/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1310912,
+   "bytes": 49152,
+   "sha256": "0b796fae585f7d89b0e77aa9240a0941c17c697bb8593b7fb044a92ff8348a04",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/trade/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1360064,
+   "bytes": 49152,
+   "sha256": "eaee095d7ae61f8033b712d29f3160f53d1d34cb9dbcf41255e28b12217ed2c9",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/trade/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1409216,
+   "bytes": 49152,
+   "sha256": "899459f3b4069f30f11e818cab8336564834afb00efd564290807e4177077084",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/trade/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1458368,
+   "bytes": 49152,
+   "sha256": "dcaa6deff06baa37f944c4deb4b1a72a161c8b9ab2c8f9b2b4d92ddecbcb8450",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/trade/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1507520,
+   "bytes": 49152,
+   "sha256": "76e0fddfd6ca6ceec3b060361ec9c05af166aacce763ed5bfa0e0dba29453678",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/trade/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1556672,
+   "bytes": 49152,
+   "sha256": "09f366d623768c8a94d026e9d8accb86d3021eb16689e17f674c18a1d9b0ddcc",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/trade/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    12,
+    1024
+   ],
+   "offset": 1605824,
+   "bytes": 49152,
+   "sha256": "3c4be1869a281ad828fa484f6ef7d05c1b8bdcc9b262f30d1242008a2905a294",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/trade/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 1654976,
+   "bytes": 4096,
+   "sha256": "c677e0a302fd6941cd7a7630a719dd24d36a6ca381b679c7d015c8e3e5ce39be",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/trade/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 1659072,
+   "bytes": 4096,
+   "sha256": "4cae11fef12e8c41c43ccdc81544d74c95c5ba73df788e7487f6a2ea899a53a4",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "case/unicode/input_ids",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 1663168,
+   "bytes": 64,
+   "sha256": "dbaf3d915381132fa9a259241181333cf97d3924c7b5a98e7c598e302803e502"
+  },
+  {
+   "name": "case/unicode/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 1663232,
+   "bytes": 64,
+   "sha256": "98f790ee3951f22e0fd44b7c95e258ec05ef746c8852ba98a1516f25f1890980"
+  },
+  {
+   "name": "case/unicode/position_ids",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 1663296,
+   "bytes": 64,
+   "sha256": "6c34360918b8747dd361f5c5d15c7dd5b7db3c282622a82554f9ee73b08415eb"
+  },
+  {
+   "name": "case/unicode/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1663360,
+   "bytes": 65536,
+   "sha256": "ea5a36a7af2b76f4d77879d09eb83acab233018f55cc03f1c2cbd435509722a1",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/unicode/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1728896,
+   "bytes": 65536,
+   "sha256": "e934eb3a7ef8569b4b3a625b38943947a71f09ae0bec311bac7bdb1c47e30427",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/unicode/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1794432,
+   "bytes": 65536,
+   "sha256": "d57ba887a81de9cee5c644c6bffb2de21b798443c6b32dbca0b64b7cec8ecf41",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/unicode/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1859968,
+   "bytes": 65536,
+   "sha256": "f1059d8a2a9c7a0ac736a8f1040a020d2f9d0b185d813cbdc602f957ef96a1ef",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/unicode/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1925504,
+   "bytes": 65536,
+   "sha256": "ef4b7a05eb8e20b08abec531680123822e4e2642b6845ebbc3048c75db1db183",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/unicode/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 1991040,
+   "bytes": 65536,
+   "sha256": "953dc6979cf1456a27f6da12270b3e1fc2b429351671ea1a4278a4949936b323",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/unicode/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2056576,
+   "bytes": 65536,
+   "sha256": "46eec4747291e6715f647e62ba314dacfe54d7f41692d2e58509f01131f7f19d",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/unicode/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2122112,
+   "bytes": 65536,
+   "sha256": "9e7f01c24550a69bde5dd49c2c461a0e3423b1d9543183221ae06b2caf89da67",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/unicode/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2187648,
+   "bytes": 65536,
+   "sha256": "29753ee87b3b5fa52f2f8527bf6c0acb2d852184b1b623f7cb1b09ce7f97b7d1",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/unicode/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2253184,
+   "bytes": 65536,
+   "sha256": "8b4ca03af7beafe06f987fc8dca0cec0929bf1eaeb81c546c7fe257f9aa56ad0",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/unicode/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2318720,
+   "bytes": 65536,
+   "sha256": "49cfde7e5ce607fe617e6726f2f2dc8acaff2a16783f7bba673e9d9c72c404b2",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/unicode/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2384256,
+   "bytes": 65536,
+   "sha256": "1b6107a342acd7b206461fc7d9063b1d4c640775ad7ad6afc7940ab2f8ce93ec",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/unicode/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2449792,
+   "bytes": 65536,
+   "sha256": "ca2fa1c18433ebc5eb589713574bdeae1581d9479a355da2bec21a891fcef5e4",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/unicode/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2515328,
+   "bytes": 65536,
+   "sha256": "1f6253f653b237596082e0bbd260af983a547c754b36ead3037f66553b1d5204",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/unicode/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2580864,
+   "bytes": 65536,
+   "sha256": "b88ef923fb18ffb6de5f0ab39ad8c9b49f61b92b22c3f0a9b73b49ca1071316c",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/unicode/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2646400,
+   "bytes": 65536,
+   "sha256": "04f8c7ecc7cb4317bd805b7424ca80b7c47dbf84df9b8c2608e2490d93f3544c",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/unicode/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2711936,
+   "bytes": 65536,
+   "sha256": "8320b47fc5586f2d8432f8f0f6d847b9fa2fb6cde70b7e4721587870984318c9",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/unicode/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2777472,
+   "bytes": 65536,
+   "sha256": "7565b700a760810d577552fca47f8fda5a645c73d1faae09356cbb66493f4336",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/unicode/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2843008,
+   "bytes": 65536,
+   "sha256": "a26e49bc820295a1481fdb395f7e7b3f79e10522e023cac6067d1559000674d7",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/unicode/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2908544,
+   "bytes": 65536,
+   "sha256": "1c43018cea35a8a932bd41a6c9204c86fd3ed6f96ab562375270a99564bb16ba",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/unicode/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2974080,
+   "bytes": 65536,
+   "sha256": "f57c18063baf668b22e5436bba449f33175d67399744145580f9a2d548f793c7",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/unicode/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 3039616,
+   "bytes": 65536,
+   "sha256": "9928cf4feff44a0c34327d7427a16f98da5fb2578e2451c2c3d5fd7f22c4dfb5",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/unicode/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 3105152,
+   "bytes": 65536,
+   "sha256": "f15d5b252f3fc693bcce3f4415de0c32872f47501204c8aacca16db81fdabca9",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/unicode/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 3170688,
+   "bytes": 65536,
+   "sha256": "8fc907004f319baddd0010fbbd02bc849edd7bf2d477e5e43283f4c3d86ff75b",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/unicode/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 3236224,
+   "bytes": 65536,
+   "sha256": "68680faf1a95a49ef077a3b1f05a24e4284dede845354f6e887a5dbf523cca0d",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/unicode/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 3301760,
+   "bytes": 4096,
+   "sha256": "ab7600c300841d9636911631e66ef859ce3219d73dede096ee4c115049841990",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/unicode/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 3305856,
+   "bytes": 4096,
+   "sha256": "1aa14b8fefdbe46323c4d4d9ba2f266ae4eb2200cb5a85de40888bfdc78f40f6",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "case/multilingual/input_ids",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 3309952,
+   "bytes": 52,
+   "sha256": "29888ea0ce712dd5ebdbc5628bac3e604820764d821d1bc09c7bf78716758ac2"
+  },
+  {
+   "name": "case/multilingual/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 3310004,
+   "bytes": 52,
+   "sha256": "c9d6b71ddb12ea95e93e7d9c58f5a4f11616f8b1e6b499bcbcf533aa999d065b"
+  },
+  {
+   "name": "case/multilingual/position_ids",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 3310056,
+   "bytes": 52,
+   "sha256": "d16443a599ceec85d28f64436aebebd93ff6b5be542e25447be90b7668080619"
+  },
+  {
+   "name": "case/multilingual/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3310108,
+   "bytes": 53248,
+   "sha256": "b713a11a204ddd0459f7648cded3947cbb68ce997484068992bf04f456f9e25d",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/multilingual/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3363356,
+   "bytes": 53248,
+   "sha256": "354a95db34c4bc7181c20395689917da52518a20aeb352d40e9fed5fb95996c9",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/multilingual/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3416604,
+   "bytes": 53248,
+   "sha256": "d562ac667e67dae63d5df291025512a6f06faf3528937ee484c0a36e8f3a1797",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/multilingual/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3469852,
+   "bytes": 53248,
+   "sha256": "2bd97c77f00177bdd4307a3a34fe7a68f0d118be60640a3017e3040001a1a7ea",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/multilingual/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3523100,
+   "bytes": 53248,
+   "sha256": "7002ed660146ae140b857216a264adc7e4ef3331daea8015c53fda269dbbfdc1",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/multilingual/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3576348,
+   "bytes": 53248,
+   "sha256": "d5d8d6f6b61eb1cbf599be9cea259e906b6faf33afedc6efa88272747bba8e82",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/multilingual/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3629596,
+   "bytes": 53248,
+   "sha256": "30da068ef87f1a6167b455284d95ff351b34cb6ffdaa09eff191bde5f7cb72f8",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/multilingual/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3682844,
+   "bytes": 53248,
+   "sha256": "8c2e8dd33fe83ee5fd0e89ae4ca4355a523b2e93848d1efa2097789deae3f073",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/multilingual/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3736092,
+   "bytes": 53248,
+   "sha256": "0dfb1f2417e18be066e3a3d97259a986296ac23eaa66e68eff44e0821135c1ea",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/multilingual/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3789340,
+   "bytes": 53248,
+   "sha256": "39c8d74285f22e2ad51281d013ab8fabbbc4f9cade4e76eeb5b1c5bb503dba5d",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/multilingual/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3842588,
+   "bytes": 53248,
+   "sha256": "2ec7a1e6e905d9908e4c4a66500ccee0a63cc0c32ab398cdeaf65fcea29d2781",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/multilingual/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3895836,
+   "bytes": 53248,
+   "sha256": "f9bb694f3ffd6cbcba0072be437e1dc80e9423e9278f96f3060d722658a20779",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/multilingual/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 3949084,
+   "bytes": 53248,
+   "sha256": "a517763e6e97460336214899549879d85b7e9192c4fe8321192e13295bdfa0dd",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/multilingual/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4002332,
+   "bytes": 53248,
+   "sha256": "bf0582e6c67121f57cd18e465e8dea55cc1bf97928a77b76debaca53e07db825",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/multilingual/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4055580,
+   "bytes": 53248,
+   "sha256": "6ee7327b1e281c70fcbc522ddeddb4fd4cfe3077e9f08d12db11b617a603e191",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/multilingual/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4108828,
+   "bytes": 53248,
+   "sha256": "ac485f016afc33fea7ecb1de18e025f5ae07e2926161c3558c59c23ab87457ec",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/multilingual/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4162076,
+   "bytes": 53248,
+   "sha256": "b5e49e1d24b34bf1e7359c2fde1e97274b267f47fd8e7097dd21a98e171532b1",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/multilingual/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4215324,
+   "bytes": 53248,
+   "sha256": "49106b14a94119d352715a25b533b382b870090e4b76fcaf33b54ecdb6ba18f5",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/multilingual/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4268572,
+   "bytes": 53248,
+   "sha256": "1263789a5d52d87c464331ee36955f0af7d0523ce6b2193652f4e80a474d6cb7",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/multilingual/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4321820,
+   "bytes": 53248,
+   "sha256": "25be3662f0d4eca279cc8c305e99ecd3935dc1f8c79daa76f1fe7cf5492aad85",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/multilingual/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4375068,
+   "bytes": 53248,
+   "sha256": "288ace96a2e328bf5c741ab36fca54e4a6553f4984abc8bc8db7698523b6fe75",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/multilingual/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4428316,
+   "bytes": 53248,
+   "sha256": "64dd6d3c056371313b37b2ee57fb7c40d510a5f4654adbd30142763658886df5",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/multilingual/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4481564,
+   "bytes": 53248,
+   "sha256": "75e738f43f503af99932bfdb63e6f8de6626e8b9d247362a2513a8fadb90799d",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/multilingual/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4534812,
+   "bytes": 53248,
+   "sha256": "0a0ba6142bc01a24c662b453dab05a9413b7ef23a227f33114ac5cc0759e935f",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/multilingual/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    13,
+    1024
+   ],
+   "offset": 4588060,
+   "bytes": 53248,
+   "sha256": "b219fcd0ba32bea0af0d6cffd788ca56ea4370c3ba425ae532df0bf4c4c7b010",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/multilingual/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 4641308,
+   "bytes": 4096,
+   "sha256": "9f798258f4cd61817d5281a7ee9b7781eab455ebc14c7aeded4e266269d1a546",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/multilingual/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 4645404,
+   "bytes": 4096,
+   "sha256": "c56e2e16be394e4d8f062071116f341434ecf27dda4c81676c566fa0196e3afa",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "case/special_literal/input_ids",
+   "dtype": "i32",
+   "shape": [
+    11
+   ],
+   "offset": 4649500,
+   "bytes": 44,
+   "sha256": "a2a15451f5ea24c44e4b0558f1193d1103e76fefb047c019e83e7056489084a2"
+  },
+  {
+   "name": "case/special_literal/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    11
+   ],
+   "offset": 4649544,
+   "bytes": 44,
+   "sha256": "30d58a4cb0b991e482779a48fc5d53133aafda913881d005fd323405d1c9d64c"
+  },
+  {
+   "name": "case/special_literal/position_ids",
+   "dtype": "i32",
+   "shape": [
+    11
+   ],
+   "offset": 4649588,
+   "bytes": 44,
+   "sha256": "801039350a2166545e8a04c3a6f657db3d21214ddddeb736d77b48c7ea6c8fcd"
+  },
+  {
+   "name": "case/special_literal/hidden.0",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4649632,
+   "bytes": 45056,
+   "sha256": "1880f500f6cb922c334b31742d7d42044b27877bbe492fa7e1b6d4a800f8e19e",
+   "note": "embedding module output (word+position+token_type, LayerNorm)"
+  },
+  {
+   "name": "case/special_literal/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4694688,
+   "bytes": 45056,
+   "sha256": "52800174a2a6d0971d57e422e8a11432dcd88d00fec7223b9a648706b99cc726",
+   "note": "output of encoder layer 1"
+  },
+  {
+   "name": "case/special_literal/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4739744,
+   "bytes": 45056,
+   "sha256": "f1af1c0a96ba95b28f0b772c87c8aa2444d8b5cabb96c5db41f4ea49d8af5212",
+   "note": "output of encoder layer 2"
+  },
+  {
+   "name": "case/special_literal/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4784800,
+   "bytes": 45056,
+   "sha256": "421263f759422ee01e7d29db0f88093899796538d3a6929bc7baf602abb42a63",
+   "note": "output of encoder layer 3"
+  },
+  {
+   "name": "case/special_literal/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4829856,
+   "bytes": 45056,
+   "sha256": "149cac3da0b5b8832af95318ceee3f0fa2a5a18cb0568d814ccf41d4c73f282d",
+   "note": "output of encoder layer 4"
+  },
+  {
+   "name": "case/special_literal/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4874912,
+   "bytes": 45056,
+   "sha256": "9a82723abd3b2661e97dc8fd985ef3c9ef5d96a2bcf88bba86363088f0dc1956",
+   "note": "output of encoder layer 5"
+  },
+  {
+   "name": "case/special_literal/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4919968,
+   "bytes": 45056,
+   "sha256": "583bbb41fe5b6fc04d544210528a440df7393d9bcc61b121415450edf1fc99cc",
+   "note": "output of encoder layer 6"
+  },
+  {
+   "name": "case/special_literal/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 4965024,
+   "bytes": 45056,
+   "sha256": "843c6986d09557ca51902e8803c91e3967477b74f09c0d04ee4e919a6b92e10f",
+   "note": "output of encoder layer 7"
+  },
+  {
+   "name": "case/special_literal/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5010080,
+   "bytes": 45056,
+   "sha256": "b46e1f0463dedc10f5676111bb08cca0969064627bc8a15aca6e9b41d2b82852",
+   "note": "output of encoder layer 8"
+  },
+  {
+   "name": "case/special_literal/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5055136,
+   "bytes": 45056,
+   "sha256": "ff00fc72561280360e24db3b95d84719bc993bcb74496890f8b304a247e14b1f",
+   "note": "output of encoder layer 9"
+  },
+  {
+   "name": "case/special_literal/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5100192,
+   "bytes": 45056,
+   "sha256": "d668115e852d6998090c2263028a1e075666656437930ae7d385a411c4d87e99",
+   "note": "output of encoder layer 10"
+  },
+  {
+   "name": "case/special_literal/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5145248,
+   "bytes": 45056,
+   "sha256": "5244d41aa633496d5265fa3df7e6799421ed1055d489dabea10ad1954d07d52e",
+   "note": "output of encoder layer 11"
+  },
+  {
+   "name": "case/special_literal/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5190304,
+   "bytes": 45056,
+   "sha256": "4d3e81859635e6489e5ac3294d96654e9959a094ebf7fa58974797860e56e885",
+   "note": "output of encoder layer 12"
+  },
+  {
+   "name": "case/special_literal/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5235360,
+   "bytes": 45056,
+   "sha256": "dadfe038bb8e9a3d8e4ad22ea36322b8ed01914353be411f14a405b133992adf",
+   "note": "output of encoder layer 13"
+  },
+  {
+   "name": "case/special_literal/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5280416,
+   "bytes": 45056,
+   "sha256": "d0a05025b915a329e4e1ae33493d288b7aa0046a35e3b5150ca1636e92fb770d",
+   "note": "output of encoder layer 14"
+  },
+  {
+   "name": "case/special_literal/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5325472,
+   "bytes": 45056,
+   "sha256": "c73764e644cd2e6315c8ffc0d498aa867ae7f46b7c7380864e77ee43661d3858",
+   "note": "output of encoder layer 15"
+  },
+  {
+   "name": "case/special_literal/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5370528,
+   "bytes": 45056,
+   "sha256": "e5361fcfc8ab1a96c3a73eb05fb350b6a245981d98511868a1011d9205786139",
+   "note": "output of encoder layer 16"
+  },
+  {
+   "name": "case/special_literal/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5415584,
+   "bytes": 45056,
+   "sha256": "4a0c1cb712f249cc200b302624b8b0575eeebaceac9f9d4015b38aaa9c41fd0d",
+   "note": "output of encoder layer 17"
+  },
+  {
+   "name": "case/special_literal/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5460640,
+   "bytes": 45056,
+   "sha256": "5e9f1ee41d37eedd20d88a8321caf5d08e7ebca8958116ba45b40bb0859bf67b",
+   "note": "output of encoder layer 18"
+  },
+  {
+   "name": "case/special_literal/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5505696,
+   "bytes": 45056,
+   "sha256": "143124fde22167caab6cc75c9c9086929fe2cc49b046c06ba3fde971bd815dc5",
+   "note": "output of encoder layer 19"
+  },
+  {
+   "name": "case/special_literal/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5550752,
+   "bytes": 45056,
+   "sha256": "a25a908c33c59883daeb7bf5e0f00cf2118e36f2335e91081b06d75e02543778",
+   "note": "output of encoder layer 20"
+  },
+  {
+   "name": "case/special_literal/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5595808,
+   "bytes": 45056,
+   "sha256": "a5f5cb24e8473b9fa5af43755c2b32df0a7badab627711be8c155e2fee78e0f7",
+   "note": "output of encoder layer 21"
+  },
+  {
+   "name": "case/special_literal/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5640864,
+   "bytes": 45056,
+   "sha256": "893df9ed0d6951cc4ab4d932535807c8e52869530e534d7f89ef268616081bd0",
+   "note": "output of encoder layer 22"
+  },
+  {
+   "name": "case/special_literal/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5685920,
+   "bytes": 45056,
+   "sha256": "daf7a4694f1b53897686b708894987c178fd523ab8eab083ca8dc6f9ffe8bc40",
+   "note": "output of encoder layer 23"
+  },
+  {
+   "name": "case/special_literal/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    11,
+    1024
+   ],
+   "offset": 5730976,
+   "bytes": 45056,
+   "sha256": "01e09081de6e73b1084ef19eb09171e3feceb6a1afaf3a411b2c6ec1b81d7d25",
+   "note": "output of encoder layer 24"
+  },
+  {
+   "name": "case/special_literal/cls",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 5776032,
+   "bytes": 4096,
+   "sha256": "061a21bb80c96fa2d19eae11dd84ee4e2563ad2affb41f64c069539b593a8043",
+   "note": "last hidden state, token 0, before normalisation"
+  },
+  {
+   "name": "case/special_literal/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 5780128,
+   "bytes": 4096,
+   "sha256": "f87178f436d5683e938d66e2ac25399c8ad25e4100fd5eb22897403bc1f5f0cd",
+   "note": "dense vector: cls / ||cls||"
+  },
+  {
+   "name": "batch/input_ids",
+   "dtype": "i32",
+   "shape": [
+    2,
+    12
+   ],
+   "offset": 5784224,
+   "bytes": 96,
+   "sha256": "ee3b1cabb974739ceb1b9ac82d639cafb966c1bbce21764c806dc39dccc2a776"
+  },
+  {
+   "name": "batch/attention_mask",
+   "dtype": "i32",
+   "shape": [
+    2,
+    12
+   ],
+   "offset": 5784320,
+   "bytes": 96,
+   "sha256": "9be9f9395f20f7f48664c378e72d62b1e1f4782ceb1414571404ac0a56fe52fe"
+  },
+  {
+   "name": "batch/position_ids",
+   "dtype": "i32",
+   "shape": [
+    2,
+    12
+   ],
+   "offset": 5784416,
+   "bytes": 96,
+   "sha256": "210407c6c4001197e99d2b979f2a9f57db3dcc2534867600232b19d9632d781b"
+  },
+  {
+   "name": "batch/hidden.last",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 5784512,
+   "bytes": 98304,
+   "sha256": "9efaffdbda7b65d9767ee095c0b7e8b0913c1c130af331df2d19901c8f5f19aa",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/embedding",
+   "dtype": "f32",
+   "shape": [
+    2,
+    1024
+   ],
+   "offset": 5882816,
+   "bytes": 8192,
+   "sha256": "a84d9260fffb090411a8be33861d3a1f1b94d5308acc84ce0d27f08a3b2fb8e6"
+  },
+  {
+   "name": "batch/single.0/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 5891008,
+   "bytes": 4096,
+   "sha256": "4cae11fef12e8c41c43ccdc81544d74c95c5ba73df788e7487f6a2ea899a53a4",
+   "note": "row 0 run alone, without padding"
+  },
+  {
+   "name": "batch/single.1/embedding",
+   "dtype": "f32",
+   "shape": [
+    1024
+   ],
+   "offset": 5895104,
+   "bytes": 4096,
+   "sha256": "f7fa69c18b257fc84c0a9ad7218eb6470d02e66051bd8b228c04803d1ea194a0",
+   "note": "row 1 run alone, without padding"
+  }
+ ]
+}

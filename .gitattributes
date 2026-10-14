@@ -23,3 +23,8 @@ docs/specs/** -text
 tests/data/**/*.jsonl text eol=lf
 tests/data/**/*.json text eol=lf
 *.f32 binary
+
+# Referenzdaten der nativen Inferenz (tests/data/infer-ref): rohe Blobs und
+# safetensors-Gewichte, jede Umwandlung zerstoert sie.
+*.bin binary
+*.safetensors binary

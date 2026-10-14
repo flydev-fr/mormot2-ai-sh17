@@ -48,10 +48,44 @@ relevant, then bump the commit below.
                 See CONCEPT.md §6 — https://modelcontextprotocol.io
   JSON-RPC 2.0  — https://www.jsonrpc.org/specification
 
-## Runtime foundation
-
-  mORMot 2 — shared/delphi/libs/_git_Synopse2
-
 The gitignored _eval/ folder holds the flydev clones (mormot2-extensions and
 mormot.ai), pinned at the commits above — they are reference material for diffing,
 never a build input.
+
+## Runtime foundation
+
+  mORMot 2 — shared/delphi/libs/_git_Synopse2
+  Last tested against: b4a210033da8f9e5f66c3719aedf1ff1b2eec2c1
+                       (2.4-stable-4208, 2026-10-14; the consumer's submodule pointer)
+  Rule: whoever bumps mORMot2 in the consumer and runs the suites here updates this line.
+
+## Native inference engine: templates (code ported into src/infer/)
+
+  None ported yet (phase 0, 2026-10-14). Allowed templates and their licences:
+  docs/native-inference.md, "Vorlagen und Lizenzen". For every port add an entry:
+
+    Project / URL / Commit / Date / License / Files here that derive from it
+
+  and name project + commit in the header of each derived unit. Apache-2.0 sources
+  (transformers, tokenizers) are looked up only, never ported - no entry here.
+
+## Native inference engine: reference data and models
+
+  Generator: tools/infer-ref/make_reference.py, environment pinned in
+             tools/infer-ref/requirements.txt (WSL aarch64, CPU, Python 3.12.13,
+             torch 2.14.1+cpu, transformers 5.19.0, tokenizers 0.23.3,
+             sentencepiece 0.2.2, safetensors 0.8.0, numpy 2.5.4)
+  Output:    tests/data/infer-ref/ (README.md there); every manifest repeats the
+             environment and the model hashes below.
+
+  Model:     BAAI/bge-m3 (MIT) - https://huggingface.co/BAAI/bge-m3
+  Revision:  5617a9f61b028005a4858fdac845db406aefb181
+  Files (sha256):
+    pytorch_model.bin        b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38
+    config.json              26159e7ad065073448460117eb24b7a4572f6f4e78eadff65dc0a11c052449fa
+    tokenizer.json           21106b6d7dab2952c1d496fb21d5dc9db75c28ed361a05f5020bbba27810dd08
+    sentencepiece.bpe.model  cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865
+  Converted: vendor/models/bge-m3/model.safetensors (F32, gitignored)
+             993b2248881724788dcab8c644a91dfd63584b6e5604ff2037cb5541e1e38e7e
+  Rule: a new revision, model or environment means regenerating every dataset and
+        updating this section in the same commit.

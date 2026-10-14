@@ -171,13 +171,14 @@ the server and its tools do not know which transport they are behind. Full examp
 # from this repo, on Linux/WSL:
 bash scripts/run-fpc-tests.sh        # MCP suite
 bash scripts/run-fpc-llm-tests.sh    # LLM suite
+bash scripts/run-fpc-infer-tests.sh  # native inference suite (reference data, no model needed)
 bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agent.lpr)
 # VERBOSE=1 for the full compiler/test log; logs land in bin/fpc/
 ```
 
 ```powershell
 # Delphi 13, on Windows:
-.\scripts\run-delphi-tests.ps1               # MCP + LLM suite (-Suite mcp|llm, -ShowAll)
+.\scripts\run-delphi-tests.ps1               # MCP, LLM and inference suites (-Suite mcp|llm|infer, -ShowAll)
 # logs and binaries land in bin\delphi\
 # Delphi 7 (Win32):
 .\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
@@ -393,7 +394,10 @@ So that their later changes remain mergeable by diff, their commit is **pinned**
 [UPSTREAM_BASE](UPSTREAM_BASE).
 
 > **Rule: whoever ports from upstream bumps `UPSTREAM_BASE` in the same commit.** Without
-> it the diff base is lost and the next round has to guess.
+> it the diff base is lost and the next round has to guess. The same file records the
+> templates of the native inference engine, the model revision and file hashes behind its
+> reference data, the Python environment that produced them, and the mORMot2 commit the
+> suites last ran against.
 
 ## Roadmap
 

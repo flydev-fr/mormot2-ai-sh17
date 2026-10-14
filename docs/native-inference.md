@@ -1,6 +1,7 @@
 # Native Inferenz in Pascal — Plan
 
-> **Status (2026-10-14):** Plan, noch kein Code. Grundlage ist der Entwurf des Nutzers
+> **Status (2026-10-14):** Phase 0 erledigt (Referenzdaten und Testrahmen, siehe dort),
+> noch kein Engine-Code. Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
 > „Option D") zusammengeführt und mit Codex abgestimmt, das gegen Code, Modelldatei und
@@ -186,12 +187,53 @@ erste Gewinn nicht hinter dem größten Umfang wartet.
 **Fertig, wenn:** die Referenzdaten für BGE-M3 vorliegen und ein Test gegen die winzigen
 Fixtures läuft.
 
+**Erledigt (2026-10-14).** Ergebnis:
+- Werkzeug [tools/infer-ref/](../tools/infer-ref/) mit fester Umgebung (Python 3.12.13,
+  torch 2.14.1+cpu, transformers 5.19.0); Daten in
+  [tests/data/infer-ref/](../tests/data/infer-ref/) (rund 7 MiB): Operator-Fixtures,
+  Tiny-XLM-R, sechs BGE-M3-Fälle mit allen 25 Zuständen plus gepaddetem Batch,
+  FP32-Vektoren des Korpus embed-de. Modellrevision, Datei-Hashes und Umgebung stehen in
+  den Manifesten und in [UPSTREAM_BASE](../UPSTREAM_BASE).
+- Zwei Läufe erzeugen bytegleiche Blobs und ein bytegleiches `model.safetensors`.
+- Suite `infer.tests` (`scripts/run-fpc-infer-tests.sh`, `-Suite infer` in beiden
+  Delphi-Skripten), 149 Assertions grün unter FPC 3.2.4 und 3.2.2 (aarch64-linux),
+  Delphi 13 (Win64) und Delphi 7 (Win32). Sie prüft den **Testrahmen**, noch keinen
+  Pascal-Forward:
+  - Unversehrtheit (Hashes);
+  - Abweisen beschädigter Daten;
+  - Gegenproben für `InferCompare` (Skalierung, Ausreißer, NaN/Inf);
+  - innere Konsistenz der Referenzen.
+
+  Gegenproben: Eine ausgebaute Normierung, ein gekipptes Byte, eine ausgebaute
+  Überlaufsperre im Lader und eine überzogene Kosinus-Schwelle lassen den Lauf
+  fehlschlagen.
+
+Befunde, die in Phase 1 eingehen:
+- **Kein safetensors bei BGE-M3.** Die Revision enthält nur `pytorch_model.bin`
+  (Pickle). Das Werkzeug konvertiert nach F32-safetensors (`vendor/models/bge-m3/`,
+  gitignored) und prüft Tensoren und Forward gegen die Quelle. Phase 1a liest diese
+  Datei.
+- **Sondertokens im Text.** `tokenizer.json` führt `<s>` als Eintrag des
+  Unigram-Vokabulars. Der HF-Tokenizer erkennt es deshalb auch mit
+  `split_special_tokens` oder `encode_special_tokens` im Text (gemessen, Manifest
+  `tokenizer_checks`). Die Referenz-IDs kommen
+  aus SentencePiece (`sentencepiece.bpe.model`), das Steuersymbole nie im Text erkennt,
+  mit fairseq-Offset. Für alle Texte ohne solches Literal sind beide gleich (geprüft).
+  Der native Tokenizer muss die Steuer-Einträge beim Zerlegen auslassen.
+- **FP32 gegen lembed-Q8:** Kosinus mindestens 0,99868, im Mittel 0,99929 über die 262
+  Korpusdokumente.
+- **Batch gegen Einzellauf:** Beim Tiny-Modell bitgleich. Bei BGE-M3 weicht die
+  gepaddete Zeile um höchstens 1,3e-7 ab (Summationsreihenfolge). Die Engine-Tests
+  vergleichen deshalb mit Toleranz, nicht bitgenau.
+
 ### Phase 1 — BGE-M3 als Ersatz für lembed
 
 **1a. FP32 auf der CPU**
 - Tensor-Kern, safetensors-Leser mit Memory-Mapping, naive MatMul in FP32.
 - XLM-RoBERTa-Forward (nachgeschlagen in candle und `modeling_xlm_roberta.py`).
-- Unigram-Tokenizer aus `tokenizer.json`, CLS-Pooling und L2-Normalisierung.
+- Unigram-Tokenizer aus `tokenizer.json`, CLS-Pooling und L2-Normalisierung. Steuer-
+  Einträge (`<s>`, `</s>`, `<pad>`, `<unk>`, `<mask>`) werden im Text nicht erkannt
+  (Befund aus Phase 0).
 
 **Fertig, wenn:**
 - die Token-IDs identisch sind;

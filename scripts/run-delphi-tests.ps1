@@ -7,7 +7,7 @@
   (Win32), prueft run-delphi7-tests.ps1.
 
   Beispiele:
-    .\scripts\run-delphi-tests.ps1                  # MCP- + LLM-Suite
+    .\scripts\run-delphi-tests.ps1                  # alle Suiten (MCP, LLM, Inferenz)
     .\scripts\run-delphi-tests.ps1 -Suite mcp       # eine Suite
     .\scripts\run-delphi-tests.ps1 -ShowAll         # voller Compiler- + Testlog
     .\scripts\run-delphi-tests.ps1 -Dcc 'C:\...\dcc64.exe'   # expliziter Compiler, ohne Versionspruefung
@@ -20,7 +20,7 @@
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('all', 'mcp', 'llm')]
+  [ValidateSet('all', 'mcp', 'llm', 'infer')]
   [string]$Suite = 'all',
   # Pfad zu dcc64.exe; gesetzt = ohne Versionspruefung (bewusste Gegenprobe)
   [string]$Dcc = $env:DCC64,
@@ -58,7 +58,7 @@ $src = Join-Path $mormot2 'src'
 $units = @((Join-Path $bds 'lib\win64\release'), $src) +
   @('core', 'lib', 'crypt', 'net', 'db', 'orm', 'rest', 'soa', 'app', 'misc', 'script', 'tools\mget' |
     ForEach-Object { Join-Path $src $_ }) +
-  @((Join-Path $lai 'src'), (Join-Path $lai 'tests'), (Join-Path $lai 'vendor'))
+  @((Join-Path $lai 'src'), (Join-Path $lai 'src\infer'), (Join-Path $lai 'tests'), (Join-Path $lai 'vendor'))
 $inc = @($src, (Join-Path $src 'core'), (Join-Path $src 'net'))
 $out = Join-Path $lai 'bin\delphi'
 $dcu = Join-Path $out 'dcu'
@@ -75,7 +75,7 @@ if (-not $env:SQLITE_EXT_DIR -and (Test-Path $ext)) {
   Write-Host ">>> SQLITE_EXT_DIR=$ext (vec0 gefunden)"
 }
 
-$suites = if ($Suite -eq 'all') { @('mcp', 'llm') } else { @($Suite) }
+$suites = if ($Suite -eq 'all') { @('mcp', 'llm', 'infer') } else { @($Suite) }
 $failed = 0
 foreach ($s in $suites) {
   $prog = "$s.tests"

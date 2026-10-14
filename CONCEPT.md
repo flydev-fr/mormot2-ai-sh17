@@ -292,9 +292,10 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 1. Referenzvertrag und deutscher Testkorpus ✓
 2. nativer Store ✓ (ersetzt vec0)
 3. Delphi-7-Portierung des bestehenden Codes (§9 Punkt 9) ✓ (2026-10-14);
-   danach Engine Phase 0, Python-Referenz:
-   - festgelegte FP32-Referenz pro Layer;
-   - winzige Fixtures.
+   danach Engine Phase 0 ✓ (2026-10-14), Python-Referenz:
+   - festgelegte FP32-Referenz pro Layer (`tests/data/infer-ref/`, `tools/infer-ref/`);
+   - winzige Fixtures;
+   - Suite `infer.tests` unter FPC 3.2.4/3.2.2, Delphi 13 und Delphi 7 grün.
 4. Phase 1a, BGE-M3 FP32
 5. Phase 1b, das vorhandene Q8-GGUF:
    - Token-IDs identisch zu lembed (wörtliche Sondertokens getrennt gegen
@@ -588,7 +589,8 @@ Roadmap — DESIGN.md verweist hierher.
      Gate-5-Messung in `docs/native-embeddings.md`; 2c IVF nur bei Bedarf.
    - Engine ○: eigene Pascal-Inferenz nach
      [docs/native-inference.md](docs/native-inference.md). Zuerst BGE-M3 (ersetzt lembed),
-     dann Qwen3 hinter `ILlmClient`, dann CUDA.
+     dann Qwen3 hinter `ILlmClient`, dann CUDA. Phase 0 (Referenzdaten, Testrahmen) ✓
+     2026-10-14; als Nächstes Phase 1a.
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.
@@ -626,6 +628,8 @@ Roadmap — DESIGN.md verweist hierher.
     4. flydev-Übernahmen (Punkt 2) nur selektiv; pgvector erst, wenn ein Deployment es
        braucht.
     5. Die Stale-Zähler der Assertions in README/DESIGN vereinheitlichen.
+    6. Ein Build-Skript für die Demos unter Delphi (13 und 7). Heute baut nur
+       `scripts/build-demo.sh` (FPC); die Delphi-Skripte decken nur die Testsuiten ab.
 
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
