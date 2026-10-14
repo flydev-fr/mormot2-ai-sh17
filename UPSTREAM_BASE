@@ -61,13 +61,21 @@ never a build input.
 
 ## Native inference engine: templates (code ported into src/infer/)
 
-  None ported yet (phase 0, 2026-10-14). Allowed templates and their licences:
-  docs/native-inference.md, "Vorlagen und Lizenzen". For every port add an entry:
+  Allowed templates and their licences: docs/native-inference.md, "Vorlagen und
+  Lizenzen". For every port add an entry (Project / URL / Commit / Date / License /
+  Files here that derive from it) and name project + commit in the header of each
+  derived unit. Apache-2.0 sources (transformers, tokenizers) and the SentencePiece
+  sources are looked up only, never ported - no entry here.
 
-    Project / URL / Commit / Date / License / Files here that derive from it
-
-  and name project + commit in the header of each derived unit. Apache-2.0 sources
-  (transformers, tokenizers) are looked up only, never ported - no entry here.
+  Project: llama.cpp (ggml-org)
+  URL:     https://github.com/ggml-org/llama.cpp
+  Commit:  6868a52cb337450658006ad2f9281c2eb63f1666
+  Date:    2026-10-14
+  License: MIT - "Copyright (c) 2023-2026 The ggml authors"; full notice in the
+           derived unit's header and in NOTICE
+  Ported:  src/llama-vocab.cpp, llm_tokenizer_ugm + llm_tokenizer_ugm_session
+           (charsmap XCDA lookup, whitespace folding, Viterbi, unknown merging)
+           -> src/infer/mormot.ai.infer.tokenizer.ugm.pas
 
 ## Native inference engine: reference data and models
 

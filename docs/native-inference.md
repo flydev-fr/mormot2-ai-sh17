@@ -1,7 +1,8 @@
 # Native Inferenz in Pascal — Plan
 
-> **Status (2026-10-14):** Phase 0 erledigt (Referenzdaten und Testrahmen, siehe dort),
-> noch kein Engine-Code. Grundlage ist der Entwurf des Nutzers
+> **Status (2026-10-14):** Phase 0 und Phase 1a erledigt: BGE-M3 läuft in FP32 nativ
+> von Text bis Vektor und trifft die PyTorch-Referenz (siehe dort). Als Nächstes 1b
+> (GGUF/Q8). Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
 > „Option D") zusammengeführt und mit Codex abgestimmt, das gegen Code, Modelldatei und
@@ -233,7 +234,8 @@ Befunde, die in Phase 1 eingehen:
 - XLM-RoBERTa-Forward (nachgeschlagen in candle und `modeling_xlm_roberta.py`).
 - Unigram-Tokenizer aus `tokenizer.json`, CLS-Pooling und L2-Normalisierung. Steuer-
   Einträge (`<s>`, `</s>`, `<pad>`, `<unk>`, `<mask>`) werden im Text nicht erkannt
-  (Befund aus Phase 0).
+  (Befund aus Phase 0). Verhalten wie SentencePiece, nicht wie der HF-Tokenizer: Der
+  weicht auch bei C1-Steuerzeichen, Hangul-Jamo und kombinierenden Zeichen ab.
 
 **Fertig, wenn:**
 - die Token-IDs identisch sind;
@@ -241,6 +243,26 @@ Befunde, die in Phase 1 eingehen:
 - das End-Embedding Kosinus ≥ 0,9999 und eine Norm von 1 ± 1e-5 hat;
 - Batch und Einzelaufruf dasselbe liefern;
 - Padding die Ergebnisse nicht verändert.
+
+**Erledigt (2026-10-14).** Units unter `src/infer/`: `tensor`, `memory`,
+`loader.safetensors`, `backend`, `backend.cpu`, `model.xlmr`, `tokenizer.ugm`,
+`pipeline.embed` (`TInferEmbedder`). Ergebnis gegen die Referenz:
+- Tokenizer: alle 1348 Fälle von `bge-m3-tokens` mit identischen IDs und identischem
+  normalisierten Text (320 Korpustexte, 128 Grenzfälle, 900 Unicode-Mischungen), auch
+  unter Delphi 7/Win32. Portiert aus llama.cpp (MIT, Herkunft in `UPSTREAM_BASE`).
+- Encoder: alle 25 Zustände der sechs Fälle und des gepaddeten Batchs innerhalb
+  atol 1e-4 / rtol 1e-3; gemessen höchstens 1,7e-5 absolut in den Zuständen und
+  1,8e-7 im End-Embedding (Kosinus 0,999999999999).
+- Text bis Vektor in einem gepaddeten Batch: Kosinus ≥ 0,9999 je Text; mehr als 512
+  Tokens werden abgewiesen, nie gekürzt.
+- Suite `infer.tests`: 752 Assertions grün unter FPC 3.2.4/3.2.2 und Delphi 13; unter
+  Delphi 7 laufen alle Teile außer dem echten Modell (SKIP: die 2,3-GB-F32-Datei passt
+  nicht ganz in einen 32-Bit-Prozess, das kommt mit Q8 in 1b).
+- Die Referenzrechnung summiert durchgehend in double (jeder Faktor wird vor der
+  Multiplikation erweitert), damit x87, SSE und NEON dieselbe Referenz liefern. Ein
+  späterer SIMD-Pfad in FP32 wird gegen diese Referenz geprüft.
+- Tempo (skalar, ein Thread, aarch64): rund 35 s für die sechs Fälle und den Batch.
+  Geschwindigkeit ist Thema von 1c.
 
 **1b. GGUF/Q8_0 — dasselbe Asset wie lembed** (vorher „Schritte 3 und 4" in
 native-embeddings.md)

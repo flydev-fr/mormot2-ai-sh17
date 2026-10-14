@@ -296,7 +296,7 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
    - festgelegte FP32-Referenz pro Layer (`tests/data/infer-ref/`, `tools/infer-ref/`);
    - winzige Fixtures;
    - Suite `infer.tests` unter FPC 3.2.4/3.2.2, Delphi 13 und Delphi 7 grün.
-4. Phase 1a, BGE-M3 FP32
+4. Phase 1a, BGE-M3 FP32 ✓ (2026-10-14)
 5. Phase 1b, das vorhandene Q8-GGUF:
    - Token-IDs identisch zu lembed (wörtliche Sondertokens getrennt gegen
      `parse_special = false`);
@@ -590,7 +590,8 @@ Roadmap — DESIGN.md verweist hierher.
    - Engine ○: eigene Pascal-Inferenz nach
      [docs/native-inference.md](docs/native-inference.md). Zuerst BGE-M3 (ersetzt lembed),
      dann Qwen3 hinter `ILlmClient`, dann CUDA. Phase 0 (Referenzdaten, Testrahmen) ✓
-     2026-10-14; als Nächstes Phase 1a.
+     und Phase 1a (BGE-M3 FP32 von Text bis Vektor, trifft PyTorch) ✓ 2026-10-14; als
+     Nächstes 1b (GGUF/Q8).
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.

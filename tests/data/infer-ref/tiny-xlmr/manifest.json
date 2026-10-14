@@ -247,13 +247,14 @@
  },
  "config_sha256": "32249c3038f65594b74507b1408a075f0a20e62e2a7a7a854e3e719f554a814e",
  "environment": {
-  "created_utc": "2026-10-14T11:01:28Z",
+  "created_utc": "2026-10-14T11:30:34Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
   "transformers": "5.19.0",
   "tokenizers": "0.23.3",
   "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
   "numpy": "2.5.4",
   "device": "cpu",
   "dtype": "float32",
@@ -266,8 +267,8 @@
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 11988,
-  "sha256": "7a388b2f790ce40d50231944a5289c4b849d697c62eeda57f77599e21f4f9d59",
+  "bytes": 18900,
+  "sha256": "c1adaacd547c52fc983b0d801649ab0a909ff2b5839e920749ab49f74c457c35",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -525,7 +526,7 @@
    "sha256": "1523c3ce867d0116bdd97970c09a18818de3456c15e96f02395770b383172d6b"
   },
   {
-   "name": "batch/hidden.last",
+   "name": "batch/hidden.0",
    "dtype": "f32",
    "shape": [
     3,
@@ -534,7 +535,34 @@
    ],
    "offset": 8148,
    "bytes": 3456,
-   "sha256": "dd603ecc06ef506e45388433d103c26238ede55757b503cac39a5df5a7ef6b2f"
+   "sha256": "775228ff79c4f2daa3bf0d17eef380afadf6708b506be8f9602c78515b649254",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    3,
+    9,
+    32
+   ],
+   "offset": 11604,
+   "bytes": 3456,
+   "sha256": "827c7124d8e97803c85ac969169e27e09fcd9a614d9973342519965541d55bfc",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    3,
+    9,
+    32
+   ],
+   "offset": 15060,
+   "bytes": 3456,
+   "sha256": "dd603ecc06ef506e45388433d103c26238ede55757b503cac39a5df5a7ef6b2f",
+   "note": "padded positions are not meaningful"
   },
   {
    "name": "batch/embedding",
@@ -543,7 +571,7 @@
     3,
     32
    ],
-   "offset": 11604,
+   "offset": 18516,
    "bytes": 384,
    "sha256": "38c90e416f21ac5f01f58f749b0f53d7c0f00497077fb0080260979d809af597"
   }

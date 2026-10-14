@@ -29,13 +29,14 @@
   }
  },
  "environment": {
-  "created_utc": "2026-10-14T11:10:48Z",
+  "created_utc": "2026-10-14T11:33:41Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
   "transformers": "5.19.0",
   "tokenizers": "0.23.3",
   "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
   "numpy": "2.5.4",
   "device": "cpu",
   "dtype": "float32",

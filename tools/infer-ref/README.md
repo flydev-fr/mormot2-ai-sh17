@@ -18,9 +18,11 @@ VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install \
 VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirements.txt
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py            # alles
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py ops tiny   # ohne Modell
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py tokens     # nur Tokenizer
 ```
 
-Mit dem Argument `bge-m3` lädt das Skript BAAI/bge-m3 in der festen Revision
+Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate).
+Mit `bge-m3` oder `tokens` lädt das Skript BAAI/bge-m3 in der festen Revision
 `5617a9f61b028005a4858fdac845db406aefb181` (rund 2,3 GB in den Hugging-Face-Cache).
 
 ## Was das Skript festlegt

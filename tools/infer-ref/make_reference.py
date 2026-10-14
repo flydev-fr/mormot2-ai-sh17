@@ -83,7 +83,9 @@ class Blob:
 
     def add(self, name, array, note=None):
         a = np.ascontiguousarray(array)
-        if a.dtype in (np.float32, np.float64, np.float16):
+        if a.dtype == np.uint8:
+            dtype = "u8"
+        elif a.dtype in (np.float32, np.float64, np.float16):
             a = a.astype("<f4")
             dtype = "f32"
         elif a.dtype.kind in "iub":
@@ -134,6 +136,7 @@ def environment():
         "transformers": transformers.__version__,
         "tokenizers": tokenizers.__version__,
         "safetensors": safetensors.__version__,
+        "sentencepiece": sentencepiece_version(),
         "numpy": np.__version__,
         "device": "cpu",
         "dtype": "float32",
@@ -143,6 +146,11 @@ def environment():
         "mode": "eval (dropout off)",
         "generator": "tools/infer-ref/make_reference.py",
     }
+
+
+def sentencepiece_version():
+    import sentencepiece
+    return sentencepiece.__version__
 
 
 def setup_determinism():
@@ -334,7 +342,8 @@ def bge_m3(snapshot):
     blob.add("batch/input_ids", ids)
     blob.add("batch/attention_mask", mask)
     blob.add("batch/position_ids", xlmr_positions(ids, pad))
-    blob.add("batch/hidden.last", hs[-1], "padded positions are not meaningful")
+    for k, h in enumerate(hs):
+        blob.add(f"batch/hidden.{k}", h, "padded positions are not meaningful")
     blob.add("batch/embedding", emb)
     batch_diff = []
     for i, r in enumerate(rows):
@@ -419,6 +428,177 @@ def embed_de(tok, model, bge_manifest):
     blob.write(os.path.join(OUT, "bge-m3-embed-de"), manifest)
 
 
+# ---------------------------------------------------------------- tokenizer
+
+def designed_cases():
+    """hand-picked edge cases - (id, text)"""
+    c = chr
+    cases = [
+        ("empty", ""), ("space", " "), ("spaces", "   "), ("tab", c(9)),
+        ("newline", c(10)), ("crlf", "a" + c(13) + c(10) + "b"),
+        ("lead_space", " Rohr"), ("trail_space", "Rohr "), ("both_spaces", "  Rohr  "),
+        ("inner_spaces", "Rohr    DN   15"), ("tabs_inside", "a" + c(9) + c(9) + "b"),
+        ("nbsp", "15" + c(0xA0) + "mm"), ("thin_space", "15" + c(0x2009) + "mm"),
+        ("narrow_nbsp", "15" + c(0x202F) + "mm"), ("ideographic_space", "a" + c(0x3000) + "b"),
+        ("em_space", "a" + c(0x2003) + "b"), ("zwsp", "a" + c(0x200B) + "b"),
+        ("zwnj", "a" + c(0x200C) + "b"), ("zwj", "a" + c(0x200D) + "b"),
+        ("bom_char", c(0xFEFF) + "Rohr"), ("soft_hyphen", "Kupfer" + c(0xAD) + "rohr"),
+        ("nul", "a" + c(0) + "b"), ("bell", "a" + c(7) + "b"), ("del", "a" + c(0x7F) + "b"),
+        ("c1_control", "a" + c(0x85) + "b"), ("line_sep", "a" + c(0x2028) + "b"),
+        ("combining_acute", "e" + c(0x301)), ("combining_diaeresis", "u" + c(0x308) + "ber"),
+        ("precomposed_ue", c(0xFC) + "ber"), ("hangul_jamo", c(0x1100) + c(0x1161)),
+        ("hangul_syllable", c(0xAC00)), ("fullwidth_latin", "".join(c(0xFF21 + i) for i in range(5))),
+        ("fullwidth_digits", "".join(c(0xFF10 + i) for i in range(10))),
+        ("halfwidth_kana", c(0xFF76) + c(0xFF9E)), ("ligature_fi", c(0xFB01) + "x"),
+        ("ligature_ffl", "a" + c(0xFB04) + "e"), ("superscript", "m" + c(0xB2) + " m" + c(0xB3)),
+        ("fraction", "1" + c(0x2044) + "2 " + c(0xBD)), ("roman_numeral", c(0x2163)),
+        ("circled_digit", c(0x2460) + c(0x2461)), ("micro_sign", c(0xB5) + "m"),
+        ("ohm_sign", "10 " + c(0x2126)), ("angstrom", c(0x212B)), ("kelvin", "5 " + c(0x212A)),
+        ("degree", "20" + c(0xB0) + "C"), ("multiplication", "30" + c(0xD7) + "60"),
+        ("minus_sign", c(0x2212) + "5"), ("en_dash", "a" + c(0x2013) + "b"),
+        ("em_dash", "a" + c(0x2014) + "b"), ("quotes", c(0x201E) + "Rohr" + c(0x201C)),
+        ("guillemets", c(0xAB) + "x" + c(0xBB)), ("ellipsis", "a" + c(0x2026)),
+        ("euro", "5 " + c(0x20AC)), ("sharp_s", "Stra" + c(0xDF) + "e"),
+        ("capital_sharp_s", "STRA" + c(0x1E9E) + "E"), ("emoji", c(0x1F600)),
+        ("emoji_skin", c(0x1F44D) + c(0x1F3FD)), ("emoji_zwj", c(0x1F468) + c(0x200D) + c(0x1F469) + c(0x200D) + c(0x1F467)),
+        ("flag", c(0x1F1E9) + c(0x1F1EA)), ("variation_selector", c(0x2764) + c(0xFE0F)),
+        ("supplementary_cjk", c(0x20000) + c(0x20001)), ("math_bold", c(0x1D400) + c(0x1D401)),
+        ("private_use", c(0xE000) + "x"), ("noncharacter", "a" + c(0xFFFE) + "b"),
+        ("replacement_char", c(0xFFFD)), ("cjk", "".join(c(x) for x in [0x6563, 0x70ED, 0x5668])),
+        ("japanese", "".join(c(x) for x in [0x914D, 0x7BA1, 0x5DE5, 0x4E8B])),
+        ("korean", "".join(c(x) for x in [0xBC30, 0xAD00])), ("arabic", "".join(c(x) for x in [0x0623, 0x0646, 0x0628, 0x0648, 0x0628])),
+        ("hebrew", "".join(c(x) for x in [0x05E6, 0x05D9, 0x05E0, 0x05D5, 0x05E8])),
+        ("thai", "".join(c(x) for x in [0x0E17, 0x0E48, 0x0E2D])), ("devanagari", "".join(c(x) for x in [0x0928, 0x0932, 0x0940])),
+        ("cyrillic", "".join(c(x) for x in [0x0422, 0x0440, 0x0443, 0x0431, 0x0430])),
+        ("greek", "".join(c(x) for x in [0x03A9, 0x03BB, 0x03C6])), ("mixed_scripts", "Rohr " + c(0x0422) + c(0x0440) + " " + c(0x7BA1)),
+        ("metaspace_char", c(0x2581) + "Rohr"), ("metaspace_only", c(0x2581)),
+        ("metaspace_double", "a" + c(0x2581) + c(0x2581) + "b"), ("long_word", "Rohrleitungsbauunternehmensverband" * 3),
+        ("long_repeat", "a" * 300), ("long_digits", "1234567890" * 20), ("dots", "." * 50),
+        ("url", "https://example.org/a?b=c&d=e"), ("email", "info@example.org"),
+        ("code", "x := y + 1; // ok"), ("html", "<b>Rohr</b> &amp; Fitting"),
+        ("lt_gt", "a < b > c"), ("brackets", "[DN 15] (Kupfer) {neu}"),
+        ("backslash", "C:" + c(92) + "Pfad" + c(92) + "x"), ("apostrophe", "Hauseigent" + c(0xFC) + "mer's"),
+        ("numbers_units", "3 x 1,5 mm" + c(0xB2) + " NYM-J"), ("dn", "DN15/DN20/DN25"),
+        ("all_caps", "KUPFERROHR VERLEGEN"), ("mixed_case", "kUpFeRrOhR"),
+    ]
+    # the special-token literals: alone, glued to text, repeated, with spaces
+    for lit, name in [("<s>", "bos"), ("</s>", "eos"), ("<pad>", "pad"),
+                      ("<unk>", "unk"), ("<mask>", "mask")]:
+        cases += [
+            (f"lit_{name}", lit), (f"lit_{name}_glued", "a" + lit + "b"),
+            (f"lit_{name}_spaced", "a " + lit + " b"), (f"lit_{name}_twice", lit + lit),
+            (f"lit_{name}_lead", lit + "Rohr"), (f"lit_{name}_trail", "Rohr" + lit),
+        ]
+    # around 512 tokens (incl. <s> </s>; "Rohr" = 2 pieces, "in" = 1): tokenization
+    # only, truncation is a separate concern - the counts are asserted in tokens()
+    cases.append(("tokens_511", "Rohr " * 254 + "in"))
+    cases.append(("tokens_512", "Rohr " * 255))
+    cases.append(("tokens_513", "Rohr " * 255 + "in"))
+    cases.append(("tokens_602", "Rohr " * 300))
+    return cases
+
+
+def generated_cases(n, seed):
+    """deterministic random mixes over character pools - (id, text)"""
+    import random
+    rng = random.Random(seed)
+    pools = [
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "".join(chr(x) for x in [0xE4, 0xF6, 0xFC, 0xC4, 0xD6, 0xDC, 0xDF, 0xE9, 0xE8, 0xE7, 0xF1]),
+        " " * 6 + chr(9) + chr(10) + chr(0xA0) + chr(0x3000) + chr(0x2009),
+        ".,;:-_/()[]{}+*=%&#@!?'" + chr(34),
+        "".join(chr(x) for x in range(0x0410, 0x0450)),
+        "".join(chr(x) for x in range(0x4E00, 0x4E40)),
+        "".join(chr(x) for x in range(0x0300, 0x0310)),
+        "".join(chr(x) for x in [0xFF21, 0xFF41, 0xFF10, 0xFB01, 0x2163, 0x2460, 0xB2, 0xBD, 0x2126]),
+        "".join(chr(x) for x in [0x1F600, 0x1F44D, 0x200D, 0xFE0F, 0x1F1E9, 0x20000]),
+        "".join(chr(x) for x in range(0x0600, 0x0620)) + "".join(chr(x) for x in range(0x05D0, 0x05EA)),
+        chr(0x2581) + chr(0x200B) + chr(0xAD) + chr(0xFEFF),
+    ]
+    weights = [30, 10, 12, 8, 6, 6, 4, 6, 4, 4, 2]
+    cases, seen = [], set()
+    while len(cases) < n:
+        length = rng.randint(1, 40)
+        chars = []
+        for _ in range(length):
+            pool = rng.choices(pools, weights)[0]
+            chars.append(rng.choice(pool))
+        text = "".join(chars)
+        if text in seen:
+            continue  # duplicates add nothing
+        seen.add(text)
+        cases.append((f"gen_{len(cases):04d}", text))
+    return cases
+
+
+def tokens(snapshot):
+    print("tokenizer cases")
+    tok = RefTokenizer(snapshot)
+    data = os.path.join(ROOT, "tests", "data", "embed-de")
+    texts = []
+    for name in ["corpus", "queries"]:
+        with open(os.path.join(data, name + ".jsonl"), encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    r = json.loads(line)
+                    texts.append((f"{name}_{r['id']}", r["text"]))
+    texts += designed_cases()
+    texts += generated_cases(900, TINY_SEED)
+    if len({cid for cid, _ in texts}) != len(texts):
+        raise ValueError("duplicated case id")
+    flat, offsets, cases = [], [], []
+    text_bytes, text_offsets = bytearray(), []
+    norm_bytes, norm_offsets = bytearray(), []
+    hf_differs = 0
+    for cid, text in texts:
+        ids = tok.encode(text, expect_hf_equal=False)
+        hf = tok.hf(text, add_special_tokens=True, truncation=False)["input_ids"]
+        if cid.startswith("tokens_") and len(ids) != int(cid[7:]):
+            raise ValueError(f"{cid}: {len(ids)} tokens")
+        offsets.append(len(flat))
+        flat += ids
+        text_offsets.append(len(text_bytes))
+        text_bytes += text.encode("utf-8")
+        norm_offsets.append(len(norm_bytes))
+        norm_bytes += tok.sp.normalize(text).encode("utf-8")
+        e = {"id": cid, "text": text, "tokens": len(ids),
+             "normalized": tok.sp.normalize(text)}
+        if hf != ids:
+            e["hf_ids"] = hf
+            hf_differs += 1
+        cases.append(e)
+    offsets.append(len(flat))
+    text_offsets.append(len(text_bytes))
+    norm_offsets.append(len(norm_bytes))
+    blob = Blob()
+    # the exact UTF-8 bytes: a JSON reader may not keep an escaped NUL
+    blob.add("texts", np.frombuffer(bytes(text_bytes), dtype=np.uint8),
+             "UTF-8 of all case texts concatenated")
+    blob.add("text_offsets", np.array(text_offsets, dtype=np.int64),
+             "case i = texts[text_offsets[i] .. text_offsets[i+1]-1]")
+    blob.add("normalized", np.frombuffer(bytes(norm_bytes), dtype=np.uint8),
+             "UTF-8 of all SentencePiece-normalized texts concatenated")
+    blob.add("normalized_offsets", np.array(norm_offsets, dtype=np.int64),
+             "case i = normalized[normalized_offsets[i] .. normalized_offsets[i+1]-1]")
+    blob.add("ids", np.array(flat, dtype=np.int64), "all cases concatenated")
+    blob.add("offsets", np.array(offsets, dtype=np.int64),
+             "case i = ids[offsets[i] .. offsets[i+1]-1]")
+    manifest = {
+        "dataset": "bge-m3-tokens",
+        "note": "reference token ids (SentencePiece, parse_special=false, fairseq ids, "
+                "<s> text </s>, no truncation) - the tokenizer gate of phase 1a. "
+                "normalized = SentencePiece normalize(); hf_ids only where the HF "
+                "tokenizer differs (it reads special-token literals as control tokens)",
+        "model": {"id": MODEL_ID, "revision": REVISION,
+                  "sentencepiece_model_sha256": sha256_file(os.path.join(snapshot, "sentencepiece.bpe.model")),
+                  "tokenizer_json_sha256": sha256_file(os.path.join(snapshot, "tokenizer.json"))},
+        "environment": environment(),
+        "hf_differs": hf_differs,
+        "cases": cases,
+    }
+    blob.write(os.path.join(OUT, "bge-m3-tokens"), manifest)
+
+
 # ---------------------------------------------------------------- tiny XLM-R
 
 def tiny():
@@ -467,7 +647,8 @@ def tiny():
     blob.add("batch/input_ids", ids)
     blob.add("batch/attention_mask", mask)
     blob.add("batch/position_ids", xlmr_positions(ids, 1))
-    blob.add("batch/hidden.last", hs[-1])
+    for k, h in enumerate(hs):
+        blob.add(f"batch/hidden.{k}", h, "padded positions are not meaningful")
     blob.add("batch/embedding", dense(hs[-1])[1])
     manifest = {
         "dataset": "tiny-xlmr",
@@ -525,8 +706,9 @@ def ops():
     # exact GELU (erf), including large magnitudes
     x = f32(np.concatenate([np.linspace(-6, 6, 25), [-30, -10, 10, 30, 0]]))
     blob.add("gelu/x", x)
-    blob.add("gelu/y", np.array([0.5 * v * (1 + math.erf(v / math.sqrt(2))) for v in x.astype(np.float64)]),
-             "exact: 0.5 x (1 + erf(x / sqrt 2)), not the tanh approximation")
+    # erfc(-z) = 1 + erf(z) without the cancellation that zeroes gelu(-10)
+    blob.add("gelu/y", np.array([0.5 * v * math.erfc(-v / math.sqrt(2)) for v in x.astype(np.float64)]),
+             "exact: 0.5 x (1 + erf(x / sqrt 2)) = 0.5 x erfc(-x / sqrt 2), not the tanh approximation")
     # L2 normalisation, incl. a tiny-norm row
     x = f32(rng.standard_normal((3, 7)))
     x[2] = f32(rng.standard_normal(7) * 1e-20)
@@ -540,7 +722,7 @@ def ops():
 
 def main():
     setup_determinism()
-    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3"}
+    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens"}
     if "ops" in what:
         ops()
     if "tiny" in what:
@@ -549,6 +731,8 @@ def main():
         snapshot = fetch_model()
         tok, model, manifest = bge_m3(snapshot)
         embed_de(tok, model, manifest)
+    if "tokens" in what:
+        tokens(fetch_model())
 
 
 if __name__ == "__main__":

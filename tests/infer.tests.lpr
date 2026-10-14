@@ -15,7 +15,10 @@ uses
   mormot.core.os,
   mormot.core.log,
   mormot.core.test,
-  test.infer;
+  test.infer,
+  test.infer.engine,
+  test.infer.xlmr,
+  test.infer.tokenizer;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -26,7 +29,10 @@ type
 procedure TInferTests.Infer;
 begin
   AddCase([
-    TTestInferReference
+    TTestInferReference,
+    TTestInferEngine,
+    TTestInferXlmr,
+    TTestInferTokenizer
   ]);
 end;
 

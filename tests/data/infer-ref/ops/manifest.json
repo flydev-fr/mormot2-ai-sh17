@@ -1,13 +1,14 @@
 {
  "dataset": "ops",
  "environment": {
-  "created_utc": "2026-10-14T11:01:28Z",
+  "created_utc": "2026-10-14T11:44:02Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
   "transformers": "5.19.0",
   "tokenizers": "0.23.3",
   "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
   "numpy": "2.5.4",
   "device": "cpu",
   "dtype": "float32",
@@ -22,7 +23,7 @@
  "blob": {
   "file": "tensors.bin",
   "bytes": 1148,
-  "sha256": "1b37ce04b4bccf1e59e21d32a45c29d071f2badd9f33e8cf2d91f03043ba2835",
+  "sha256": "540b81431ff4335bfd5339c1d6077ff1e2d9b9c2d1d478d47ee4547ba069a5b0",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -167,8 +168,8 @@
    ],
    "offset": 860,
    "bytes": 120,
-   "sha256": "52a3849e765451386e92293b05d86dd69ea1f257277baf0976c917889f127ccd",
-   "note": "exact: 0.5 x (1 + erf(x / sqrt 2)), not the tanh approximation"
+   "sha256": "a49909aff5cbdb67ddfed87c69bf5b377acc53d84f1ebfc73172b94c160a3be5",
+   "note": "exact: 0.5 x (1 + erf(x / sqrt 2)) = 0.5 x erfc(-x / sqrt 2), not the tanh approximation"
   },
   {
    "name": "l2/x",

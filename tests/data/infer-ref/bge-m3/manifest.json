@@ -63,13 +63,14 @@
   }
  },
  "environment": {
-  "created_utc": "2026-10-14T11:08:52Z",
+  "created_utc": "2026-10-14T11:31:48Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
   "transformers": "5.19.0",
   "tokenizers": "0.23.3",
   "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
   "numpy": "2.5.4",
   "device": "cpu",
   "dtype": "float32",
@@ -255,8 +256,8 @@
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 5899200,
-  "sha256": "6ca8197c50a1cc501d7d7c580a467581ea81edd14f6bff1170c060e9bcc2a495",
+  "bytes": 8258496,
+  "sha256": "4002c9ca11aea1da8741db86cbe32f056453a88768d8b15d1ac823553c5eec04",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -2407,7 +2408,7 @@
    "sha256": "210407c6c4001197e99d2b979f2a9f57db3dcc2534867600232b19d9632d781b"
   },
   {
-   "name": "batch/hidden.last",
+   "name": "batch/hidden.0",
    "dtype": "f32",
    "shape": [
     2,
@@ -2415,6 +2416,318 @@
     1024
    ],
    "offset": 5784512,
+   "bytes": 98304,
+   "sha256": "9a53bf50528d3373161d76ca6c6d5bf8d82e1970207ff6bdf510b68a3f319a62",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.1",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 5882816,
+   "bytes": 98304,
+   "sha256": "3dbdb3c4632473ea9be0530dc27d442378689d6d5c4a58e6c3ca925c9dfc8854",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.2",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 5981120,
+   "bytes": 98304,
+   "sha256": "5548a900dc62ce57cf9712a410cfa019206a4894dd3fef096cd06a58d38bada7",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.3",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6079424,
+   "bytes": 98304,
+   "sha256": "bb7ab122c8658dc675e835df356367c3ac3bbc74e918420cb5091523452dc91d",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.4",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6177728,
+   "bytes": 98304,
+   "sha256": "4df3efbe46918ea777d4c6e85956fd5e73d22d33169ed36fed8f505b4032da95",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.5",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6276032,
+   "bytes": 98304,
+   "sha256": "01ff4bd2bde10f390dc6a8264e50eb24073bedc7ef34c44fc5bd2cb6f17765bc",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.6",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6374336,
+   "bytes": 98304,
+   "sha256": "45c9a35c9e1b4d6933e60c2361251970a46448c99f57eab7dcd5b181762c6a45",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.7",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6472640,
+   "bytes": 98304,
+   "sha256": "f2782c0dd7281e9b7b8c60d36318ff35b9a842ee015449932adc7efb2f7fe286",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.8",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6570944,
+   "bytes": 98304,
+   "sha256": "a6e5a3e10c5a84d9423bc1fdc984776721a22e473a5f1aa3321fff04e01ac6a4",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.9",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6669248,
+   "bytes": 98304,
+   "sha256": "54b039282fc6029357519a07821b389e8fa124abc261502c8cfb18da275091e6",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.10",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6767552,
+   "bytes": 98304,
+   "sha256": "487bbcd52d7cd7d3235cdd3269740fe545c29609343462314e9c7e2d38d4d4ee",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.11",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6865856,
+   "bytes": 98304,
+   "sha256": "edfda4eeb84d5b45f22e57f1661890441e5ea9a04898a5418d3eb335ae1b26d7",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.12",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 6964160,
+   "bytes": 98304,
+   "sha256": "a6f0f6eda5577d96dd68e5a9a5e83a107daecf3a8dc1ef4dac2190bcfb381855",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.13",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7062464,
+   "bytes": 98304,
+   "sha256": "5ba4b5c77a77c3d6dfb7284bb0814cf46ee7aa9e561e8c55b98083e548fbf8cf",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.14",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7160768,
+   "bytes": 98304,
+   "sha256": "7ec1e400fbc4eb5dfa1794ba828cdc68044ceccafd894e456c9dbec400baefc0",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.15",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7259072,
+   "bytes": 98304,
+   "sha256": "72b4efe0119596930707b4574529dcb13fdf2f2d563a23b464abd0406cfc80a7",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.16",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7357376,
+   "bytes": 98304,
+   "sha256": "547ebd193fffbcca1232535ca18fe6f7926a3dd513ce0a94dd7d1373086ff3f1",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.17",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7455680,
+   "bytes": 98304,
+   "sha256": "ac500156aa33119833ad845ce67e331605d3da75e0060b4dbc2430327e79072b",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.18",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7553984,
+   "bytes": 98304,
+   "sha256": "700b0071a6bcc6c872c87b70108cc03a978635140c8b623b8d5fb5ac245faabb",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.19",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7652288,
+   "bytes": 98304,
+   "sha256": "0beca7545eb70b43db4e6b315fb045016292585f355c7f986d68681c330641c2",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.20",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7750592,
+   "bytes": 98304,
+   "sha256": "fab9f4e33c2d98b83cf13f3b892978ddaee85dc0d09138e49c95ef52429c215b",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.21",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7848896,
+   "bytes": 98304,
+   "sha256": "ba24d0088ed85de2278531e9dda50cdebe3e7430c73980ab459bcf840ec6a061",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.22",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 7947200,
+   "bytes": 98304,
+   "sha256": "013015d44d2bd722fdb90bb8f8a353d0223e6d14864683eebdeb48ee59c7deb9",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.23",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 8045504,
+   "bytes": 98304,
+   "sha256": "0b15a3aff5328cac3e3c7a1144157e56c21cb818c721a1ba6212657ea1d0afff",
+   "note": "padded positions are not meaningful"
+  },
+  {
+   "name": "batch/hidden.24",
+   "dtype": "f32",
+   "shape": [
+    2,
+    12,
+    1024
+   ],
+   "offset": 8143808,
    "bytes": 98304,
    "sha256": "9efaffdbda7b65d9767ee095c0b7e8b0913c1c130af331df2d19901c8f5f19aa",
    "note": "padded positions are not meaningful"
@@ -2426,7 +2739,7 @@
     2,
     1024
    ],
-   "offset": 5882816,
+   "offset": 8242112,
    "bytes": 8192,
    "sha256": "a84d9260fffb090411a8be33861d3a1f1b94d5308acc84ce0d27f08a3b2fb8e6"
   },
@@ -2436,7 +2749,7 @@
    "shape": [
     1024
    ],
-   "offset": 5891008,
+   "offset": 8250304,
    "bytes": 4096,
    "sha256": "4cae11fef12e8c41c43ccdc81544d74c95c5ba73df788e7487f6a2ea899a53a4",
    "note": "row 0 run alone, without padding"
@@ -2447,7 +2760,7 @@
    "shape": [
     1024
    ],
-   "offset": 5895104,
+   "offset": 8254400,
    "bytes": 4096,
    "sha256": "f7fa69c18b257fc84c0a9ad7218eb6470d02e66051bd8b228c04803d1ea194a0",
    "note": "row 1 run alone, without padding"

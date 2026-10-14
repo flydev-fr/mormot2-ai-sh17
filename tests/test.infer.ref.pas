@@ -37,7 +37,7 @@ type
   EInferRef = class(ESynException);
 
   /// element type of a reference tensor
-  TInferRefType = (irtF32, irtI32);
+  TInferRefType = (irtF32, irtI32, irtU8);
 
   /// one tensor of a reference dataset, as described by its manifest
   TInferRefTensor = record
@@ -87,6 +87,8 @@ type
     function F32(const aName: RawUtf8; out aCount: PtrInt): PSingleArray;
     /// pointer to the i32 elements of aName - raises EInferRef if missing or f32
     function I32(const aName: RawUtf8; out aCount: PtrInt): PIntegerArray;
+    /// pointer to the u8 bytes of aName - raises EInferRef if missing or not u8
+    function U8(const aName: RawUtf8; out aCount: PtrInt): PByteArray;
     /// the parsed manifest
     function Manifest: PDocVariantData;
     /// all tensors, in blob order
@@ -138,6 +140,10 @@ function FindInferRefDir(const aDataset: RawUtf8): TFileName;
 
 
 implementation
+
+const
+  /// element size of each reference type
+  REF_SIZE: array[TInferRefType] of integer = (4, 4, 1);
 
 { TInferRefSet }
 
@@ -200,6 +206,8 @@ begin
       t^.DType := irtF32
     else if dtype = 'i32' then
       t^.DType := irtI32
+    else if dtype = 'u8' then
+      t^.DType := irtU8
     else
       EInferRef.RaiseUtf8('%: unsupported dtype %', [t^.Name, dtype]);
     if not item^.GetAsArray('shape', shape) then
@@ -220,9 +228,10 @@ begin
     // compare in Int64 before narrowing to PtrInt: on Win32 count * 4 could wrap
     bytes := item^.I['bytes'];
     offset := item^.I['offset'];
-    if bytes <> count * 4 then
+    if bytes <> count * REF_SIZE[t^.DType] then
       EInferRef.RaiseUtf8('%: % bytes for % elements', [t^.Name, bytes, count]);
-    if (offset < 0) or (offset and 3 <> 0) or (offset > length(fBlob) - bytes) then
+    if (offset < 0) or (offset mod REF_SIZE[t^.DType] <> 0) or
+       (offset > length(fBlob) - bytes) then
       EInferRef.RaiseUtf8('%: offset % outside the blob', [t^.Name, offset]);
     t^.Count := count;
     t^.Offset := offset;
@@ -287,6 +296,11 @@ end;
 function TInferRefSet.F32(const aName: RawUtf8; out aCount: PtrInt): PSingleArray;
 begin
   result := Data(aName, irtF32, aCount);
+end;
+
+function TInferRefSet.U8(const aName: RawUtf8; out aCount: PtrInt): PByteArray;
+begin
+  result := Data(aName, irtU8, aCount);
 end;
 
 function TInferRefSet.I32(const aName: RawUtf8; out aCount: PtrInt): PIntegerArray;

@@ -57,8 +57,8 @@ type
 implementation
 
 const
-  DATASETS: array[0..3] of RawUtf8 = (
-    'ops', 'tiny-xlmr', 'bge-m3', 'bge-m3-embed-de');
+  DATASETS: array[0..4] of RawUtf8 = (
+    'ops', 'tiny-xlmr', 'bge-m3', 'bge-m3-embed-de', 'bge-m3-tokens');
 
 /// v / ||v|| in double, stored as single
 procedure Normalized(aValues: PSingleArray; aCount: PtrInt;

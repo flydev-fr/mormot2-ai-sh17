@@ -10,7 +10,7 @@ von Hand geändert.
 Jeder Datensatz ist ein Ordner mit `manifest.json` und `tensors.bin`:
 - `tensors.bin` enthält die Tensoren als rohe Little-Endian-Werte, hintereinander,
   4-Byte-ausgerichtet;
-- `manifest.json` beschreibt jeden Tensor mit `name`, `dtype` (`f32` oder `i32`),
+- `manifest.json` beschreibt jeden Tensor mit `name`, `dtype` (`f32`, `i32` oder `u8`),
   `shape` (zeilenweise, C-Reihenfolge), `offset`, `bytes` und `sha256`. Dazu kommen die
   Hashes der ganzen Datei, Modellrevision, Umgebung und Pipeline, außerdem der Zeitpunkt der
   Erzeugung. Die Blobs sind reproduzierbar, die Manifeste wegen dieses Zeitstempels nicht.
@@ -24,8 +24,9 @@ verglichen, sondern elementweise: `|a − r| ≤ atol + rtol·|r|`, dazu Kosinus
 | Ordner | Inhalt | Größe |
 |---|---|---|
 | `ops/` | Operator-Fixtures: Linear (`x·Wᵀ + b`), LayerNorm (nicht-triviale γ/β, fast konstante und konstante Zeile), maskiertes Softmax (großer Logit), exaktes GELU (erf), L2 (Zeile mit Norm ~1e-20). Eingaben f32, Erwartung in float64 gerechnet. | 5 KiB |
-| `tiny-xlmr/` | XLM-R mit 2 Layern, Breite 32, 4 Köpfe, Vokabular 64, BGE-M3-Konventionen (pad 1, bos 0, eos 2, eps 1e-5, exaktes GELU). Vertrag sind `model.safetensors` und `config.json`, nicht der Seed. Drei Sequenzen mit allen Zuständen, dazu derselbe Inhalt als rechts gepaddeter Batch. | 106 KiB |
-| `bge-m3/` | Sechs kurze Fälle (≤ 16 Tokens inkl. `<s>`/`</s>`): leer, nur Leerzeichen, Handwerkstext, Unicode, mehrsprachig, Sondertoken-Literal. Je Fall IDs, Maske, Positionen, alle 25 Zustände (0 = Ausgang des Embedding-Moduls nach LayerNorm, 1–24 = Ausgang von Layer k), CLS und normierter Vektor. Dazu ein rechts gepaddeter Batch aus zwei Texten, jeder auch als Einzellauf. Prüfung der Sondertoken-Literale unter `tokenizer_checks`. | 5,6 MiB |
+| `tiny-xlmr/` | XLM-R mit 2 Layern, Breite 32, 4 Köpfe, Vokabular 64, BGE-M3-Konventionen (pad 1, bos 0, eos 2, eps 1e-5, exaktes GELU). Vertrag sind `model.safetensors` und `config.json`, nicht der Seed. Drei Sequenzen mit allen Zuständen, dazu derselbe Inhalt als rechts gepaddeter Batch, ebenfalls mit allen Zuständen. | 106 KiB |
+| `bge-m3/` | Sechs kurze Fälle (≤ 16 Tokens inkl. `<s>`/`</s>`): leer, nur Leerzeichen, Handwerkstext, Unicode, mehrsprachig, Sondertoken-Literal. Je Fall IDs, Maske, Positionen, alle 25 Zustände (0 = Ausgang des Embedding-Moduls nach LayerNorm, 1–24 = Ausgang von Layer k), CLS und normierter Vektor. Dazu ein rechts gepaddeter Batch aus zwei Texten mit allen Zuständen, jeder Text auch als Einzellauf. Prüfung der Sondertoken-Literale unter `tokenizer_checks`. | 7,9 MiB |
+| `bge-m3-tokens/` | Token-IDs als Gate für den Tokenizer: alle 320 Texte aus embed-de, 128 entworfene Grenzfälle (Leerraum aller Art, Steuer- und Nullbreitenzeichen, kombinierende Zeichen, Vollbreite, Ligaturen, Emoji mit ZWJ, mehrere Schriften, U+2581 im Text, alle Sondertoken-Literale einzeln/angrenzend/doppelt, 511/512/513/602 Tokens) und 900 erzeugte Unicode-Mischungen. Je Fall Text, normalisierter Text (SentencePiece) und die IDs; wo der HF-Tokenizer abweicht, zusätzlich `hf_ids`. Text und normalisierter Text liegen zusätzlich byte-genau im Blob (`texts`, `normalized` als `u8`): Ein JSON-Leser darf ein maskiertes NUL verlieren (mORMot liest es als `?`). | 0,4 MiB |
 | `bge-m3-embed-de/` | FP32-Vektoren des Korpus [embed-de](../embed-de/) (262 Dokumente, 58 Anfragen, Zeile = Dateizeile). Sie ersetzen weder das lembed-Q8-Orakel in `embed-de/reference/` noch das nDCG-Gate von Phase 1b. | 1,25 MiB |
 
 Gemessen am 2026-10-14:
