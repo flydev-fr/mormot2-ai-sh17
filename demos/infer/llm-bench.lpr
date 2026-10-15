@@ -184,8 +184,19 @@ begin
   LinearCalls := 0;
 end;
 
+{$ifdef OSDARWIN}
+/// the libc call: struct rusage starts with two timevals (16 bytes each on a
+// 64-bit Darwin), then ru_maxrss in bytes
+function getrusage(aWho: integer; aUsage: pointer): integer; cdecl;
+  external 'c' name 'getrusage';
+{$endif OSDARWIN}
+
 /// peak resident memory in MB, -1 if unknown
 function PeakRssMB: integer;
+{$ifdef OSDARWIN}
+var
+  usage: array[0..17] of Int64; // struct rusage: 144 bytes
+{$endif OSDARWIN}
 {$ifdef OSLINUX}
 var
   s: RawUtf8;
@@ -197,6 +208,10 @@ var
 {$endif OSWINDOWS}
 begin
   result := -1;
+  {$ifdef OSDARWIN}
+  if getrusage(0 {RUSAGE_SELF}, @usage) = 0 then
+    result := usage[4] shr 20;
+  {$endif OSDARWIN}
   {$ifdef OSLINUX}
   s := StringFromFileNoSize('/proc/self/status');
   p := StrPosI('VMHWM:', pointer(s));

@@ -696,7 +696,22 @@ bestehen und die Benchmarks dokumentiert sind.
   unverändert grün. Gegenproben (Zeilen- und Abschnittsversatz, falsche RoPE-Zeile,
   Position ohne Vorgänger, SiLU ohne Single-Rundung) schlagen an.
 
-- Offen in Phase 3: Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
+**3f, macOS erledigt 2026-10-15: Benchmark auf dem Apple M2 Pro** (FPC 3.2.4, 7 Threads,
+NEON-Dotprod; zwei Läufe, bis 10 % auseinander). Die Infer-Suite läuft dort mit allen
+Modellen grün (2010 Prüfungen, wie auf dem Snapdragon).
+
+| | Prefill | Dekodieren | Speicher-Peak |
+|---|---|---|---|
+| F32, 200 | 162–181 Tokens/s | 42 Tokens/s | 3,8 GB |
+| Q8_0, 200 | 515–562 Tokens/s | 70–75 Tokens/s | 2,1 GB |
+| F32, 1000 | 147–160 Tokens/s | 31–32 Tokens/s | 4,1 GB |
+| Q8_0, 1000 | 371–408 Tokens/s | 44–47 Tokens/s | 2,4 GB |
+
+Der M2 Pro dekodiert 10 bis 30 % schneller als der Snapdragon (vermutlich die höhere
+Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt auch unter macOS
+(`getrusage`).
+
+- Offen in Phase 3: Q4/K-Quants (GGUF), Benchmark auf x86_64 (RTX-Rechner).
 
 ### Phase 4 — GPU
 

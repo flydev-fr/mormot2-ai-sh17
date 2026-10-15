@@ -39,7 +39,7 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 720 | 2000 |
 | Windows x86 | **Delphi 7** | 1253 | 708 | 1230 ⁶ |
-| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | 1597 ⁷ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2010 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
@@ -53,9 +53,9 @@ that target.
 client: about 540 assertions with the model, about 300 without it).
 ⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
 model, the tokenizer and the chat template run.
-⁷ With all models, NEON dot-product kernels; the BGE-M3 corpus gate passes there too
-(nDCG@10 0.9004, the same as on the Snapdragon). Run before the native client tests were
-added (about 160 assertions with the model).
+⁷ With all models, NEON dot-product kernels. The BGE-M3 corpus gate passed there in an
+earlier run of the same day (nDCG@10 0.9004, the same as on the Snapdragon); it is not
+part of this count.
 ⁸ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
 (without the model).
 
@@ -156,6 +156,16 @@ then 32 new tokens (`demos/infer/llm-bench`), 2026-10-15:
 | Q8_0 | 498 tokens/s | 64 tokens/s | 2.1 GB |
 | FP32, 1000-token prompt | 138 tokens/s | 24 tokens/s | 4.1 GB |
 | Q8_0, 1000-token prompt | 240 tokens/s | 40 tokens/s | 2.4 GB |
+
+The same on an Apple M2 Pro (macOS, FPC 3.2.4, 7 threads; two runs, which differ by
+up to 10 %):
+
+| | prefill | decode | peak RSS |
+|---|---|---|---|
+| FP32 | 162-181 tokens/s | 42 tokens/s | 3.8 GB |
+| Q8_0 | 515-562 tokens/s | 70-75 tokens/s | 2.1 GB |
+| FP32, 1000-token prompt | 147-160 tokens/s | 31-32 tokens/s | 4.1 GB |
+| Q8_0, 1000-token prompt | 371-408 tokens/s | 44-47 tokens/s | 2.4 GB |
 
 FP32 keeps greedy output token-identical to `transformers`; Q8_0 passes its own gate but
 can flip a close decision - with it, Qwen3-0.6B answers the weather question of the
