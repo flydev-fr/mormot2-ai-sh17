@@ -35,10 +35,10 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 2136 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2136 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 720 | 2126 |
-| Windows x86 | **Delphi 7** | 1253 | 708 | 1309 ⁶ |
+| Windows x64 | Delphi 13 | 1257 | 726 | 2126 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 1309 ⁶ |
 | macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2010 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
