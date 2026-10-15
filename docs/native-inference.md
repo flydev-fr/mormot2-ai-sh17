@@ -802,7 +802,36 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   (benutzerdefinierte Tokens verworfen, unbekannte Typen übergangen, Pre-Tokenizer
   ungeprüft, Vokabular um eins zu kurz) schlagen an.
 
-- Offen in Phase 3: K-Quants (3e-3), Q4_0-Kernel (s. o.), Benchmark auf x86_64
+**3e-3a, erledigt 2026-10-15: K-Quants Q4_K und Q6_K (Korrektheit).**
+
+- Die Typen der verbreiteten Q4_K_M-Dateien: `idtQ4_K` (Superblock zu 256 Werten in 8
+  Teilblöcken mit 6-Bit-Skala und -Minimum, 144 Bytes) und `idtQ6_K` (16 Gruppen mit
+  8-Bit-Skala, 6-Bit-Werte, 210 Bytes); der GGUF-Leser nimmt sie an (ggml-Typen 12, 14).
+- `InferRowToF32` dequantisiert sie mit den Single-Schritten von ggmls
+  `dequantize_row_*` (bitgleich geprüft). Aktivierungen werden wie bei ggml als Q8_K
+  quantisiert (`InferQuantizeRowQ8_K`: Skala aus dem ersten größten Wert mit Vorzeichen,
+  Gleichstände zur geraden Zahl, Blocksummen je 16).
+- `Linear`: je Teilblock exakte Ganzzahlsummen, bei Q4_K die Minima über die
+  Blocksummen der Aktivierungen; die Skalen in Double. Referenz und schnelles Backend
+  rechnen gleich (das schnelle verteilt die Kacheln auf den Pool); SIMD-Kernel folgen in
+  3e-3b.
+- Das Modell nutzt Q4_K- und Q6_K-Matrizen aus GGUF direkt, die Skalen (bei Q6_K am
+  Blockende) beim Laden geprüft.
+- Datei: `unsloth/Qwen3-0.6B-GGUF`, `Qwen3-0.6B-Q4_K_M.gguf`, Revision `50968a4`,
+  SHA-256 `ac2d9771…`, als `vendor/models/qwen3-0.6b-q4_k_m.gguf`: Q4_K, Q6_K für
+  `token_embd` (also den gebundenen Kopf) und je die Hälfte von `attn_v` und
+  `ffn_down`, mit Importance-Matrix quantisiert. Lädt in 2,9 s; jede Matrix mit Kosinus
+  ≥ 0,997 an den BF16-Gewichten.
+- Gate gegen FP32: Kosinus 0,867 (`chat_tool`) bis 0,990, Fehler bis 9,0 - deutlich
+  besser als Q4_0 (0,66 bis 0,96), aber Greedy weicht auch hier ab, wo die Referenz
+  1,37 sicher war (`chat_en` antwortet „Paris.“ mit Punkt).
+- Tests gegen ggml selbst (Referenzziel `qk`): Q8_K-Bytes, Q4_K- und Q6_K-Dequantisierung
+  bitgleich, `Linear` gegen `ggml_vec_dot_q4_K_q8_K` / `_q6_K_q8_K`; zufällige Blöcke:
+  `Exact` und Float bitgleich zur Referenz, nahe F32 auf den dequantisierten Zeilen.
+  Gegenproben (Skala/Minimum von Teilblock 4-7, vertauschte Nibbles, Minima addiert,
+  Q6_K-Hochbits, Q8_K-Gleichstände und erster Größter) schlagen an.
+
+- Offen in Phase 3: K-Quant-Kernel (3e-3b), Q4_0-Kernel (s. o.), Benchmark auf x86_64
   (RTX-Rechner).
 
 ### Phase 4 — GPU

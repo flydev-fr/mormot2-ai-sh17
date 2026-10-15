@@ -35,10 +35,10 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2161 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2247 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 726 | 2151 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 1322 ⁶ |
+| Windows x64 | Delphi 13 | 1257 | 726 | 2237 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 1383 ⁶ |
 | macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2010 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
@@ -555,8 +555,9 @@ Next, in this order:
    up to 1.8x faster). Q4_0 works (byte-identical to ggml) but is experimental: too
    coarse for a 0.6B model and, without kernels of its own, slower than Q8_0. Qwen3
    loads straight from llama.cpp GGUF files (Q8_0, Q4_0, F16), tokenizer included, so
-   one .gguf file is a complete native `ILlmClient`. Next: the K-quants (Q4_K_M) with
-   fused SIMD kernels, then Q4_0 kernels; a benchmark on x86_64.
+   one .gguf file is a complete native `ILlmClient`, and Q4_K_M files load too (Q4_K
+   and Q6_K, checked against ggml itself). Next: SIMD kernels for the K-quants, then
+   Q4_0 kernels; a benchmark on x86_64.
 2. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

@@ -64,6 +64,9 @@ type
     /// Q4_0 Linear: exact on all cores = the reference bit for bit (partial
     // tiles, rows beyond the stack buffer), the float path within tolerance
     procedure LinearQ4MatchesReference;
+    /// Q4_K and Q6_K Linear: exact on all cores = the reference bit for bit,
+    // the float path within tolerance, both near F32 of the dequantized rows
+    procedure LinearKMatchesReference;
     /// default mode: Linear, Attention and GELU within their tolerances
     procedure FastModeWithinTolerance;
     /// the decoder operations (phase 3): CausalAttention exact = the reference
@@ -478,6 +481,104 @@ begin
     CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'Q8_0 no bias % x % x %',
       [rows, nin, nout]);
   end;
+end;
+
+/// random K-quant rows: every bit pattern of the quants and scales, finite
+// half-float scales of both signs
+function RandomK(aType: TInferDType; aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+var
+  i, b, nb, size: PtrInt;
+  p: PByteArray;
+begin
+  size := INFER_DTYPE_SIZE[aType];
+  nb := aOut * (aIn div 256);
+  SetLength(result, nb * size);
+  p := pointer(result);
+  for i := 0 to nb * size - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    p^[i] := aSeed shr 24;
+  end;
+  for b := 0 to nb - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    if aType = idtQ4_K then
+    begin
+      PInferBlockQ4_K(@p^[b * size])^.d :=
+        InferSingleToHalf(((aSeed shr 8) and 1023) / 65536 + 1e-4);
+      PInferBlockQ4_K(@p^[b * size])^.dmin :=
+        InferSingleToHalf(((aSeed shr 18) and 1023) / 131072);
+    end
+    else
+      PInferBlockQ6_K(@p^[b * size])^.d :=
+        InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 65536 + 1e-4);
+  end;
+end;
+
+procedure TTestInferFast.LinearKMatchesReference;
+const
+  // rows, in, out: partial tiles, several super-blocks
+  SHAPES: array[0..4, 0..2] of integer = (
+    (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (64, 256, 40));
+var
+  i, k, r, o, rows, nin, nout: PtrInt;
+  x, bias, y1, y2, y3, wf: TSingleDynArray;
+  wq: RawByteString;
+  kind: TInferDType;
+  e: double;
+  cmp: TInferCompare;
+begin
+  for k := 0 to 1 do
+  begin
+    if k = 0 then
+      kind := idtQ4_K
+    else
+      kind := idtQ6_K;
+    for i := 0 to high(SHAPES) do
+    begin
+      rows := SHAPES[i, 0];
+      nin := SHAPES[i, 1];
+      nout := SHAPES[i, 2];
+      Fill(x, rows * nin, 311 + i, 3);
+      Fill(bias, nout, 331 + i, 1);
+      wq := RandomK(kind, nout, nin, 341 + i + 100 * k);
+      SetLength(y1, rows * nout);
+      SetLength(y2, rows * nout);
+      SetLength(y3, rows * nout);
+      fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), kind), nout,
+        pointer(bias), pointer(y1));
+      fExact.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), kind), nout,
+        pointer(bias), pointer(y2));
+      CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), '% exact % x % x %',
+        [INFER_DTYPE_NAME[kind], rows, nin, nout]);
+      fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), kind), nout,
+        pointer(bias), pointer(y3));
+      e := RelError(pointer(y3), pointer(y1), rows * nout);
+      CheckUtf8(e <= 2e-6, '% float % x % x %: relative error %',
+        [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
+      // independent of the block sums: F32 on the dequantized weights, apart
+      // only by the rounding of the activations to Q8_K
+      SetLength(wf, nout * nin);
+      for o := 0 to nout - 1 do
+        InferRowToF32(pointer(wq), kind, o, nin, @wf[o * nin]);
+      fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wf), idtF32), nout,
+        pointer(bias), pointer(y3));
+      // (random weights: outputs in the thousands, so a direction, not a bound)
+      cmp := InferCompare(pointer(y1), pointer(y3), rows * nout, 0.05, 0.02);
+      CheckUtf8(cmp.Cosine > 0.9999,
+        '% against F32 of its dequantized weights, % x % x %: %',
+        [INFER_DTYPE_NAME[kind], rows, nin, nout, InferCompareText(cmp)]);
+    end;
+  end;
+  r := 0; // shapes with a partial block are refused
+  try
+    fFast.Linear(pointer(x), 1, 300, InferWeight(pointer(wq), idtQ6_K), 1, nil,
+      pointer(y1));
+  except
+    on EInferError do
+      r := 1;
+  end;
+  Check(r = 1, 'K-quants need whole blocks of 256');
 end;
 
 procedure TTestInferFast.LinearQ4MatchesReference;

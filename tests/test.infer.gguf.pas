@@ -64,6 +64,9 @@ type
     // dequantize exactly and give the Q4_0 Linear of ggml-cpu; Q8_0 weights
     // quantize like ggml's reference quantizer (ties away from zero)
     procedure Q4LikeGgml;
+    /// Q8_K activations, Q4_K and Q6_K dequantization and their Linear: the
+    // bytes and sums of ggml itself
+    procedure KQuantsLikeGgml;
     /// the tiny GGUF: metadata, tensors, typed access
     procedure ReaderReadsTinyFile;
     /// truncated, malformed and hostile files are refused, never read past
@@ -495,6 +498,84 @@ begin
     // ggml sums in single, we in double: the integer block sums are the same
     cmp := InferCompare(pointer(out), y, rows * nout, 1e-5, 1e-5);
     CheckUtf8(InferCompareOk(cmp), 'Q4_0 linear like ggml: %', [InferCompareText(cmp)]);
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferGguf.KQuantsLikeGgml;
+var
+  ref: TInferRefSet;
+  dir: TFileName;
+  x, b, y, deq: PSingleArray;
+  blocks, w: PByteArray;
+  t: PInferRefTensor;
+  n, m, rows, cols, nin, nout, r, k, size: PtrInt;
+  mine: RawByteString;
+  out, row: TSingleDynArray;
+  cmp: TInferCompare;
+  kind: TInferDType;
+  name: RawUtf8;
+begin
+  dir := FindInferRefDir('qk');
+  if CheckFailed(dir <> '', 'qk found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    // Q8_K activations: the bytes of ggml-cpu's quantize_row_q8_K
+    t := ref.Tensor('q8k/x');
+    rows := t^.Shape[0];
+    cols := t^.Shape[1];
+    x := ref.F32('q8k/x', n);
+    blocks := ref.U8('q8k/blocks', m);
+    CheckEqual(m, rows * (cols div 256) * SizeOf(TInferBlockQ8_K), 'Q8_K bytes');
+    SetLength(mine, (cols div 256) * SizeOf(TInferBlockQ8_K));
+    for r := 0 to rows - 1 do
+    begin
+      InferQuantizeRowQ8_K(@x^[r * cols], cols, pointer(mine));
+      CheckUtf8(CompareMem(pointer(mine), @blocks^[r * length(mine)], length(mine)),
+        'Q8_K row % like quantize_row_q8_K', [r]);
+    end;
+    // Q4_K and Q6_K weights: dequantized bit for bit, the Linear like ggml
+    t := ref.Tensor('linear/x');
+    rows := t^.Shape[0];
+    nin := t^.Shape[1];
+    nout := ref.Tensor('linear/bias')^.Shape[0];
+    x := ref.F32('linear/x', n);
+    b := ref.F32('linear/bias', n);
+    SetLength(row, nin);
+    SetLength(out, rows * nout);
+    for k := 0 to 1 do
+    begin
+      if k = 0 then
+      begin
+        kind := idtQ4_K;
+        name := 'q4_K';
+      end
+      else
+      begin
+        kind := idtQ6_K;
+        name := 'q6_K';
+      end;
+      size := (nin div 256) * INFER_DTYPE_SIZE[kind];
+      w := ref.U8(name + '/weight', n);
+      CheckEqual(n, nout * size, name + ' bytes');
+      deq := ref.F32(name + '/dequant', n);
+      for r := 0 to nout - 1 do
+      begin
+        InferRowToF32(w, kind, r, nin, pointer(row));
+        cmp := InferCompare(pointer(row), @deq^[r * nin], nin, 0, 0);
+        CheckUtf8(InferCompareOk(cmp), '% dequantized row %: %',
+          [name, r, InferCompareText(cmp)]);
+      end;
+      CheckUtf8(fCpu.Supports(ioLinear, kind), 'the CPU backend takes %', [name]);
+      fCpu.Linear(x, rows, nin, InferWeight(w, kind), nout, b, pointer(out));
+      y := ref.F32(name + '/y', n);
+      // ggml sums in single, we in double: the integer block sums are the same
+      cmp := InferCompare(pointer(out), y, rows * nout, 1e-4, 1e-5);
+      CheckUtf8(InferCompareOk(cmp), '% linear like ggml: %',
+        [name, InferCompareText(cmp)]);
+    end;
   finally
     ref.Free;
   end;

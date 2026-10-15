@@ -182,6 +182,10 @@ begin
       result := idtQ4_0;
     8:
       result := idtQ8_0;
+    12:
+      result := idtQ4_K;
+    14:
+      result := idtQ6_K;
     30:
       result := idtBF16;
   else

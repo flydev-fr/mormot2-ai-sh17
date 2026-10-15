@@ -557,7 +557,7 @@ begin
   // for a matrix (aBlocks)
   if not ((t^.DType in [idtF32, idtBF16]) or
           ((fGguf <> nil) and ((t^.DType = idtF16) or
-           (aBlocks and (t^.DType in [idtQ8_0, idtQ4_0]))))) then
+           (aBlocks and (t^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]))))) then
     EInferError.RaiseUtf8('%: % is %, not supported here',
       [self, aName, INFER_DTYPE_NAME[t^.DType]]);
   result := t;
@@ -619,21 +619,31 @@ begin
   end;
 end;
 
-/// raise unless every FP16 scale of the aCount blocks is finite
+/// raise unless every FP16 scale of the blocks of t is finite
 procedure CheckScales(t: PInferTensor; const aName: RawUtf8; aModel: TObject);
 var
-  b, size: PtrInt;
-  p: PByte;
+  b, size, first, second: PtrInt;
+  p: PByteArray;
 begin
   size := INFER_DTYPE_SIZE[t^.DType];
+  // where the half-float scales sit: d first (Q8_0, Q4_0), d and dmin first
+  // (Q4_K), d last (Q6_K)
+  first := 0;
+  second := -1;
+  case t^.DType of
+    idtQ4_K:
+      second := 2;
+    idtQ6_K:
+      first := SizeOf(TInferBlockQ6_K) - 2;
+  end;
   p := t^.Data;
-  for b := 0 to t^.Count div 32 - 1 do
+  for b := 0 to t^.Count div INFER_DTYPE_BLOCK[t^.DType] - 1 do
   begin
-    // the scale opens every block (TInferBlockQ8_0 and TInferBlockQ4_0)
-    if PWord(p)^ and $7fff >= $7c00 then
+    if (PWord(@p^[first])^ and $7fff >= $7c00) or
+       ((second >= 0) and (PWord(@p^[second])^ and $7fff >= $7c00)) then
       EInferError.RaiseUtf8('%: % has a scale that is no finite number in block %',
         [aModel, aName, b]);
-    inc(p, size);
+    p := @p^[size];
   end;
 end;
 
@@ -650,7 +660,7 @@ begin
     // a GGUF file decides: blocks in place, F32 in place, F16 / BF16 widened
     t := Checked(aName, [aRows, aCols], true);
     case t^.DType of
-      idtQ8_0, idtQ4_0:
+      idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K:
         begin
           CheckScales(t, aName, self);
           result := InferWeight(t^.Data, t^.DType);
@@ -734,7 +744,7 @@ begin
   fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
     fGguf <> nil);
   // read per token: its scales checked here, also when the head is untied
-  if fEmbedSrc^.DType in [idtQ8_0, idtQ4_0] then
+  if fEmbedSrc^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K] then
     CheckScales(fEmbedSrc, 'model.embed_tokens.weight', self);
   if (fGguf = nil) and (fWeights = idtF32) then
     fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),

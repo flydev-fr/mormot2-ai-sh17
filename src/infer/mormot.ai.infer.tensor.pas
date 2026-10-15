@@ -45,7 +45,9 @@ type
     idtU8,
     idtI8,
     idtQ8_0,
-    idtQ4_0);
+    idtQ4_0,
+    idtQ4_K,
+    idtQ6_K);
 
   /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
   // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
@@ -70,6 +72,43 @@ type
     TInferBlockQ4_0;
   PInferBlockQ4_0Array = ^TInferBlockQ4_0Array;
 
+  /// one Q4_K super-block of 256 values as ggml stores it
+  // - 8 sub-blocks of 32: value = d * sc[j] * q - dmin * m[j], q in 0..15, sc
+  // and m 6-bit, packed in scales (see InferScaleMinK4); sub-block 2k takes
+  // the low nibbles of qs[32k..32k+31], sub-block 2k+1 their high nibbles
+  // - d and dmin are IEEE half floats (raw bits); 144 bytes
+  TInferBlockQ4_K = packed record
+    d, dmin: word;
+    scales: array[0..11] of byte;
+    qs: array[0..127] of byte;
+  end;
+  PInferBlockQ4_K = ^TInferBlockQ4_K;
+
+  /// one Q6_K super-block of 256 values as ggml stores it
+  // - 16 groups of 16: value = d * scales[g] * (q - 32), q in 0..63 from 4 low
+  // bits in ql and 2 high bits in qh (see InferRowToF32 for the layout)
+  // - d is an IEEE half float (raw bits); 210 bytes
+  TInferBlockQ6_K = packed record
+    ql: array[0..127] of byte;
+    qh: array[0..63] of byte;
+    scales: array[0..15] of shortint;
+    d: word;
+  end;
+  PInferBlockQ6_K = ^TInferBlockQ6_K;
+
+  /// one Q8_K block of 256 activations, as ggml quantizes them for a K-quant
+  // dot product: value = d * qs[i]; bsums[g] = the sum of qs[16g..16g+15]
+  // - d is a single, not a half float; 292 bytes
+  TInferBlockQ8_K = packed record
+    d: single;
+    qs: array[0..255] of shortint;
+    bsums: array[0..15] of smallint;
+  end;
+  PInferBlockQ8_K = ^TInferBlockQ8_K;
+  TInferBlockQ8_KArray = array[0..(MaxInt div SizeOf(TInferBlockQ8_K)) - 1] of
+    TInferBlockQ8_K;
+  PInferBlockQ8_KArray = ^TInferBlockQ8_KArray;
+
   /// a named, typed, shaped view on elements owned by someone else
   TInferTensor = record
     /// the tensor name, e.g. 'encoder.layer.0.attention.self.query.weight'
@@ -91,15 +130,16 @@ type
 const
   /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1, 34, 18);
+    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210);
 
   /// elements per block of each type: 1 for plain element types
-  INFER_DTYPE_BLOCK: array[TInferDType] of byte = (
-    0, 1, 1, 1, 1, 1, 1, 1, 32, 32);
+  INFER_DTYPE_BLOCK: array[TInferDType] of word = (
+    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256);
 
   /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
-    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0');
+    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0', 'Q4_K',
+    'Q6_K');
 
 /// the element type of a safetensors dtype name, idtUnknown if not supported
 // - block types are no safetensors types and never returned
@@ -124,9 +164,13 @@ function InferSingleToHalf(aValue: single): word;
 
 /// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
 // - F32 is copied, Q8_0 and Q4_0 dequantized (d * q, d * (q - 8): exact in
-// single); aCols must be a multiple of the block size
+// single), Q4_K and Q6_K with the single steps of ggml's dequantize_row_*;
+// aCols must be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
+
+/// the 6-bit scale and min of sub-block j (0..7) of a Q4_K super-block
+procedure InferScaleMinK4(j: PtrInt; aScales: PByteArray; out aScale, aMin: integer);
 
 /// product of aShape, refused (false) when a dimension is negative or the product
 // would exceed aLimit - checked before multiplying, so it can never overflow
@@ -252,6 +296,82 @@ begin
   result := sign or half;
 end;
 
+procedure InferScaleMinK4(j: PtrInt; aScales: PByteArray; out aScale, aMin: integer);
+begin
+  if j < 4 then
+  begin
+    aScale := aScales^[j] and 63;
+    aMin := aScales^[j + 4] and 63;
+  end
+  else
+  begin
+    aScale := (aScales^[j + 4] and 15) or ((aScales^[j - 4] shr 6) shl 4);
+    aMin := (aScales^[j + 4] shr 4) or ((aScales^[j] shr 6) shl 4);
+  end;
+end;
+
+/// 256 values of a Q4_K super-block: y = d1 * q - m1 as ggml's single steps
+// - d1 = d * sc has at most 17 significant bits, d1 * q at most 21: exact in a
+// single, so a fused multiply-add gives the same bits as two roundings
+procedure DequantQ4K(b: PInferBlockQ4_K; y: PSingleArray);
+var
+  k, l, sc, m: integer;
+  d, dmin, d1, m1: single;
+begin
+  d := InferHalfToSingle(b^.d);
+  dmin := InferHalfToSingle(b^.dmin);
+  for k := 0 to 3 do
+  begin
+    InferScaleMinK4(2 * k, @b^.scales, sc, m);
+    d1 := d * sc;
+    m1 := dmin * m;
+    for l := 0 to 31 do
+      y^[64 * k + l] := d1 * (b^.qs[32 * k + l] and 15) - m1;
+    InferScaleMinK4(2 * k + 1, @b^.scales, sc, m);
+    d1 := d * sc;
+    m1 := dmin * m;
+    for l := 0 to 31 do
+      y^[64 * k + 32 + l] := d1 * (b^.qs[32 * k + l] shr 4) - m1;
+  end;
+end;
+
+/// the 6-bit value of position i (0..255) of a Q6_K super-block, minus 32
+function Q6KValue(b: PInferBlockQ6_K; i: PtrInt): integer;
+var
+  n, l, h: PtrInt;
+begin
+  n := i shr 7;       // which half of 128
+  i := i and 127;
+  l := i and 31;      // the byte inside each run of 32
+  h := b^.qh[32 * n + l] shr (2 * (i shr 5)) and 3;
+  case i shr 5 of
+    0:
+      result := b^.ql[64 * n + l] and 15;
+    1:
+      result := b^.ql[64 * n + l + 32] and 15;
+    2:
+      result := b^.ql[64 * n + l] shr 4;
+  else
+    result := b^.ql[64 * n + l + 32] shr 4;
+  end;
+  result := (result or (h shl 4)) - 32;
+end;
+
+/// 256 values of a Q6_K super-block: y = (d * scale) * q, two roundings as
+// ggml's dequantize_row_q6_K
+procedure DequantQ6K(b: PInferBlockQ6_K; y: PSingleArray);
+var
+  i: PtrInt;
+  d, t: single;
+begin
+  d := InferHalfToSingle(b^.d);
+  for i := 0 to 255 do
+  begin
+    t := d * b^.scales[i shr 4];
+    y^[i] := t * Q6KValue(b, i);
+  end;
+end;
+
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 var
@@ -274,6 +394,20 @@ begin
             aDst^[b * 32 + j] := d * blk^.qs[j];
           inc(blk);
         end;
+      end;
+    idtQ4_K:
+      begin
+        nb := aCols shr 8;
+        for b := 0 to nb - 1 do
+          DequantQ4K(@PByteArray(aData)^[(aRow * nb + b) * SizeOf(TInferBlockQ4_K)],
+            @aDst^[b * 256]);
+      end;
+    idtQ6_K:
+      begin
+        nb := aCols shr 8;
+        for b := 0 to nb - 1 do
+          DequantQ6K(@PByteArray(aData)^[(aRow * nb + b) * SizeOf(TInferBlockQ6_K)],
+            @aDst^[b * 256]);
       end;
     idtQ4_0:
       begin

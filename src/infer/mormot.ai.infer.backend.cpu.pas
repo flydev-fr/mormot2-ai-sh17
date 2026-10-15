@@ -88,12 +88,28 @@ procedure InferQuantizeRowQ8_0Ref(x: PSingleArray; aCount: PtrInt;
 procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
   aBlocks: PInferBlockQ4_0Array);
 
+/// quantize aCount (a multiple of 256) activations into Q8_K blocks, as
+// ggml-cpu's quantize_row_q8_K before a K-quant dot product: d = m / -127 with
+// m the first value of the largest magnitude (d a single), q = the single
+// product x * (-127 / m) rounded to nearest even, at most 127; bsums per 16
+// - NaN and infinity are refused (EInferError)
+procedure InferQuantizeRowQ8_K(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_KArray);
+
+/// the dot product of aBlocks Q4_K super-blocks with Q8_K activations: per
+// sub-block the exact integer sums, scaled in double (the reference)
+function InferDotQ4K(w: PInferBlockQ4_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+
+/// the dot product of aBlocks Q6_K super-blocks with Q8_K activations
+function InferDotQ6K(w: PInferBlockQ6_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+
 /// aBlocks Q4_0 blocks as Q8_0 blocks: the same scale, q - 8 as the signed
 // value - exact, so every Q8_0 kernel computes the Q4_0 x Q8_0 dot product
 procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 
 type
-  /// scalar reference backend: every operation; Linear takes F32, Q8_0 or Q4_0
+  /// scalar reference backend: every operation; Linear takes F32, Q8_0, Q4_0,
+  // Q4_K or Q6_K
   TInferCpuBackend = class(TInferBackend)
   protected
     /// query rows aFirst..aLast of one head: scores, masked softmax, weighted
@@ -140,6 +156,8 @@ type
     Xq: PInferBlockQ8_0Array;
     Dx: PDoubleArray;
     Dxs: PSingleArray;
+    /// the activation rows as Q8_K blocks, for Q4_K / Q6_K weights
+    Xk: PInferBlockQ8_KArray;
     /// true: the FP32 arithmetic of the SIMD kernel (Q8_0 or F32 weights),
     // false: the exact one
     Fp32: boolean;
@@ -165,6 +183,7 @@ type
     fRows, fSeq, fHeadDim, fWidth: PtrInt;
     fKeep: PIntegerArray;
     fXq: array of TInferBlockQ8_0;
+    fXk: array of TInferBlockQ8_K;
     fDx: TDoubleDynArray;
     fDxs: TSingleDynArray;
     fScratch: array of TSingleDynArray;
@@ -661,6 +680,171 @@ begin
   end;
 end;
 
+procedure InferQuantizeRowQ8_K(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_KArray);
+var
+  b, j, g, s: PtrInt;
+  amax, m, v, iscale, t: single;
+  f: integer;
+  xb: PSingleArray;
+  blk: PInferBlockQ8_K;
+begin
+  for b := 0 to (aCount shr 8) - 1 do
+  begin
+    xb := @x^[b * 256];
+    blk := @aBlocks^[b];
+    amax := 0;
+    m := 0;
+    for j := 0 to 255 do
+    begin
+      if PCardinal(@xb^[j])^ and $7f800000 = $7f800000 then
+        EInferError.RaiseUtf8('InferQuantizeRowQ8_K: non-finite activation at %',
+          [b * 256 + j]);
+      v := Abs(xb^[j]);
+      if v > amax then // the first of equal magnitudes, as ggml
+      begin
+        amax := v;
+        m := xb^[j];
+      end;
+    end;
+    // m so small that -127 / m is no single: a zero block (ggml: only m = 0)
+    if amax < 3.7320437e-37 then // 127 / 3.4028235e38
+    begin
+      FillCharFast(blk^, SizeOf(blk^), 0);
+      continue;
+    end;
+    iscale := -127 / m; // one correctly rounded single division
+    for j := 0 to 255 do
+    begin
+      t := iscale * xb^[j];
+      // nearest, ties to even - spelled out: Round depends on the FPU mode
+      f := Trunc(t);
+      v := t - f;
+      if v > 0.5 then
+        inc(f)
+      else if v < -0.5 then
+        dec(f)
+      else if (v = 0.5) and odd(f) then
+        inc(f)
+      else if (v = -0.5) and odd(f) then
+        dec(f);
+      if f > 127 then
+        f := 127;
+      blk^.qs[j] := f;
+    end;
+    for g := 0 to 15 do
+    begin
+      s := 0;
+      for j := 16 * g to 16 * g + 15 do
+        inc(s, blk^.qs[j]);
+      blk^.bsums[g] := s;
+    end;
+    blk^.d := 1 / iscale;
+  end;
+end;
+
+function InferDotQ4K(w: PInferBlockQ4_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+var
+  b, j, l, k: PtrInt;
+  sc, m, isum, msum, s: integer;
+  dx: double;
+begin
+  result := 0;
+  for b := 0 to aBlocks - 1 do
+  begin
+    isum := 0; // at most 8 * 63 * 32 * 15 * 128: fits an integer
+    msum := 0;
+    for j := 0 to 7 do
+    begin
+      InferScaleMinK4(j, @w^.scales, sc, m);
+      k := 32 * (j shr 1);
+      s := 0;
+      if odd(j) then
+        for l := 0 to 31 do
+          inc(s, integer(w^.qs[k + l] shr 4) * x^.qs[32 * j + l])
+      else
+        for l := 0 to 31 do
+          inc(s, integer(w^.qs[k + l] and 15) * x^.qs[32 * j + l]);
+      inc(isum, sc * s);
+      inc(msum, m * (x^.bsums[2 * j] + x^.bsums[2 * j + 1]));
+    end;
+    dx := x^.d;
+    result := result + (InferHalfToSingle(w^.d) * dx) * isum -
+      (InferHalfToSingle(w^.dmin) * dx) * msum;
+    inc(w);
+    inc(x);
+  end;
+end;
+
+function InferDotQ6K(w: PInferBlockQ6_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+var
+  b, n, g, l, i: PtrInt;
+  q, isum, s: integer;
+  dx: double;
+begin
+  result := 0;
+  for b := 0 to aBlocks - 1 do
+  begin
+    isum := 0; // at most 16 * 128 * 16 * 32 * 128: fits an integer
+    for g := 0 to 15 do
+    begin
+      s := 0;
+      for l := 0 to 15 do
+      begin
+        i := 16 * g + l;
+        n := i shr 7;
+        q := w^.qh[32 * n + (i and 31)] shr (2 * ((i and 127) shr 5)) and 3;
+        case (i and 127) shr 5 of
+          0:
+            q := (w^.ql[64 * n + (i and 31)] and 15) or (q shl 4);
+          1:
+            q := (w^.ql[64 * n + (i and 31) + 32] and 15) or (q shl 4);
+          2:
+            q := (w^.ql[64 * n + (i and 31)] shr 4) or (q shl 4);
+        else
+          q := (w^.ql[64 * n + (i and 31) + 32] shr 4) or (q shl 4);
+        end;
+        inc(s, (q - 32) * x^.qs[i]);
+      end;
+      inc(isum, w^.scales[g] * s);
+    end;
+    dx := x^.d;
+    result := result + (InferHalfToSingle(w^.d) * dx) * isum;
+    inc(w);
+    inc(x);
+  end;
+end;
+
+/// the K-quant Linear of the reference: activations as Q8_K, exact block sums
+procedure LinearK(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
+  aOut: PtrInt; bias: PSingleArray; y: PSingleArray);
+var
+  r, o, nb: PtrInt;
+  acc: double;
+  xk: array of TInferBlockQ8_K;
+begin
+  nb := aIn shr 8;
+  SetLength(xk, nb);
+  for r := 0 to aRows - 1 do
+  begin
+    InferQuantizeRowQ8_K(@x^[r * aIn], aIn, pointer(xk));
+    for o := 0 to aOut - 1 do
+    begin
+      if bias <> nil then
+        acc := bias^[o]
+      else
+        acc := 0;
+      if w.DType = idtQ4_K then
+        acc := acc + InferDotQ4K(@PByteArray(w.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
+          pointer(xk), nb)
+      else
+        acc := acc + InferDotQ6K(@PByteArray(w.Data)^[o * nb * SizeOf(TInferBlockQ6_K)],
+          pointer(xk), nb);
+      y^[r * aOut + o] := acc;
+    end;
+  end;
+end;
+
 procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 var
   b, j: PtrInt;
@@ -809,7 +993,7 @@ end;
 function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolean;
 begin
   if aOp = ioLinear then
-    result := aWeights in [idtF32, idtQ8_0, idtQ4_0]
+    result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]
   else
     result := aWeights = idtF32;
 end;
@@ -872,6 +1056,14 @@ begin
           EInferError.RaiseUtf8('%.Linear: % inputs are no whole Q8_0 blocks',
             [self, aIn]);
         LinearQ8_0(x, aRows, aIn, w.Data, aOut, bias, y);
+        exit;
+      end;
+    idtQ4_K, idtQ6_K:
+      begin
+        if aIn and 255 <> 0 then
+          EInferError.RaiseUtf8('%.Linear: % inputs are no whole % blocks',
+            [self, aIn, INFER_DTYPE_NAME[w.DType]]);
+        LinearK(x, aRows, aIn, w, aOut, bias, y);
         exit;
       end;
     idtQ4_0:
@@ -1225,6 +1417,12 @@ var
   b, first: PtrInt;
 begin
   first := aRow * aJob.Blocks;
+  if aJob.W.DType in [idtQ4_K, idtQ6_K] then
+  begin
+    InferQuantizeRowQ8_K(@aJob.X^[aRow * aJob.InCount], aJob.InCount,
+      @aJob.Xk^[first]);
+    exit;
+  end;
   InferQuantizeRowQ8_0(@aJob.X^[aRow * aJob.InCount], aJob.InCount,
     @aJob.Xq^[first]);
   for b := first to first + aJob.Blocks - 1 do
@@ -1243,7 +1441,7 @@ end;
 /// output features aTile * TILE .. of every token row
 procedure LinearTileWork(const aJob: TInferLinearJob; aTile: PtrInt);
 var
-  o, oEnd, r, b, i, nb, k, stride: PtrInt;
+  o, oEnd, r, i, nb, k, stride: PtrInt;
   acc, a, dw: double;
   accs: single;
   acc8: array[0..7] of double;
@@ -1326,7 +1524,23 @@ var
 
 begin
   oEnd := MinPtrInt((aTile + 1) * TILE, aJob.OutCount) - 1;
-  if aJob.W.DType <> idtF32 then
+  if aJob.W.DType in [idtQ4_K, idtQ6_K] then
+  begin
+    // K-quants: the exact block sums of the reference, per output and row
+    nb := aJob.Blocks;
+    for o := aTile * TILE to oEnd do
+      for r := 0 to aJob.Rows - 1 do
+      begin
+        if aJob.W.DType = idtQ4_K then
+          acc := InferDotQ4K(@PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
+            @aJob.Xk^[r * nb], nb)
+        else
+          acc := InferDotQ6K(@PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ6_K)],
+            @aJob.Xk^[r * nb], nb);
+        aJob.Y^[r * aJob.OutCount + o] := Bias(o) + acc;
+      end;
+  end
+  else if aJob.W.DType <> idtF32 then
   begin
     nb := aJob.Blocks;
     wbase := aJob.W.Data;
@@ -1476,12 +1690,14 @@ procedure TInferCpuFastBackend.Linear(x: PSingleArray; aRows, aIn: PtrInt;
 var
   job: TInferLinearJob;
   xq: array of TInferBlockQ8_0;
+  xk: array of TInferBlockQ8_K;
   dx: TDoubleDynArray;
   dxs: TSingleDynArray;
   r, t, n: PtrInt;
+  kq: boolean;
 begin
-  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0]) or
-     ((w.DType <> idtF32) and (aIn and 31 <> 0)) then
+  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) or
+     ((w.DType <> idtF32) and (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0)) then
   begin
     inherited Linear(x, aRows, aIn, w, aOut, bias, y); // raises
     exit;
@@ -1493,8 +1709,14 @@ begin
   job.Rows := aRows;
   job.InCount := aIn;
   job.OutCount := aOut;
-  job.Blocks := aIn shr 5;
-  if w.DType <> idtF32 then // Q4_0 tiles become Q8_0: the same kernels
+  kq := w.DType in [idtQ4_K, idtQ6_K];
+  if kq then
+    job.Blocks := aIn shr 8 // Q8_K blocks of 256
+  else
+    job.Blocks := aIn shr 5;
+  if kq then
+    job.Fp32 := false // the exact block sums for now
+  else if w.DType <> idtF32 then // Q4_0 tiles become Q8_0: the same kernels
     job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2)
   else
     // the float row kernel needs whole lanes of 16
@@ -1504,7 +1726,13 @@ begin
   if (Int64(aRows) * aIn * aOut >= PARALLEL_MIN) and fBusy.TryLock then
   try
     // on the pool: the buffers of the backend, items shared by every thread
-    if w.DType <> idtF32 then
+    if kq then
+    begin
+      if length(fXk) < aRows * job.Blocks then
+        SetLength(fXk, aRows * job.Blocks);
+      job.Xk := pointer(fXk);
+    end
+    else if w.DType <> idtF32 then
     begin
       if length(fXq) < aRows * job.Blocks then
       begin
@@ -1526,7 +1754,14 @@ begin
   end;
   // too small, or the pool is busy with another caller: the same kernels and
   // arithmetic on this thread, with buffers of its own
-  if w.DType <> idtF32 then
+  if kq then
+  begin
+    SetLength(xk, aRows * job.Blocks);
+    job.Xk := pointer(xk);
+    for r := 0 to aRows - 1 do
+      LinearQuantizeRow(job, r);
+  end
+  else if w.DType <> idtF32 then
   begin
     SetLength(xq, aRows * job.Blocks);
     SetLength(dx, aRows * job.Blocks);

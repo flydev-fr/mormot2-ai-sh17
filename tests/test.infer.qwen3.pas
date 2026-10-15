@@ -99,6 +99,8 @@ type
     procedure TinyGguf;
     /// Qwen's own Q8_0 GGUF of Qwen3-0.6B: every matrix our bytes, the Q8_0 gate
     procedure Qwen3Gguf;
+    /// a Q4_K_M GGUF of Qwen3-0.6B (Q4_K and Q6_K matrices) against FP32
+    procedure Qwen3GgufQ4KM;
   end;
 
 
@@ -1276,8 +1278,8 @@ const
     'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight',
     'mlp.down_proj.weight');
 
-/// the lowest cosine between a Q8_0 matrix of aModel and the same weights in
-// aFile (BF16), and the matrix it belongs to
+/// the lowest cosine between a quantized matrix of aModel and the same weights
+// in aFile (BF16), and the matrix it belongs to
 function SourceCosine(aModel: TQwen3Model; aFile: TSafeTensorsFile;
   out aWorst: RawUtf8): double;
 var
@@ -1303,7 +1305,7 @@ begin
         name := 'model.embed_tokens.weight'
       else
         name := FormatUtf8('model.layers.%.%', [i, HF_MATRICES[k]]);
-      if w[k].DType <> idtQ8_0 then
+      if not (w[k].DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) then
       begin
         aWorst := FormatUtf8('% is %', [name, INFER_DTYPE_NAME[w[k].DType]]);
         result := -1;
@@ -1316,7 +1318,7 @@ begin
       nb := 0;
       for r := 0 to rows[k] - 1 do
       begin
-        InferRowToF32(w[k].Data, idtQ8_0, r, cols[k], pointer(mine));
+        InferRowToF32(w[k].Data, w[k].DType, r, cols[k], pointer(mine));
         for c := 0 to cols[k] - 1 do
         begin
           a := mine[c];
@@ -1397,6 +1399,53 @@ begin
   // raw_fox at a step the reference was 0.71 sure of (measured 2026-10-15),
   // logits cosine 0.997 and max error 1.24 at worst
   Qwen3Quantized(idtQ8_0, 0.98, 3, 1, gguf);
+end;
+
+procedure TTestInferQwen3.Qwen3GgufQ4KM;
+var
+  dir, gguf: TFileName;
+  g: TQwen3Model;
+  st: TSafeTensorsFile;
+  detail: RawUtf8;
+  cs: double;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+    'qwen3-0.6b-q4_k_m.gguf');
+  if not FileExists(gguf) then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q4_k_m.gguf');
+    AddConsole('SKIP Qwen3 Q4_K_M: no vendor/models/qwen3-0.6b-q4_k_m.gguf ' +
+      '(unsloth/Qwen3-0.6B-GGUF, see docs/native-inference.md)');
+    exit;
+  end;
+  // unsloth's file mixes Q4_K and Q6_K (token_embd, half of attn_v and
+  // ffn_down) and was quantized with an importance matrix: every matrix still
+  // close to the BF16 weights - a wrong tensor or a broken K-quant unpacking
+  // would not be
+  g := TQwen3Model.CreateFromGguf(gguf, fFast);
+  st := nil;
+  try
+    Check(g.Weights = idtQ4_K, 'Q4_K layers');
+    Check(g.Head.DType = idtQ6_K, 'a Q6_K head (tied to token_embd)');
+    st := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(dir) +
+      'model.safetensors');
+    cs := SourceCosine(g, st, detail);
+    AddConsole(FormatString('Q4_K_M matrices against the BF16 weights: lowest ' +
+      'cosine % (%)', [cs, detail]));
+    CheckUtf8(cs >= 0.99, 'Q4_K_M matrices like the BF16 weights: % %', [cs, detail]);
+  finally
+    st.Free;
+    g.Free;
+  end;
+  // measured 2026-10-15 (NEON, exact block sums): logits cosine 0.867
+  // (chat_tool) to 0.990, max error up to 9.0; greedy leaves the reference
+  // where it was 1.37 sure (chat_en answers "Paris." with a full stop) - far
+  // better than Q4_0, still no greedy condition for a 0.6B model
+  Qwen3Quantized(idtQ4_K, 0.8, 12, 1e9, gguf);
 end;
 
 procedure TTestInferQwen3.Qwen3GreedyMatchesReference;
