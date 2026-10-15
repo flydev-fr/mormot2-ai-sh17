@@ -22,7 +22,8 @@ unit mormot.ai.infer.tokenizer.bpe;
 {
   *****************************************************************************
 
-    - TBpeTokenizer: load a byte-level BPE tokenizer.json (Qwen2 pipeline),
+    - TBpeTokenizer: load a byte-level BPE tokenizer.json or the tokenizer of a
+      GGUF file (Qwen2 pipeline),
       Normalize, Split, Encode text to ids and Decode ids to bytes
 
   *****************************************************************************
@@ -40,6 +41,7 @@ uses
   mormot.core.text,
   mormot.core.variants,
   mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.unicode;
 
 type
@@ -74,6 +76,10 @@ type
     fMergeCount: integer;
     fAddedText: TRawUtf8DynArray;
     fAddedId: TIntegerDynArray;
+    /// the tables from the vocabulary (byte-level texts by id), the merges
+    // (left and right by rank) and the added tokens
+    procedure Build(const aVocab, aLeft, aRight, aAddedText: TRawUtf8DynArray;
+      const aAddedId: TIntegerDynArray);
     procedure AddMerge(aLeft, aRight, aRank, aNew: integer);
     function FindMerge(aLeft, aRight: integer; out aRank, aNew: integer): boolean;
     function BytesId(p: pointer; aLen: PtrInt): integer;
@@ -85,6 +91,12 @@ type
     // BPE (no dropout, no unk, no prefix/suffix, no byte fallback), ByteLevel
     // decoder - raises EInferError otherwise
     constructor Create(const aFileName: TFileName);
+    /// the same tokenizer from the tokenizer.ggml.* metadata of a GGUF file:
+    // model gpt2, pre-tokenizer qwen2; normal tokens are the BPE vocabulary,
+    // control and user-defined ones the added tokens, unused ones no token
+    // - GGUF stores no normalizer: NFC is applied, as Qwen's tokenizer.json has
+    // it (llama.cpp itself does not normalize)
+    constructor CreateFromGguf(aGguf: TGgufFile);
     /// the NFC-normalized text (invalid UTF-8 replaced first)
     function Normalize(const aText: RawUtf8): RawUtf8;
     /// the pre-tokenized pieces of the normalized text, as UTF-8
@@ -183,11 +195,10 @@ var
   norm, pre, list, split, level, model, vocab, merges, entry, added,
   decoder: PDocVariantData;
   pair: PDocVariantData;
-  i, n, id, maxId, h, sp: PtrInt;
-  bytes, left, right: RawByteString;
-  l, r, m, oldRank, oldNew: integer;
-  text, a, b: RawUtf8;
-  one: byte;
+  i, n, id, sp: PtrInt;
+  texts, a, b, addedText: TRawUtf8DynArray;
+  addedId: TIntegerDynArray;
+  text: RawUtf8;
 begin
   inherited Create;
   if not doc.InitJsonFromFile(aFileName, JSON_FAST_FLOAT) then
@@ -219,10 +230,38 @@ begin
   if not model^.GetAsObject('vocab', vocab) or (vocab^.Count = 0) or
      not model^.GetAsArray('merges', merges) then
     EInferError.RaiseUtf8('%: BPE without vocab or merges', [self]);
-  // the vocabulary: ids 0..n-1, each exactly once, as raw bytes
+  // the vocabulary: ids 0..n-1, each exactly once
   n := vocab^.Count;
-  fVocabCount := n;
-  maxId := n - 1;
+  SetLength(texts, n);
+  for i := 0 to n - 1 do
+  begin
+    id := VariantToIntegerDef(vocab^.Values[i], -1);
+    if (id < 0) or (id >= n) or (texts[id] <> '') then
+      EInferError.RaiseUtf8('%: vocab id % of "%" invalid or used twice',
+        [self, id, vocab^.Names[i]]);
+    texts[id] := vocab^.Names[i];
+  end;
+  // the merges: ["a", "b"] (current format) or "a b" (older files)
+  SetLength(a, merges^.Count);
+  SetLength(b, merges^.Count);
+  for i := 0 to merges^.Count - 1 do
+    if _Safe(merges^.Values[i])^.IsArray then
+    begin
+      pair := _Safe(merges^.Values[i]);
+      if pair^.Count <> 2 then
+        EInferError.RaiseUtf8('%: merge % is not a pair', [self, i]);
+      VariantToUtf8(pair^.Values[0], a[i]);
+      VariantToUtf8(pair^.Values[1], b[i]);
+    end
+    else
+    begin
+      VariantToUtf8(merges^.Values[i], text);
+      sp := PosEx(' ', text);
+      if (sp <= 1) or (sp = length(text)) or (PosEx(' ', text, sp + 1) > 0) then
+        EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, i, text]);
+      a[i] := copy(text, 1, sp - 1);
+      b[i] := copy(text, sp + 1, maxInt);
+    end;
   // added tokens: absent, or an array - anything else is no file of ours
   // (GetAsArray is false for an empty array too, hence GetAsDocVariant)
   added := nil;
@@ -230,25 +269,105 @@ begin
     if not doc.GetAsDocVariant('added_tokens', added) or not added^.IsArray then
       EInferError.RaiseUtf8('%: added_tokens is not an array', [self]);
   if added <> nil then
+  begin
+    SetLength(addedText, added^.Count);
+    SetLength(addedId, added^.Count);
     for i := 0 to added^.Count - 1 do
     begin
-      id := _Safe(added^.Values[i])^.I['id'];
-      if (id < 0) or (id > n + 1 shl 20) then
-        EInferError.RaiseUtf8('%: added token id % out of range', [self, id]);
-      if id > maxId then
-        maxId := id;
+      entry := _Safe(added^.Values[i]);
+      addedId[i] := entry^.I['id'];
+      addedText[i] := entry^.U['content'];
     end;
+  end;
+  Build(texts, a, b, addedText, addedId);
+end;
+
+constructor TBpeTokenizer.CreateFromGguf(aGguf: TGgufFile);
+var
+  tokens, merges, a, b, texts, addedText: TRawUtf8DynArray;
+  addedId: TIntegerDynArray;
+  types: PIntegerArray;
+  count: Int64;
+  i, n, sp: PtrInt;
+begin
+  inherited Create;
+  // llama.cpp's names of the Qwen2 pipeline: a GPT-2 byte-level BPE with the
+  // qwen2 pre-tokenizer (the Split regex of tokenizer.json); GGUF stores no
+  // normalizer - Qwen's tokenizer.json has NFC, which Normalize applies
+  if aGguf.Str('tokenizer.ggml.model') <> 'gpt2' then
+    EInferError.RaiseUtf8('%: tokenizer model "%" is no byte-level BPE',
+      [self, aGguf.Str('tokenizer.ggml.model')]);
+  if aGguf.Str('tokenizer.ggml.pre') <> 'qwen2' then
+    EInferError.RaiseUtf8('%: pre-tokenizer "%" is not qwen2',
+      [self, aGguf.Str('tokenizer.ggml.pre')]);
+  tokens := aGguf.Strings('tokenizer.ggml.tokens');
+  count := length(tokens);
+  types := aGguf.Ints32('tokenizer.ggml.token_type', count);
+  merges := aGguf.Strings('tokenizer.ggml.merges');
+  // normal tokens (1) first: the BPE vocabulary; then control (3) and
+  // user-defined (4) tokens, the added ones; unused padding (5) is no token
+  n := 0;
+  while (n < length(tokens)) and (types^[n] = 1) do
+    inc(n);
+  if n = 0 then
+    EInferError.RaiseUtf8('%: no normal token', [self]);
+  texts := copy(tokens, 0, n);
+  for i := n to high(tokens) do
+    case types^[i] of
+      3, 4:
+        begin
+          SetLength(addedText, length(addedText) + 1);
+          SetLength(addedId, length(addedId) + 1);
+          addedText[high(addedText)] := tokens[i];
+          addedId[high(addedId)] := i;
+        end;
+      5:
+        ; // unused: a padding row of the embedding, never produced
+    else
+      EInferError.RaiseUtf8('%: token % "%" of type % after the vocabulary',
+        [self, i, tokens[i], types^[i]]);
+    end;
+  SetLength(a, length(merges));
+  SetLength(b, length(merges));
+  for i := 0 to high(merges) do
+  begin
+    sp := PosEx(' ', merges[i]);
+    if (sp <= 1) or (sp = length(merges[i])) or (PosEx(' ', merges[i], sp + 1) > 0) then
+      EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, i, merges[i]]);
+    a[i] := copy(merges[i], 1, sp - 1);
+    b[i] := copy(merges[i], sp + 1, maxInt);
+  end;
+  Build(texts, a, b, addedText, addedId);
+end;
+
+procedure TBpeTokenizer.Build(const aVocab, aLeft, aRight, aAddedText: TRawUtf8DynArray;
+  const aAddedId: TIntegerDynArray);
+var
+  i, n, id, maxId, h: PtrInt;
+  bytes, left, right: RawByteString;
+  l, r, m, oldRank, oldNew: integer;
+  one: byte;
+begin
+  n := length(aVocab);
+  if n = 0 then
+    EInferError.RaiseUtf8('%: BPE without vocab', [self]);
+  fVocabCount := n;
+  maxId := n - 1;
+  for i := 0 to high(aAddedId) do
+  begin
+    id := aAddedId[i];
+    if (id < 0) or (id > n + 1 shl 20) then
+      EInferError.RaiseUtf8('%: added token id % out of range', [self, id]);
+    if id > maxId then
+      maxId := id;
+  end;
   SetLength(fTokens, maxId + 1);
   for i := 0 to n - 1 do
   begin
-    id := VariantToIntegerDef(vocab^.Values[i], -1);
-    if (id < 0) or (id >= n) or (fTokens[id] <> '') then
-      EInferError.RaiseUtf8('%: vocab id % of "%" invalid or used twice',
-        [self, id, vocab^.Names[i]]);
-    if not ByteLevelDecode(vocab^.Names[i], bytes) then
-      EInferError.RaiseUtf8('%: vocab entry "%" is not byte-level text',
-        [self, vocab^.Names[i]]);
-    fTokens[id] := bytes;
+    if not ByteLevelDecode(aVocab[i], bytes) then
+      EInferError.RaiseUtf8('%: vocab entry % "%" is not byte-level text',
+        [self, i, aVocab[i]]);
+    fTokens[i] := bytes;
   end;
   // hash of the byte strings, chained by id: lookups allocate nothing
   fHashMask := 1;
@@ -272,7 +391,7 @@ begin
       EInferError.RaiseUtf8('%: no token for byte %', [self, i]);
   end;
   // the merges: (left, right) -> rank and merged id
-  fMergeCount := merges^.Count;
+  fMergeCount := length(aLeft);
   fMergeMask := 1;
   while fMergeMask < fMergeCount * 2 + 2 do
     fMergeMask := fMergeMask shl 1;
@@ -283,56 +402,35 @@ begin
   SetLength(fMergeNew, fMergeMask + 1);
   for i := 0 to fMergeCount - 1 do
   begin
-    // ["a", "b"] (current format) or "a b" (older files)
-    if _Safe(merges^.Values[i])^.IsArray then
-    begin
-      pair := _Safe(merges^.Values[i]);
-      if pair^.Count <> 2 then
-        EInferError.RaiseUtf8('%: merge % is not a pair', [self, i]);
-      VariantToUtf8(pair^.Values[0], a);
-      VariantToUtf8(pair^.Values[1], b);
-    end
-    else
-    begin
-      VariantToUtf8(merges^.Values[i], text);
-      sp := PosEx(' ', text);
-      if (sp <= 1) or (sp = length(text)) or (PosEx(' ', text, sp + 1) > 0) then
-        EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, i, text]);
-      a := copy(text, 1, sp - 1);
-      b := copy(text, sp + 1, maxInt);
-    end;
-    if not ByteLevelDecode(a, left) or not ByteLevelDecode(b, right) then
+    if not ByteLevelDecode(aLeft[i], left) or not ByteLevelDecode(aRight[i], right) then
       EInferError.RaiseUtf8('%: merge % is not byte-level text', [self, i]);
     l := BytesId(pointer(left), length(left));
     r := BytesId(pointer(right), length(right));
     bytes := left + right;
     m := BytesId(pointer(bytes), length(bytes));
     if (l < 0) or (r < 0) or (m < 0) then
-      EInferError.RaiseUtf8('%: merge % "% %" outside the vocabulary', [self, i, a, b]);
+      EInferError.RaiseUtf8('%: merge % "% %" outside the vocabulary',
+        [self, i, aLeft[i], aRight[i]]);
     if FindMerge(l, r, oldRank, oldNew) then
       // the tokenizers library would keep the last rank: refuse instead
       EInferError.RaiseUtf8('%: merge % "% %" repeats merge %',
-        [self, i, a, b, oldRank]);
+        [self, i, aLeft[i], aRight[i], oldRank]);
     AddMerge(l, r, i, m);
   end;
   // added tokens: never matched in text, reachable by TokenId
-  if added <> nil then
+  SetLength(fAddedText, length(aAddedId));
+  SetLength(fAddedId, length(aAddedId));
+  for i := 0 to high(aAddedId) do
   begin
-    SetLength(fAddedText, added^.Count);
-    SetLength(fAddedId, added^.Count);
-    for i := 0 to added^.Count - 1 do
-    begin
-      entry := _Safe(added^.Values[i]);
-      id := entry^.I['id'];
-      text := entry^.U['content'];
-      if (id < 0) or (id > high(fTokens)) or (text = '') or
-         ((id < n) and (fTokens[id] <> text)) or ((id >= n) and (fTokens[id] <> '')) then
-        EInferError.RaiseUtf8('%: added token % "%" clashes with the vocabulary',
-          [self, id, text]);
-      fTokens[id] := text;
-      fAddedText[i] := text;
-      fAddedId[i] := id;
-    end;
+    id := aAddedId[i];
+    if (aAddedText[i] = '') or
+       ((id < n) and (fTokens[id] <> aAddedText[i])) or
+       ((id >= n) and (fTokens[id] <> '')) then
+      EInferError.RaiseUtf8('%: added token % "%" clashes with the vocabulary',
+        [self, id, aAddedText[i]]);
+    fTokens[id] := aAddedText[i];
+    fAddedText[i] := aAddedText[i];
+    fAddedId[i] := id;
   end;
 end;
 

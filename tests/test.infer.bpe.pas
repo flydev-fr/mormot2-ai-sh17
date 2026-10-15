@@ -28,6 +28,7 @@ uses
   mormot.ai.infer.unicode,
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.chat,
+  mormot.ai.infer.loader.gguf,
   test.infer.ref;
 
 type
@@ -40,6 +41,8 @@ type
     procedure CleanUp; override;
     /// false (and SKIP or a failure) when tokenizer.json is not there
     function Ready: boolean;
+    /// every reference case through aTokenizer: same ids, decoding
+    procedure CheckIds(aTokenizer: TBpeTokenizer; const aLabel: RawUtf8);
   published
     /// NFC of every reference text equals the HF normalizer (no model needed)
     procedure NfcMatchesReference;
@@ -53,6 +56,9 @@ type
     procedure IdsMatchReference;
     /// control-token literals in text stay text; invalid UTF-8 becomes U+FFFD
     procedure LiteralsAndInvalidUtf8;
+    /// the tokenizer of Qwen's GGUF file = the one of tokenizer.json: every
+    // token, every added token, the reference ids; foreign tokenizers refused
+    procedure GgufTokenizer;
     /// every chat case: same ids and same rendered text as transformers
     procedure ChatTemplateMatchesReference;
   end;
@@ -432,6 +438,12 @@ begin
 end;
 
 procedure TTestInferBpe.IdsMatchReference;
+begin
+  if Ready then
+    CheckIds(fTokenizer, 'tokenizer.json');
+end;
+
+procedure TTestInferBpe.CheckIds(aTokenizer: TBpeTokenizer; const aLabel: RawUtf8);
 var
   ref: TInferRefSet;
   dir: TFileName;
@@ -442,8 +454,6 @@ var
   mine: TIntegerDynArray;
   text, expected, failures: RawUtf8;
 begin
-  if not Ready then
-    exit;
   dir := FindInferRefDir('qwen3-tokens');
   if CheckFailed(dir <> '', 'qwen3-tokens found') then
     exit;
@@ -462,7 +472,7 @@ begin
     for i := 0 to cases^.Count - 1 do
     begin
       FastSetString(text, @texts^[textOffsets^[i]], textOffsets^[i + 1] - textOffsets^[i]);
-      mine := fTokenizer.Encode(text);
+      mine := aTokenizer.Encode(text);
       first := offsets^[i];
       count := offsets^[i + 1] - first;
       if not SameIds(mine, @ids^[first], count) then
@@ -474,12 +484,13 @@ begin
       end;
       FastSetString(expected, @norms^[normOffsets^[i]],
         normOffsets^[i + 1] - normOffsets^[i]);
-      if fTokenizer.Decode(mine) <> expected then
+      if aTokenizer.Decode(mine) <> expected then
         inc(decBad);
     end;
-    CheckUtf8(idsBad = 0, '% of % cases with other ids:%',
-      [idsBad, cases^.Count, failures]);
-    CheckUtf8(decBad = 0, '% of % cases decode otherwise', [decBad, cases^.Count]);
+    CheckUtf8(idsBad = 0, '%: % of % cases with other ids:%',
+      [aLabel, idsBad, cases^.Count, failures]);
+    CheckUtf8(decBad = 0, '%: % of % cases decode otherwise',
+      [aLabel, decBad, cases^.Count]);
   finally
     ref.Free;
   end;
@@ -564,6 +575,99 @@ begin
     result[i].Name := t^.U['name'];
     result[i].Description := t^.U['description'];
     result[i].ParametersJson := t^.U['parameters'];
+  end;
+end;
+
+/// true when TBpeTokenizer.CreateFromGguf refuses aFile with a message
+// containing aWhy
+function GgufRefused(const aFile: TFileName; const aWhy: RawUtf8): boolean;
+var
+  g: TGgufFile;
+begin
+  result := false;
+  g := TGgufFile.Create(aFile);
+  try
+    try
+      TBpeTokenizer.CreateFromGguf(g).Free;
+    except
+      on E: EInferError do
+        result := PosEx(aWhy, StringToUtf8(E.Message)) > 0;
+    end;
+  finally
+    g.Free;
+  end;
+end;
+
+procedure TTestInferBpe.GgufTokenizer;
+var
+  fn: TFileName;
+  g: TGgufFile;
+  tok: TBpeTokenizer;
+  i, bad: PtrInt;
+  raised: boolean;
+  added: RawUtf8;
+begin
+  // a GGUF tokenizer of another kind: the Unigram one of the tiny XLM-R file
+  fn := FindInferRefDir('tiny-gguf');
+  if not CheckFailed(fn <> '', 'tiny-gguf found') then
+  begin
+    g := TGgufFile.Create(fn + 'model.gguf');
+    try
+      raised := false;
+      try
+        TBpeTokenizer.CreateFromGguf(g).Free;
+      except
+        on E: EInferError do
+          raised := PosEx('no byte-level BPE', StringToUtf8(E.Message)) > 0;
+      end;
+      Check(raised, 'a Unigram (t5) tokenizer refused');
+    finally
+      g.Free;
+    end;
+  end;
+  fn := FindInferRefDir('tiny-qwen3-gguf');
+  if not CheckFailed(fn <> '', 'tiny-qwen3-gguf found') then
+  begin
+    Check(GgufRefused(fn + 'tok-bad-pre.gguf', 'is not qwen2'),
+      'another pre-tokenizer refused');
+    Check(GgufRefused(fn + 'tok-bad-type.gguf', 'of type 6'),
+      'a byte token after the vocabulary refused');
+  end;
+  if not Ready then
+    exit;
+  fn := ExpandFileName(FindQwen3Folder('tokenizer.json') + '..' + PathDelim +
+    'qwen3-0.6b-q8_0.gguf');
+  if not FileExists(fn) then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q8_0.gguf');
+    AddConsole('SKIP GGUF tokenizer: no vendor/models/qwen3-0.6b-q8_0.gguf');
+    exit;
+  end;
+  g := TGgufFile.Create(fn);
+  tok := nil;
+  try
+    tok := TBpeTokenizer.CreateFromGguf(g);
+    CheckEqual(tok.VocabSize, fTokenizer.VocabSize, 'vocabulary size');
+    CheckEqual(tok.BpeCount, fTokenizer.BpeCount, 'BPE tokens');
+    CheckEqual(tok.MergeCount, fTokenizer.MergeCount, 'merges');
+    bad := 0;
+    for i := 0 to fTokenizer.VocabSize - 1 do
+      if tok.TokenBytes(i) <> fTokenizer.TokenBytes(i) then
+        inc(bad);
+    CheckEqual(bad, 0, 'every token the same bytes');
+    bad := 0;
+    for i := fTokenizer.BpeCount to fTokenizer.VocabSize - 1 do
+    begin
+      added := fTokenizer.TokenBytes(i);
+      if (added <> '') and (tok.TokenId(added) <> fTokenizer.TokenId(added)) then
+        inc(bad);
+    end;
+    CheckEqual(bad, 0, 'every added token found by its content');
+    CheckIds(tok, 'GGUF');
+  finally
+    tok.Free;
+    g.Free;
   end;
 end;
 

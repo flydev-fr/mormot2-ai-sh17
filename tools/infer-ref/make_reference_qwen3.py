@@ -1101,6 +1101,22 @@ def tiny_qwen3_gguf():
             raw[34 * 5:34 * 5 + 2] = bytes([0x00, 0x7e])  # the scale of block 5: NaN
             t[3] = bytes(raw)
     files["bad-embscale.gguf"] = (metadata(ucfg), [tuple(t) for t in emb])
+    # tokenizers the BPE loader refuses: another pre-tokenizer, a byte token
+    # (type 6) after the vocabulary - the 256 GPT-2 byte-level characters first
+    alphabet = ([chr(c) for c in range(ord("!"), ord("~") + 1)] +
+                [chr(c) for c in range(0xa1, 0xad)] + [chr(c) for c in range(0xae, 0x100)])
+    alphabet += [chr(256 + i) for i in range(256 - len(alphabet))]
+
+    def tokenizer(pre, extra_type):
+        toks = alphabet + ["<|im_end|>"]
+        return [("general.architecture", "str", "qwen3"),
+                ("tokenizer.ggml.model", "str", "gpt2"),
+                ("tokenizer.ggml.pre", "str", pre),
+                ("tokenizer.ggml.tokens", "arr", ("str", toks)),
+                ("tokenizer.ggml.token_type", "arr", ("i32", [1] * 256 + [extra_type])),
+                ("tokenizer.ggml.merges", "arr", ("str", []))]
+    files["tok-bad-pre.gguf"] = (tokenizer("llama-bpe", 3), [])
+    files["tok-bad-type.gguf"] = (tokenizer("qwen2", 6), [])
     for name, (kvs, tens) in files.items():
         mr.gguf_write(os.path.join(folder, name), kvs, tens)
     manifest = {"dataset": "tiny-qwen3-gguf", "environment": mr.environment(),

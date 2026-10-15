@@ -96,6 +96,8 @@ type
     procedure SamplingSettings;
     /// the native client samples, reproducibly per seed
     procedure Qwen3Sampling;
+    /// the native client from one GGUF file: model, tokenizer, a chat answer
+    procedure Qwen3ChatClientGguf;
   end;
 
 
@@ -1478,6 +1480,74 @@ begin
     'seed', 12]);
   r3 := llm.ChatComplete(req);
   AddConsole(FormatString('sampled: "%" / "%"', [r1.Content, r3.Content]));
+end;
+
+procedure TTestInferLlmNative.Qwen3ChatClientGguf;
+var
+  dir, refdir, fn: TFileName;
+  ref: TInferRefSet;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  p: PDocVariantData;
+  req: TLlmChatRequest;
+  r: TLlmChatResponse;
+  log: TDeltaLog;
+  timer: TPrecisionTimer;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  fn := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+    'qwen3-0.6b-q8_0.gguf');
+  if not FileExists(fn) then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q8_0.gguf');
+    AddConsole('SKIP native client from GGUF: no vendor/models/qwen3-0.6b-q8_0.gguf');
+    exit;
+  end;
+  refdir := FindInferRefDir('qwen3');
+  if CheckFailed(refdir <> '', 'qwen3 reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    timer.Start;
+    client := TNativeLlmClient.CreateFromGguf(fn);
+    llm := client;
+    AddConsole(FormatString('native client from GGUF loaded in %', [timer.Stop]));
+    CheckEqual(llm.Config.DefaultModel, 'qwen3-0.6b-q8_0', 'model name from the file');
+    Check(client.Sampling.Temperature = 0, 'greedy without generation_config.json');
+    Check(client.Model.Weights = idtQ8_0, 'Q8_0 file');
+    // the prompt is tokenized by the file's own tokenizer: the reference count
+    p := FindPrompt(ref, 'chat_en');
+    if CheckFailed(p <> nil, 'chat_en') then
+      exit;
+    req := LlmChatRequest('', nil);
+    RefRequest(p, req);
+    r := llm.ChatComplete(req);
+    CheckEqual(r.Usage.PromptTokens, p^.I['tokens'], 'chat_en prompt tokens');
+    CheckEqual(r.Content, 'Paris', 'chat_en content');
+    Check(r.FinishReason = lfrStop, 'chat_en stop');
+    // streamed: valid UTF-8 deltas, one Done
+    p := FindPrompt(ref, 'chat_de');
+    if CheckFailed(p <> nil, 'chat_de') then
+      exit;
+    req := LlmChatRequest('', nil);
+    RefRequest(p, req);
+    req.MaxTokens := 24;
+    log := TDeltaLog.Create;
+    try
+      llm.ChatStream(req, log.OnDelta);
+      AddConsole(FormatString('chat_de from GGUF: %', [log.Content]));
+      Check(log.Content <> '', 'an answer');
+      CheckEqual(log.Invalid, 0, 'valid UTF-8 deltas');
+      CheckEqual(log.Dones, 1, 'one Done');
+    finally
+      log.Free;
+    end;
+  finally
+    ref.Free;
+  end;
 end;
 
 function TTestInferLlmNative.Weather(const aArgumentsJson: RawUtf8): RawUtf8;

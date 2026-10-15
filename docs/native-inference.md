@@ -783,8 +783,27 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   (`qwen3.rope.dimension_count`) und eine nicht endliche Skala im Embedding, auch wenn
   der Kopf nicht daran gebunden ist (Review-Fund).
 
-- Offen in Phase 3: Tokenizer und Client aus GGUF, K-Quants (3e-3), Q4_0-Kernel (s. o.),
-  Benchmark auf x86_64 (RTX-Rechner).
+**3e-2b, erledigt 2026-10-15: Tokenizer und Client aus einer GGUF-Datei.**
+
+- `TBpeTokenizer.CreateFromGguf` liest `tokenizer.ggml.*`: Modell `gpt2` mit
+  Pre-Tokenizer `qwen2` (die Split-Regex von Qwens `tokenizer.json`), die normalen
+  Tokens (Typ 1) als BPE-Vokabular, Kontroll- und benutzerdefinierte Tokens (3, 4) als
+  Added Tokens, ungenutzte (5, `[PAD…]`) als kein Token, die Merges als „a b“. GGUF
+  speichert keinen Normalizer; NFC wird angewandt wie in Qwens `tokenizer.json`
+  (llama.cpp selbst normalisiert nicht). Jeder andere Tokenizer, ein anderer
+  Pre-Tokenizer oder ein unbekannter Token-Typ werden abgelehnt.
+- `TNativeLlmClient.CreateFromGguf(Datei)`: Modell, Tokenizer und Template aus einer
+  Datei; Modellname aus dem Dateinamen; Sampling Greedy, bis `Sampling` gesetzt wird
+  (eine GGUF-Datei hat keine `generation_config.json`).
+- Tests: der Tokenizer aus Qwens Q8_0-Datei gleicht dem aus `tokenizer.json` in jedem
+  Token, jedem Added Token und allen 2416 Gate-Fällen; der Client aus der Datei antwortet
+  auf `chat_en` „Paris“ mit derselben Prompt-Länge wie die Referenz und streamt gültiges
+  UTF-8; Unigram-, `llama-bpe`- und Byte-Token-Tokenizer werden abgelehnt. Gegenproben
+  (benutzerdefinierte Tokens verworfen, unbekannte Typen übergangen, Pre-Tokenizer
+  ungeprüft, Vokabular um eins zu kurz) schlagen an.
+
+- Offen in Phase 3: K-Quants (3e-3), Q4_0-Kernel (s. o.), Benchmark auf x86_64
+  (RTX-Rechner).
 
 ### Phase 4 — GPU
 

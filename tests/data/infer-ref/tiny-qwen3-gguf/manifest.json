@@ -1,7 +1,7 @@
 {
  "dataset": "tiny-qwen3-gguf",
  "environment": {
-  "created_utc": "2026-10-15T19:29:11Z",
+  "created_utc": "2026-10-15T20:33:58Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
@@ -37,6 +37,8 @@
   "bad-shape.gguf": "f9e3a32629cb484bded6802bd8512dd2d2ddc85a63d5648445b8ad73a321d450",
   "q4_0.gguf": "97a1b2c0a3b30ae59cc2062146a78d1f789c87997ea9cbb67b285069111ee4a7",
   "q8_0.gguf": "036568de8794efe6c45617b40fcf270aa291ca4ed89145635acdce2d76646766",
+  "tok-bad-pre.gguf": "ca86fc739d8f30b7244f440d799a75165abb213e2ccd78c92cb7bfc33d3eddc6",
+  "tok-bad-type.gguf": "0950d009fa0d892b90e76a4ee4dacc0346b712f79604b046bc8a3d9712e35882",
   "untied-f16.gguf": "9339abebbaa79e6afb879a382ea308c4919888dadf0a0caa02e6bad499a66d9e"
  }
 }

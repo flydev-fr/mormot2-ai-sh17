@@ -278,6 +278,13 @@ type
     // the reference itself instead of calling the tool)
     constructor Create(const aFolder: TFileName; const aModelName: RawUtf8 = '';
       aBackend: TInferBackend = nil; aWeights: TInferDType = idtF32); reintroduce;
+    /// one llama.cpp GGUF file of a Qwen3 model: weights, settings and the
+    // tokenizer from it (TQwen3Model.CreateFromGguf, TBpeTokenizer.CreateFromGguf)
+    // - aModelName: the name in Config and in every response, the file name
+    // without extension when ''; aBackend as for Create
+    // - a GGUF file has no generation_config.json: Sampling is greedy until set
+    constructor CreateFromGguf(const aFileName: TFileName;
+      const aModelName: RawUtf8 = ''; aBackend: TInferBackend = nil);
     destructor Destroy; override;
     function ChatComplete(const aRequest: TLlmChatRequest): TLlmChatResponse;
     procedure ChatStream(const aRequest: TLlmChatRequest;
@@ -1043,6 +1050,33 @@ begin
   fConfig.DefaultModel := aModelName;
   if fConfig.DefaultModel = '' then
     fConfig.DefaultModel := StringToUtf8(ExtractFileName(ExcludeTrailingPathDelimiter(aFolder)));
+end;
+
+constructor TNativeLlmClient.CreateFromGguf(const aFileName: TFileName;
+  const aModelName: RawUtf8; aBackend: TInferBackend);
+begin
+  inherited Create;
+  fMaxTokens := NATIVE_LLM_DEFAULT_MAX_TOKENS;
+  fEnableThinking := true;
+  fBackend := aBackend;
+  if fBackend = nil then
+  begin
+    fBackend := TInferCpuFastBackend.Create;
+    fOwnBackend := true;
+  end;
+  fModel := TQwen3Model.CreateFromGguf(aFileName, fBackend);
+  fTokenizer := TBpeTokenizer.CreateFromGguf(fModel.Gguf);
+  if fTokenizer.VocabSize > fModel.Config.VocabSize then
+    ELlmClient.RaiseUtf8('%: % tokens but % embedding rows in %',
+      [self, fTokenizer.VocabSize, fModel.Config.VocabSize, aFileName]);
+  fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
+  fSampling := InferSamplingGreedy;
+  fCache := TNativePromptCache.Create;
+  // the stop and control tokens: fail at load, not at the first request
+  TQwen3OutputParser.Create(fTokenizer).Free;
+  fConfig.DefaultModel := aModelName;
+  if fConfig.DefaultModel = '' then
+    fConfig.DefaultModel := StringToUtf8(ChangeFileExt(ExtractFileName(aFileName), ''));
 end;
 
 destructor TNativeLlmClient.Destroy;

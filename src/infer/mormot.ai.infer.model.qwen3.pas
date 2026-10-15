@@ -209,6 +209,10 @@ type
     /// the language-model head, as used
     property Head: TInferWeight
       read fHead;
+    /// the GGUF file of CreateFromGguf (nil after Create): its metadata holds
+    // the tokenizer too
+    property Gguf: TGgufFile
+      read fGguf;
   end;
 
 
