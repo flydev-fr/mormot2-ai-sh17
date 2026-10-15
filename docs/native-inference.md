@@ -536,6 +536,9 @@ bestehen und die Benchmarks dokumentiert sind.
 Weitere Architekturen (Llama 3, Mistral, Gemma), Reranker (BGE-Reranker),
 Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding, MoE.
 
+Eine eigene Spur daneben ist die Verteilung großer Jobs auf ungenutzte Rechner:
+[distributed-execution.md](distributed-execution.md). Ihr Executor ist diese Engine.
+
 ## Plattformen und Tests
 
 ### Messung am 2026-10-14

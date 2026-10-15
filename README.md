@@ -513,8 +513,11 @@ Next, in this order:
 4. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
-Alongside: the first real consumer of the load governor (a bulk indexing job in the
-backend), agent loop limits (cancellation, deadlines, context budget),
+Alongside, as a separate track: **distributed execution** - big inference jobs pulled
+by idle machines on the network (task parallelism with leases, not model parallelism;
+embeddings in the LAN first, LLM batch jobs later), see
+[docs/distributed-execution.md](docs/distributed-execution.md) (German). Also alongside:
+the first real consumer of the load governor (a bulk indexing job in the backend), agent loop limits (cancellation, deadlines, context budget),
 token-based chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
 the single source of truth for open points.
 

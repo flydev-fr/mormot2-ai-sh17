@@ -654,6 +654,28 @@ Roadmap — DESIGN.md verweist hierher.
          docs/native-inference.md).
        Lüfter und Leistungsgrenzen (PL1/PL2) bleiben bei Firmware und BIOS; von außen
        begrenzt im Docker-Betrieb `--cpus`.
+11. **Verteilte Ausführung** (aufgenommen 2026-10-15, Plan:
+    [docs/distributed-execution.md](docs/distributed-execution.md), Arbeitstitel
+    „Rechenknecht"):
+    - große Inferenz-Jobs per Pull an ungenutzte Rechner im Netz verteilen, mit Lease
+      und Watchdog;
+    - verteilt werden Aufgaben, nicht das Modell.
+    Eine eigene Spur neben der Engine-Roadmap, deren Reihenfolge bleibt unverändert.
+    - **Phase 1:** Embeddings im LAN. Sie kann sofort beginnen, die Engine-Phase 1 ist
+      fertig.
+    - **Später:** Robustheit, GPU-Rechner und LLM-Jobs. LLM-Jobs setzen 2d und
+      Engine-Phase 3 voraus.
+    Bausteine sind vorhanden:
+    - `mormot.ai.embed.native`;
+    - der Load Governor (Punkt 10.7) als Bremse des Executors;
+    - der Exact-Modus, bitgleich zur Referenz desselben Builds. Über Plattformen
+      hinweg ist das noch zu messen.
+    Neu zu bauen:
+    - Queue, Lease und REST-API;
+    - die Leerlauf-Erkennung je Plattform;
+    - das Executor-Binary.
+    Fünf Entscheidungen sind offen, u. a. ob der Server in der Extension oder im
+    Landrix-Backend läuft (siehe Plan).
 
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
