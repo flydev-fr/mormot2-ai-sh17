@@ -66,6 +66,9 @@ type
     /// the decoder operations (phase 3): CausalAttention exact = the reference
     // bit for bit, float within a tolerance; F32 Linear in float lanes
     procedure DecoderOpsMatchReference;
+    /// RmsNorm, SwiGlu and Rope: every mode bit-identical to the reference
+    // (rows or slices over the pool), the reference against the definition
+    procedure DecoderNormAndSwiGlu;
     /// the thread pool: exactly once, bursts, exceptions
     procedure ThreadPoolRunsEveryItemOnce;
     /// two threads embedding at once through one fast backend
@@ -772,6 +775,118 @@ begin
   Fill(y3, 3, 901, 5);
   fFast.Linear(nil, 1, 0, InferWeight(nil, idtF32), 3, pointer(bias), pointer(y3));
   Check(SameBits(pointer(y3), pointer(bias), 3), 'F32 Linear without inputs = bias');
+end;
+
+procedure TTestInferFast.DecoderNormAndSwiGlu;
+const
+  // rows, cols: below, at and above the parallel thresholds; 128 = a head
+  NORMS: array[0..6, 0..1] of integer = (
+    (1, 1024), (7, 1024), (8, 1024), (9, 1024), (200, 1024), (16, 128),
+    (3200, 128));
+  // 3000: in parallel, with a partial last slice
+  GLUS: array[0..6] of integer = (1, 1000, 2047, 2048, 3000, 3072, 200 * 3072);
+  ROPES: array[0..4] of integer = (1, 7, 8, 9, 200);
+var
+  i, r, c, k, j, rows, cols, n: PtrInt;
+  x, w, y1, y2, y3, u, g1, g2, g3, want: TSingleDynArray;
+  sum, a: double;
+  silu: single;
+  cmp: TInferCompare;
+begin
+  for i := 0 to high(NORMS) do
+  begin
+    rows := NORMS[i, 0];
+    cols := NORMS[i, 1];
+    n := rows * cols;
+    Fill(x, n, 900 + i, 4);
+    Fill(w, cols, 950 + i, 1);
+    SetLength(y1, n);
+    SetLength(y2, n);
+    fRef.RmsNorm(pointer(x), rows, cols, pointer(w), 1e-6, pointer(y1));
+    fFast.RmsNorm(pointer(x), rows, cols, pointer(w), 1e-6, pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), n), 'rmsnorm, % x %', [rows, cols]);
+    y3 := copy(x);
+    fExact.RmsNorm(pointer(y3), rows, cols, pointer(w), 1e-6, pointer(y3));
+    CheckUtf8(SameBits(pointer(y1), pointer(y3), n), 'rmsnorm in place, % x %',
+      [rows, cols]);
+    // the reference against the definition
+    SetLength(want, n);
+    for r := 0 to rows - 1 do
+    begin
+      sum := 0;
+      for c := 0 to cols - 1 do
+        sum := sum + Sqr(x[r * cols + c]);
+      for c := 0 to cols - 1 do
+        want[r * cols + c] := x[r * cols + c] / Sqrt(sum / cols + 1e-6) * w[c];
+    end;
+    cmp := InferCompare(pointer(y1), pointer(want), n, 1e-6, 1e-6);
+    CheckUtf8(InferCompareOk(cmp), 'rmsnorm by definition, % x %: %',
+      [rows, cols, InferCompareText(cmp)]);
+  end;
+  for i := 0 to high(GLUS) do
+  begin
+    n := GLUS[i];
+    Fill(g1, n, 1000 + i, 8);
+    Fill(u, n, 1100 + i, 2);
+    g2 := copy(g1);
+    g3 := copy(g1);
+    SetLength(want, n);
+    SetLength(y3, n);
+    for r := 0 to n - 1 do
+    begin
+      a := g1[r];
+      want[r] := a / (1 + Exp(-a)) * u[r];
+      silu := a / (1 + Exp(-a)); // float32 steps: silu rounded, then the product
+      y3[r] := silu * u[r];
+    end;
+    fRef.SwiGlu(pointer(g1), pointer(u), n);
+    fFast.SwiGlu(pointer(g2), pointer(u), n);
+    fExact.SwiGlu(pointer(g3), pointer(u), n);
+    CheckUtf8(SameBits(pointer(g1), pointer(g2), n) and
+      SameBits(pointer(g1), pointer(g3), n), 'swiglu of %', [n]);
+    CheckUtf8(SameBits(pointer(g1), pointer(y3), n), 'swiglu in float32 steps, %',
+      [n]);
+    cmp := InferCompare(pointer(g1), pointer(want), n, 1e-6, 1e-6);
+    CheckUtf8(InferCompareOk(cmp), 'swiglu by definition, %: %',
+      [n, InferCompareText(cmp)]);
+  end;
+  // Rope: rows below, at and above the parallel threshold; 16 heads of 128
+  for i := 0 to high(ROPES) do
+  begin
+    rows := ROPES[i];
+    n := rows * 16 * 128;
+    Fill(x, n, 1200 + i, 3);
+    SetLength(w, rows * 64);
+    SetLength(u, rows * 64);
+    for r := 0 to rows - 1 do
+      for c := 0 to 63 do
+      begin
+        a := (7 + r) / Exp(c / 64 * Ln(1000000)); // position / theta^(2c/d)
+        w[r * 64 + c] := Cos(a);
+        u[r * 64 + c] := Sin(a);
+      end;
+    y1 := copy(x);
+    y2 := copy(x);
+    y3 := copy(x);
+    fRef.Rope(pointer(y1), rows, 16, 128, pointer(w), pointer(u));
+    fFast.Rope(pointer(y2), rows, 16, 128, pointer(w), pointer(u));
+    fExact.Rope(pointer(y3), rows, 16, 128, pointer(w), pointer(u));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), n) and
+      SameBits(pointer(y1), pointer(y3), n), 'rope, % rows', [rows]);
+    // rotate_half by definition: [x1, x2] -> [x1 c - x2 s, x2 c + x1 s]
+    SetLength(want, n);
+    for r := 0 to rows - 1 do
+      for c := 0 to 15 do
+        for k := 0 to 63 do
+        begin
+          j := (r * 16 + c) * 128 + k;
+          want[j] := x[j] * w[r * 64 + k] - x[j + 64] * u[r * 64 + k];
+          want[j + 64] := x[j + 64] * w[r * 64 + k] + x[j] * u[r * 64 + k];
+        end;
+    cmp := InferCompare(pointer(y1), pointer(want), n, 1e-6, 1e-6);
+    CheckUtf8(InferCompareOk(cmp), 'rope by definition, % rows: %',
+      [rows, InferCompareText(cmp)]);
+  end;
 end;
 
 procedure TTestInferFast.ThreadPoolRunsEveryItemOnce;

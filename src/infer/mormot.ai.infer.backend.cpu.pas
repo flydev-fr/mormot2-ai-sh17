@@ -93,6 +93,11 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
+      aEps: double; y: PSingleArray); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      aCos, aSin: PSingleArray); override;
   end;
 
   /// one CausalAttention: its operands and the arithmetic to use
@@ -155,6 +160,9 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray);
     procedure GeluRange(aItem: integer);
     procedure LayerNormRows(aItem: integer);
+    procedure RmsNormRows(aItem: integer);
+    procedure SwiGluRange(aItem: integer);
+    procedure RopeRows(aItem: integer);
     procedure RunParallel(const aJob: TOnInferItem; aCount: integer);
   public
     /// aThreads: the threads to compute on, the calling one included; 0 means
@@ -171,6 +179,11 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
+      aEps: double; y: PSingleArray); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      aCos, aSin: PSingleArray); override;
     /// the threads computing, the calling one included
     property Threads: integer
       read fThreads;
@@ -976,6 +989,73 @@ begin
     x^[i] := x^[i] * sum;
 end;
 
+procedure TInferCpuBackend.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
+  w: PSingleArray; aEps: double; y: PSingleArray);
+var
+  r, c: PtrInt;
+  sum, a, inv: double;
+  xr, yr: PSingleArray;
+  n: single;
+begin
+  for r := 0 to aRows - 1 do
+  begin
+    xr := @x^[r * aCols];
+    yr := @y^[r * aCols];
+    sum := 0;
+    for c := 0 to aCols - 1 do
+    begin
+      a := xr^[c];
+      sum := sum + a * a;
+    end;
+    inv := 1 / Sqrt(sum / aCols + aEps);
+    for c := 0 to aCols - 1 do
+    begin
+      // the reference rounds the normalized value to single before the weight
+      n := xr^[c] * inv;
+      yr^[c] := w^[c] * n;
+    end;
+  end;
+end;
+
+procedure TInferCpuBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+var
+  i: PtrInt;
+  a: double;
+  b: single;
+begin
+  for i := 0 to aCount - 1 do
+  begin
+    // silu(g) * u, each step rounded to single like the reference
+    a := gate^[i];
+    b := a / (1 + Exp(-a));
+    gate^[i] := b * up^[i];
+  end;
+end;
+
+procedure TInferCpuBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+  aCos, aSin: PSingleArray);
+var
+  r, h, i, half: PtrInt;
+  c, s, a, b: double;
+  v: PSingleArray;
+begin
+  half := aHeadDim shr 1;
+  for r := 0 to aRows - 1 do
+    for i := 0 to half - 1 do
+    begin
+      c := aCos^[r * half + i];
+      s := aSin^[r * half + i];
+      for h := 0 to aHeads - 1 do
+      begin
+        v := @x^[(r * aHeads + h) * aHeadDim];
+        a := v^[i];
+        b := v^[i + half];
+        v^[i] := a * c - b * s;
+        v^[i + half] := b * c + a * s;
+      end;
+    end;
+end;
+
 { TInferCpuFastBackend }
 
 const
@@ -1600,6 +1680,106 @@ begin
     fBeta := beta;
     fEps := aEps;
     RunParallel(LayerNormRows, (aRows + LAYERNORM_ROWS - 1) div LAYERNORM_ROWS);
+  finally
+    fBusy.UnLock;
+  end;
+end;
+
+const
+  /// rows per RmsNorm work item
+  RMSNORM_ROWS = 4;
+  /// elements per SwiGlu work item: a decoded token has a few of them
+  SWIGLU_ITEM = 1024;
+
+procedure TInferCpuFastBackend.RmsNormRows(aItem: integer);
+var
+  first: PtrInt;
+begin
+  // the reference arithmetic, each row on one thread: bit-identical
+  first := PtrInt(aItem) * RMSNORM_ROWS;
+  inherited RmsNorm(@fX^[first * fCols], MinPtrInt(RMSNORM_ROWS, fRows - first),
+    fCols, fGamma, fEps, @fY^[first * fCols]);
+end;
+
+procedure TInferCpuFastBackend.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
+  w: PSingleArray; aEps: double; y: PSingleArray);
+begin
+  if (aRows < 2 * RMSNORM_ROWS) or (aRows * aCols < 8192) or
+     not fBusy.TryLock then
+  begin
+    inherited RmsNorm(x, aRows, aCols, w, aEps, y);
+    exit;
+  end;
+  try
+    fX := x;
+    fY := y;
+    fRows := aRows;
+    fCols := aCols;
+    fGamma := w;
+    fEps := aEps;
+    RunParallel(RmsNormRows, (aRows + RMSNORM_ROWS - 1) div RMSNORM_ROWS);
+  finally
+    fBusy.UnLock;
+  end;
+end;
+
+procedure TInferCpuFastBackend.SwiGluRange(aItem: integer);
+var
+  first: PtrInt;
+begin
+  // the reference arithmetic on a slice: bit-identical
+  first := PtrInt(aItem) * SWIGLU_ITEM;
+  inherited SwiGlu(@fX^[first], @fY^[first], MinPtrInt(SWIGLU_ITEM, fRows - first));
+end;
+
+procedure TInferCpuFastBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+begin
+  if (aCount < 2 * SWIGLU_ITEM) or not fBusy.TryLock then
+  begin
+    inherited SwiGlu(gate, up, aCount);
+    exit;
+  end;
+  try
+    fX := gate;
+    fY := up;
+    fRows := aCount;
+    RunParallel(SwiGluRange, (aCount + SWIGLU_ITEM - 1) div SWIGLU_ITEM);
+  finally
+    fBusy.UnLock;
+  end;
+end;
+
+const
+  /// rows per Rope work item
+  ROPE_ROWS = 4;
+
+procedure TInferCpuFastBackend.RopeRows(aItem: integer);
+var
+  first, half: PtrInt;
+begin
+  // the reference arithmetic, each row on one thread: bit-identical
+  first := PtrInt(aItem) * ROPE_ROWS;
+  half := fHeadDim shr 1;
+  inherited Rope(@fX^[first * fWidth * fHeadDim], MinPtrInt(ROPE_ROWS, fRows - first),
+    fWidth, fHeadDim, @fGamma^[first * half], @fBeta^[first * half]);
+end;
+
+procedure TInferCpuFastBackend.Rope(x: PSingleArray; aRows, aHeads,
+  aHeadDim: PtrInt; aCos, aSin: PSingleArray);
+begin
+  if (aRows < 2 * ROPE_ROWS) or not fBusy.TryLock then
+  begin
+    inherited Rope(x, aRows, aHeads, aHeadDim, aCos, aSin);
+    exit;
+  end;
+  try
+    fX := x;
+    fRows := aRows;
+    fWidth := aHeads;
+    fHeadDim := aHeadDim;
+    fGamma := aCos;
+    fBeta := aSin;
+    RunParallel(RopeRows, (aRows + ROPE_ROWS - 1) div ROPE_ROWS);
   finally
     fBusy.UnLock;
   end;

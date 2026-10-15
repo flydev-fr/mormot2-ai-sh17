@@ -36,7 +36,10 @@ type
     ioSoftmaxMasked,
     ioAttention,
     ioL2Normalize,
-    ioCausalAttention);
+    ioCausalAttention,
+    ioRmsNorm,
+    ioSwiGlu,
+    ioRope);
 
   /// a weight matrix [out, in] as stored in the file: its first byte and type
   // - F32 holds out * in singles, Q8_0 out rows of in div 32 blocks
@@ -89,6 +92,21 @@ type
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray);
       virtual; abstract;
+    /// y[rows, cols] = x / sqrt(mean(x^2) + eps) * w, per row (RMSNorm)
+    // - the normalized value is rounded to single before the weight, as the
+    // float32 reference does; y may be x
+    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
+      aEps: double; y: PSingleArray); virtual; abstract;
+    /// gate := silu(gate) * up elementwise (the SwiGLU of a feed-forward
+    // block), silu(g) = g / (1 + exp(-g)) rounded to single before the product
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); virtual; abstract;
+    /// rotary positions in place, the halves of every head rotated together
+    // (rotate_half): x[i], x[i + d/2] := x[i] c - x[i + d/2] s, x[i + d/2] c +
+    // x[i] s, in double
+    // - x is [aRows, aHeads * aHeadDim]; aCos and aSin are [aRows, aHeadDim / 2],
+    // the factors of each row's position
+    procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      aCos, aSin: PSingleArray); virtual; abstract;
   end;
 
 /// a TInferWeight from its parts

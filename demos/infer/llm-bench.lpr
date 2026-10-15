@@ -43,7 +43,7 @@ type
   protected
     fInner: TInferBackend;
   public
-    LinearUs, AddUs: Int64;
+    LinearUs, AddUs, AttnUs, NormUs, GluUs, RopeUs: Int64;
     LinearCalls: Int64;
     constructor Create(aInner: TInferBackend);
     function Supports(aOp: TInferOp; aWeights: TInferDType): boolean; override;
@@ -60,6 +60,11 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
+      aEps: double; y: PSingleArray); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      aCos, aSin: PSingleArray); override;
     procedure Reset;
   end;
 
@@ -127,14 +132,55 @@ end;
 procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
   y: PSingleArray);
+var
+  t0, t1: Int64;
 begin
+  QueryPerformanceMicroSeconds(t0);
   fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y);
+  QueryPerformanceMicroSeconds(t1);
+  inc(AttnUs, t1 - t0);
+end;
+
+procedure TTimedBackend.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
+  w: PSingleArray; aEps: double; y: PSingleArray);
+var
+  t0, t1: Int64;
+begin
+  QueryPerformanceMicroSeconds(t0);
+  fInner.RmsNorm(x, aRows, aCols, w, aEps, y);
+  QueryPerformanceMicroSeconds(t1);
+  inc(NormUs, t1 - t0);
+end;
+
+procedure TTimedBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+var
+  t0, t1: Int64;
+begin
+  QueryPerformanceMicroSeconds(t0);
+  fInner.SwiGlu(gate, up, aCount);
+  QueryPerformanceMicroSeconds(t1);
+  inc(GluUs, t1 - t0);
+end;
+
+procedure TTimedBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+  aCos, aSin: PSingleArray);
+var
+  t0, t1: Int64;
+begin
+  QueryPerformanceMicroSeconds(t0);
+  fInner.Rope(x, aRows, aHeads, aHeadDim, aCos, aSin);
+  QueryPerformanceMicroSeconds(t1);
+  inc(RopeUs, t1 - t0);
 end;
 
 procedure TTimedBackend.Reset;
 begin
   LinearUs := 0;
   AddUs := 0;
+  AttnUs := 0;
+  NormUs := 0;
+  GluUs := 0;
+  RopeUs := 0;
   LinearCalls := 0;
 end;
 
@@ -257,10 +303,14 @@ begin
       QueryPerformanceMicroSeconds(t1);
       prefillUs := t1 - t0;
       ConsoleWrite('prefill: % tokens in % ms = % tokens/s; linear % pct, ' +
-        'add % pct, rest (attention, norms, rope) % pct',
+        'add % pct, attention % pct, rmsnorm % pct, swiglu % pct, rope % pct, ' +
+        'rest % pct',
         [promptLen, prefillUs div 1000, promptLen * 1000000 / prefillUs,
          Pct(timed.LinearUs, prefillUs), Pct(timed.AddUs, prefillUs),
-         Pct(prefillUs - timed.LinearUs - timed.AddUs, prefillUs)]);
+         Pct(timed.AttnUs, prefillUs), Pct(timed.NormUs, prefillUs),
+         Pct(timed.GluUs, prefillUs), Pct(timed.RopeUs, prefillUs),
+         Pct(prefillUs - timed.LinearUs - timed.AddUs - timed.AttnUs -
+         timed.NormUs - timed.GluUs - timed.RopeUs, prefillUs)]);
       timed.Reset;
       n := 0;
       QueryPerformanceMicroSeconds(t0);
@@ -273,10 +323,14 @@ begin
       QueryPerformanceMicroSeconds(t1);
       decodeUs := t1 - t0;
       ConsoleWrite('decode: % tokens in % ms = % tokens/s (% ms/token); ' +
-        'linear % pct, add % pct, rest % pct',
+        'linear % pct, add % pct, attention % pct, rmsnorm % pct, swiglu % pct, ' +
+        'rope % pct, rest % pct',
         [n, decodeUs div 1000, n * 1000000 / decodeUs, decodeUs / 1000 / n,
          Pct(timed.LinearUs, decodeUs), Pct(timed.AddUs, decodeUs),
-         Pct(decodeUs - timed.LinearUs - timed.AddUs, decodeUs)]);
+         Pct(timed.AttnUs, decodeUs), Pct(timed.NormUs, decodeUs),
+         Pct(timed.GluUs, decodeUs), Pct(timed.RopeUs, decodeUs),
+         Pct(decodeUs - timed.LinearUs - timed.AddUs - timed.AttnUs -
+         timed.NormUs - timed.GluUs - timed.RopeUs, decodeUs)]);
       ConsoleWrite('context: % tokens, peak % MB', [ctx.Length, PeakRssMB]);
     finally
       ctx.Free;

@@ -663,8 +663,40 @@ bestehen und die Benchmarks dokumentiert sind.
   gespeichert, Truncate nach oben, erster statt längster Treffer, LRU verkehrt,
   volle Liste neu angelegt, Slots kürzen verkehrt, Client ohne Cache) schlagen an.
 
-- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Q4/K-Quants
-  (GGUF), Benchmarks auf macOS und x86_64.
+**3d, erledigt 2026-10-15: Normen, RoPE, SwiGLU und das Wachsen des KV-Caches.**
+
+- Gemessen vorher (Q8_0, 200 Tokens): 45 % des Prefills und 19 % des Dekodierens lagen
+  außerhalb der Matrixprodukte und der Attention, in RMSNorm, RoPE und SwiGLU, die im
+  Modell auf einem Thread liefen. `llm-bench` weist jetzt jede Operation einzeln aus.
+- RMSNorm, SwiGLU und RoPE sind Backend-Operationen (`ioRmsNorm`, `ioSwiGlu`,
+  `ioRope`). Die Referenz rechnet genau wie bisher das Modell; das schnelle Backend
+  verteilt Zeilen bzw. Abschnitte auf den Pool, mit derselben Arithmetik. Damit bleibt
+  alles bitgleich, in beiden Modi, und kein Gate ändert sich. SIMD lohnt hier nicht
+  mehr: Zusammen bleiben die drei unter 10 %.
+- RoPE: Cos und Sin rechnet `Forward` einmal je Position, statt je Layer und je Q und K
+  (56-mal dasselbe bei Qwen3-0.6B).
+- KV-Cache: Er wuchs beim ersten Wachsen auf genau die Prompt-Länge, sodass schon das
+  erste dekodierte Token den ganzen Cache kopierte (bei 1000 Tokens rund 300 ms). Er
+  wächst jetzt auf das Doppelte und mindestens ein Viertel über den Bedarf.
+- Messung (Snapdragon, 8 Threads, ein Lauf; vorher am selben Tag gemessen):
+
+  | | Prefill | Dekodieren | Speicher-Peak |
+  |---|---|---|---|
+  | F32, 200, vorher | 167 Tokens/s | 30 Tokens/s | 3,8 GB |
+  | F32, 200 | 203 Tokens/s | 33 Tokens/s | 3,8 GB |
+  | F32, 1000 | 138 Tokens/s | 24 Tokens/s | 4,1 GB |
+  | Q8_0, 200, vorher | 282 Tokens/s | 53 Tokens/s | 2,1 GB |
+  | Q8_0, 200 | 498 Tokens/s | 64 Tokens/s | 2,1 GB |
+  | Q8_0, 1000 | 240 Tokens/s | 40 Tokens/s | 2,4 GB |
+
+  Bei 1000 Tokens geht jetzt die Hälfte des Prefills in die Attention; sie ist der
+  nächste Hebel bei langen Prompts.
+- Tests: RMSNorm, SwiGLU und RoPE in allen Modi bitgleich zur Referenz (unter, an und
+  über den Schwellen, in place) und die Referenz gegen die Formeln; die Qwen3-Gates
+  unverändert grün. Gegenproben (Zeilen- und Abschnittsversatz, falsche RoPE-Zeile,
+  Position ohne Vorgänger, SiLU ohne Single-Rundung) schlagen an.
+
+- Offen in Phase 3: Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
 
 ### Phase 4 — GPU
 

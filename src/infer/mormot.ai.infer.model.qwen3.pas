@@ -94,6 +94,7 @@ type
     fKeys, fValues: array of TSingleDynArray; // per layer [capacity, kvWidth]
     fIds: TIntegerDynArray; // [capacity] the token at every cached position
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
+    fCos, fSin: TSingleDynArray; // [new tokens, HeadDim / 2] rotary factors
     function GetId(aPosition: PtrInt): integer;
   public
     /// forget the cached tokens - the buffers stay allocated
@@ -133,9 +134,7 @@ type
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
     function Matrix(const aName: RawUtf8; aRows, aCols: Int64): TInferWeight;
     procedure Grow(aCtx: TQwen3Context; aTokens, aNew: PtrInt);
-    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
-      y: PSingleArray);
-    procedure Rope(x: PSingleArray; aRows, aHeads, aFirstPos: PtrInt);
+    procedure RopeFactors(aCtx: TQwen3Context; aRows, aFirstPos: PtrInt);
     procedure Attention(aCtx: TQwen3Context; aLayer, aRows: PtrInt);
   public
     /// load <aFolder>config.json and <aFolder>model.safetensors
@@ -255,8 +254,11 @@ begin
   if not fBackend.Supports(ioLinear, aWeights) then
     EInferError.RaiseUtf8('%: the backend has no % Linear',
       [self, INFER_DTYPE_NAME[aWeights]]);
-  if not fBackend.Supports(ioCausalAttention, idtF32) then
-    EInferError.RaiseUtf8('%: the backend has no causal attention', [self]);
+  if not fBackend.Supports(ioCausalAttention, idtF32) or
+     not fBackend.Supports(ioRmsNorm, idtF32) or
+     not fBackend.Supports(ioSwiGlu, idtF32) or
+     not fBackend.Supports(ioRope, idtF32) then
+    EInferError.RaiseUtf8('%: the backend lacks a decoder operation', [self]);
   LoadConfig(IncludeTrailingPathDelimiter(aFolder) + 'config.json');
   if (aWeights = idtQ8_0) and
      ((fConfig.Hidden and 31 <> 0) or (fConfig.Intermediate and 31 <> 0) or
@@ -558,9 +560,11 @@ begin
   end;
   if aTokens > aCtx.fCapacity then
   begin
+    // doubled, and a quarter beyond the tokens wanted: a prefill is followed
+    // by decoding, which must not copy the whole cache at its first token
     cap := aCtx.fCapacity * 2;
-    if cap < aTokens then
-      cap := aTokens;
+    if cap < aTokens + aTokens shr 2 then
+      cap := aTokens + aTokens shr 2;
     if cap < 64 then
       cap := 64;
     if cap > fConfig.MaxPositions then
@@ -586,60 +590,24 @@ begin
   Need(aCtx.fV, aNew * kvw);
   Need(aCtx.fGate, aNew * fConfig.Intermediate);
   Need(aCtx.fUp, aNew * fConfig.Intermediate);
+  Need(aCtx.fCos, aNew * (fConfig.HeadDim shr 1));
+  Need(aCtx.fSin, aNew * (fConfig.HeadDim shr 1));
 end;
 
-procedure TQwen3Model.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
-  w: PSingleArray; y: PSingleArray);
+procedure TQwen3Model.RopeFactors(aCtx: TQwen3Context; aRows, aFirstPos: PtrInt);
 var
-  r, c: PtrInt;
-  sum, a, inv: double;
-  xr, yr: PSingleArray;
-  n: single;
-begin
-  for r := 0 to aRows - 1 do
-  begin
-    xr := @x^[r * aCols];
-    yr := @y^[r * aCols];
-    sum := 0;
-    for c := 0 to aCols - 1 do
-    begin
-      a := xr^[c];
-      sum := sum + a * a;
-    end;
-    inv := 1 / Sqrt(sum / aCols + fConfig.RmsEps);
-    for c := 0 to aCols - 1 do
-    begin
-      // the reference rounds the normalized value to single before the weight
-      n := xr^[c] * inv;
-      yr^[c] := w^[c] * n;
-    end;
-  end;
-end;
-
-procedure TQwen3Model.Rope(x: PSingleArray; aRows, aHeads, aFirstPos: PtrInt);
-var
-  r, h, i, half, d: PtrInt;
+  r, i, half: PtrInt;
   angle: single;
-  c, s, a, b: double;
-  v: PSingleArray;
 begin
-  d := fConfig.HeadDim;
-  half := d shr 1;
+  // once per Forward: every layer and both Q and K use the same factors
+  half := fConfig.HeadDim shr 1;
   for r := 0 to aRows - 1 do
     for i := 0 to half - 1 do
     begin
       // the angle in single, as the reference's float32 product
       angle := fInvFreq[i] * (aFirstPos + r);
-      c := RoundToSingle(Cos(angle));
-      s := RoundToSingle(Sin(angle));
-      for h := 0 to aHeads - 1 do
-      begin
-        v := @x^[(r * aHeads + h) * d];
-        a := v^[i];
-        b := v^[i + half];
-        v^[i] := a * c - b * s;
-        v^[i + half] := b * c + a * s;
-      end;
+      aCtx.fCos[r * half + i] := Cos(angle);
+      aCtx.fSin[r * half + i] := Sin(angle);
     end;
 end;
 
@@ -667,7 +635,6 @@ procedure TQwen3Model.Forward(aCtx: TQwen3Context; aIds: PIntegerArray;
 var
   i, l, n, h, f, qw, kvw, past, id: PtrInt;
   ly: ^TQwen3Layer;
-  a, b: double;
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
@@ -691,6 +658,7 @@ begin
       EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary', [self, id]);
   end;
   Grow(aCtx, past + n, n);
+  RopeFactors(aCtx, n, past);
   // embeddings
   for i := 0 to n - 1 do
     WidenRow(fEmbedSrc, aIds^[i], h, @aCtx.fX[i * h]);
@@ -700,16 +668,19 @@ begin
   begin
     ly := @fLayer[l];
     // attention block: pre-norm, projections, per-head norms, rotary positions
-    RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, pointer(aCtx.fH));
+    fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
+      pointer(aCtx.fH));
     fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, nil, pointer(aCtx.fQ));
     fBackend.Linear(pointer(aCtx.fH), n, h, ly^.K, kvw, nil, pointer(aCtx.fK));
     fBackend.Linear(pointer(aCtx.fH), n, h, ly^.V, kvw, nil, pointer(aCtx.fV));
-    RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, fConfig.HeadDim, ly^.QNorm,
-      pointer(aCtx.fQ));
-    RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim, ly^.KNorm,
-      pointer(aCtx.fK));
-    Rope(pointer(aCtx.fQ), n, fConfig.Heads, past);
-    Rope(pointer(aCtx.fK), n, fConfig.KvHeads, past);
+    fBackend.RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, fConfig.HeadDim,
+      ly^.QNorm, fConfig.RmsEps, pointer(aCtx.fQ));
+    fBackend.RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim,
+      ly^.KNorm, fConfig.RmsEps, pointer(aCtx.fK));
+    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, fConfig.HeadDim,
+      pointer(aCtx.fCos), pointer(aCtx.fSin));
+    fBackend.Rope(pointer(aCtx.fK), n, fConfig.KvHeads, fConfig.HeadDim,
+      pointer(aCtx.fCos), pointer(aCtx.fSin));
     MoveFast(pointer(aCtx.fK)^, aCtx.fKeys[l][past * kvw], n * kvw * SizeOf(single));
     MoveFast(pointer(aCtx.fV)^, aCtx.fValues[l][past * kvw], n * kvw * SizeOf(single));
     Attention(aCtx, l, n);
@@ -718,16 +689,11 @@ begin
       aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
     fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
     // feed-forward block: pre-norm, SwiGLU, residual
-    RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, pointer(aCtx.fH));
+    fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
+      pointer(aCtx.fH));
     fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Gate, f, nil, pointer(aCtx.fGate));
     fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Up, f, nil, pointer(aCtx.fUp));
-    for i := 0 to n * f - 1 do
-    begin
-      // silu(g) * u, each step rounded to single like the reference
-      a := aCtx.fGate[i];
-      b := RoundToSingle(a / (1 + Exp(-a)));
-      aCtx.fGate[i] := b * aCtx.fUp[i];
-    end;
+    fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), n * f);
     fBackend.Linear(pointer(aCtx.fGate), n, f, ly^.Down, h, nil, pointer(aCtx.fTmp));
     if Assigned(aOnState) and (l = 0) then
       aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
@@ -739,7 +705,7 @@ begin
   aCtx.fLength := past + n;
   if (aLogits = nil) and not Assigned(aOnState) then
     exit;
-  RmsNorm(pointer(aCtx.fX), n, h, fNorm, pointer(aCtx.fH));
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, fNorm, fConfig.RmsEps, pointer(aCtx.fH));
   if Assigned(aOnState) then
     aOnState('norm', pointer(aCtx.fH), n, h);
   if aLogits = nil then

@@ -73,12 +73,18 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+    procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
+      aEps: double; y: PSingleArray); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      aCos, aSin: PSingleArray); override;
     function Report(aTotal: Int64): RawUtf8;
   end;
 
 const
   OP_NAME: array[TInferOp] of RawUtf8 = (
-    'linear', 'layernorm', 'gelu', 'add', 'softmax', 'attention', 'l2', 'causal');
+    'linear', 'layernorm', 'gelu', 'add', 'softmax', 'attention', 'l2', 'causal',
+    'rmsnorm', 'swiglu', 'rope');
 
 function NotZero(v: Int64): Int64;
 begin
@@ -171,6 +177,29 @@ procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   y: PSingleArray);
 begin
   fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y);
+end;
+
+procedure TTimedBackend.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
+  w: PSingleArray; aEps: double; y: PSingleArray);
+begin
+  Enter;
+  fInner.RmsNorm(x, aRows, aCols, w, aEps, y);
+  Leave(ioRmsNorm);
+end;
+
+procedure TTimedBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+begin
+  Enter;
+  fInner.SwiGlu(gate, up, aCount);
+  Leave(ioSwiGlu);
+end;
+
+procedure TTimedBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+  aCos, aSin: PSingleArray);
+begin
+  Enter;
+  fInner.Rope(x, aRows, aHeads, aHeadDim, aCos, aSin);
+  Leave(ioRope);
 end;
 
 function TTimedBackend.Report(aTotal: Int64): RawUtf8;
