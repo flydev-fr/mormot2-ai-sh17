@@ -158,7 +158,7 @@ then 32 new tokens (`demos/infer/llm-bench`), 2026-10-15:
 | Q8_0, 1000-token prompt | 240 tokens/s | 40 tokens/s | 2.4 GB |
 
 The same on an Apple M2 Pro (macOS, FPC 3.2.4, 7 threads; two runs, which differ by
-up to 10 %):
+up to 12 %):
 
 | | prefill | decode | peak RSS |
 |---|---|---|---|

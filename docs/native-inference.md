@@ -697,7 +697,7 @@ bestehen und die Benchmarks dokumentiert sind.
   Position ohne Vorgänger, SiLU ohne Single-Rundung) schlagen an.
 
 **3f, macOS erledigt 2026-10-15: Benchmark auf dem Apple M2 Pro** (FPC 3.2.4, 7 Threads,
-NEON-Dotprod; zwei Läufe, bis 10 % auseinander). Die Infer-Suite läuft dort mit allen
+NEON-Dotprod; zwei Läufe, bis 12 % auseinander). Die Infer-Suite läuft dort mit allen
 Modellen grün (2010 Prüfungen, wie auf dem Snapdragon).
 
 | | Prefill | Dekodieren | Speicher-Peak |
@@ -707,7 +707,7 @@ Modellen grün (2010 Prüfungen, wie auf dem Snapdragon).
 | F32, 1000 | 147–160 Tokens/s | 31–32 Tokens/s | 4,1 GB |
 | Q8_0, 1000 | 371–408 Tokens/s | 44–47 Tokens/s | 2,4 GB |
 
-Der M2 Pro dekodiert 10 bis 30 % schneller als der Snapdragon (vermutlich die höhere
+Der M2 Pro dekodiert 9 bis 33 % schneller als der Snapdragon (vermutlich die höhere
 Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt auch unter macOS
 (`getrusage`).
 
