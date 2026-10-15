@@ -2,11 +2,14 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - RollbackIfOpen: the transaction-recovery rule every SQLite-backed store needs
-//   (mORMot's Commit clears its flag even when COMMIT fails)
-// - run-time extension loading (sqlite-vec / sqlite-lembed): mORMot does not bind
-//   sqlite3_enable_load_extension, so loading is enabled via
-//   db_config(SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION) - proven cross-platform (FPC,
-//   Linux+Windows); the extension shared libs live next to their llama/ggml deps
+//   (roll back whatever is open, never raise from an except branch)
+// - run-time extension loading (sqlite-vec / sqlite-lembed) is mORMot's own
+//   TSqlDataBase.LoadExtension (mORMot2 6302d231e, 2026-10-15): it enables the C
+//   loading API only for the call and never the SQL load_extension() function; the
+//   extension shared libs live next to their llama/ggml deps
+// - its TFileName goes through the ANSI code page where string is not Unicode
+//   (Delphi 7, FPC on Windows): an extension folder with characters outside it
+//   cannot be loaded there - there are no 32-bit builds of vec0 and lembed anyway
 // - lives apart from the concrete stores so that a store without extensions (the
 //   native one) never depends on the sqlite-vec unit
 unit mormot.ai.sqlite;
@@ -15,8 +18,7 @@ unit mormot.ai.sqlite;
   *****************************************************************************
 
     - RollbackIfOpen: transaction recovery shared by the SQLite backends
-    - SqliteExtSuffix / EnableSqliteExtensions / LoadSqliteExtension:
-      run-time loading of sqlite-vec and sqlite-lembed
+    - SqliteExtSuffix: the shared-library suffix of sqlite-vec and sqlite-lembed
 
   *****************************************************************************
 }
@@ -33,23 +35,16 @@ uses
   mormot.db.raw.sqlite3;
 
 /// roll back the open transaction of aDB, if SQLite says there is one
-// - TSqlDataBase.Commit clears TransactionActive even when COMMIT itself fails
-// (e.g. SQLITE_BUSY), and RollBack checks exactly that flag - so an
-// `except RollBack` after a failed Commit is a no-op and the transaction stays
-// open: every later TransactionBegin fails and single writes silently join it.
-// This decides on SQLite's own state (get_autocommit) instead.
+// - TransactionActive and RollBack follow SQLite's own state since mORMot2
+// f08998d82 (2026-10-15) - before, a failed Commit (e.g. SQLITE_BUSY) cleared
+// the flag and left the transaction open, so this unit asked get_autocommit
+// itself; that is mORMot's job now
 // - never raises: a failed rollback must not hide the original exception
 procedure RollbackIfOpen(aDB: TSqlDataBase);
 
 /// the platform shared-library suffix for a SQLite extension
 function SqliteExtSuffix: RawUtf8;
 
-/// enable run-time extension loading on a connection (mORMot omits the dedicated
-/// enable API, so SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION via db_config is used)
-procedure EnableSqliteExtensions(aDB: TSqlite3DB);
-
-/// load a SQLite extension shared library by absolute path
-procedure LoadSqliteExtension(aDB: TSqlite3DB; const aPath: RawUtf8);
 
 
 implementation
@@ -59,11 +54,7 @@ begin
   if (aDB = nil) or (aDB.DB = 0) then
     exit;
   try
-    if sqlite3.get_autocommit(aDB.DB) = 0 then
-      if aDB.TransactionActive then
-        aDB.RollBack // also resets mORMot's flag
-      else
-        aDB.Execute('ROLLBACK TRANSACTION;'); // flag already gone (failed Commit)
+    aDB.RollBack; // nothing when SQLite has no transaction open
   except
     // keep the original exception
   end;
@@ -80,28 +71,6 @@ begin
   result := '.so';
   {$endif OSDARWIN}
   {$endif OSWINDOWS}
-end;
-
-procedure EnableSqliteExtensions(aDB: TSqlite3DB);
-var
-  enabled: integer;
-begin
-  enabled := 0;
-  if not Assigned(sqlite3.db_config) then
-    ESqlite3Exception.RaiseUtf8('EnableSqliteExtensions: db_config unavailable', []);
-  if sqlite3.db_config(aDB, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, @enabled) <> SQLITE_OK then
-    ESqlite3Exception.RaiseUtf8('EnableSqliteExtensions failed: %',
-      [Utf8ToString(sqlite3.errmsg(aDB))]);
-end;
-
-procedure LoadSqliteExtension(aDB: TSqlite3DB; const aPath: RawUtf8);
-var
-  msg: PUtf8Char;
-begin
-  msg := nil;
-  if sqlite3.load_extension(aDB, pointer(aPath), nil, msg) <> SQLITE_OK then
-    ESqlite3Exception.RaiseUtf8('LoadSqliteExtension % failed: %',
-      [aPath, Utf8ToString(msg)]);
 end;
 
 end.

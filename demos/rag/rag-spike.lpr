@@ -30,30 +30,6 @@ var
   extdir, model, modelName: RawUtf8;
   dim: integer;
 
-procedure EnableLoadExtension;
-var
-  enabled: integer;
-begin
-  enabled := 0;
-  if not Assigned(sqlite3.db_config) then
-    raise ESqlite3Exception.CreateUtf8('sqlite3.db_config unavailable', []);
-  if sqlite3.db_config(db.DB, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, @enabled) <> SQLITE_OK then
-    raise ESqlite3Exception.CreateUtf8('enable load_extension failed: %',
-      [Utf8ToString(sqlite3.errmsg(db.DB))]);
-end;
-
-procedure LoadExt(const aFile: RawUtf8);
-var
-  msg: PUtf8Char;
-  fn: RawUtf8;
-begin
-  fn := extdir + '/' + aFile;
-  msg := nil;
-  if sqlite3.load_extension(db.DB, pointer(fn), nil, msg) <> SQLITE_OK then
-    raise ESqlite3Exception.CreateUtf8('load_extension % failed: %',
-      [fn, Utf8ToString(msg)]);
-end;
-
 procedure RegisterModel;
 var
   r: TSqlRequest;
@@ -134,9 +110,9 @@ begin
 
   db := TSqlDataBase.Create(':memory:', '');
   try
-    EnableLoadExtension;
-    LoadExt('lembed0.so');
-    LoadExt('vec0.so');
+    // mORMot enables the C loading API for the call only
+    db.LoadExtension(Utf8ToString(extdir + '/lembed0.so'));
+    db.LoadExtension(Utf8ToString(extdir + '/vec0.so'));
     ConsoleWrite(FormatUtf8('loaded: vec=%  lembed=%',
       [db.ExecuteJson('SELECT vec_version()'),
        db.ExecuteJson('SELECT lembed_version()')]), ccLightGray);

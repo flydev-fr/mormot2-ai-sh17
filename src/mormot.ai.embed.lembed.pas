@@ -39,7 +39,7 @@ uses
   mormot.ai.llm.types,
   mormot.ai.embeddings,
   mormot.ai.vectorstore,           // BlobToVector helper (SQLite-free)
-  mormot.ai.sqlite; // Enable/LoadSqliteExtension + SqliteExtSuffix
+  mormot.ai.sqlite; // SqliteExtSuffix
 
 type
   /// a local IEmbedder using sqlite-lembed (a GGUF model run inside SQLite)
@@ -88,8 +88,7 @@ begin
   // own a private in-memory connection: it hosts only lembed0 + the model, never
   // a vector store, so this embedder can serve any number of stores/DBs
   fDB := TSqlDataBase.Create(Utf8ToString(SQLITE_MEMORY_DATABASE_NAME), '');
-  EnableSqliteExtensions(fDB.DB);
-  LoadSqliteExtension(fDB.DB, aExtDir + '/lembed0' + SqliteExtSuffix);
+  fDB.LoadExtension(Utf8ToString(aExtDir + '/lembed0' + SqliteExtSuffix));
   r.Prepare(fDB.DB,
     'INSERT INTO temp.lembed_models(name, model) VALUES (?, lembed_model_from_file(?));');
   try

@@ -6,7 +6,7 @@
 //   top, so a full RAG pipeline can run in-process, offline, with no API. The
 //   static-SQLite dependency is isolated HERE - the engine (mormot.ai.rag) only
 //   sees mormot.ai.vectorstore (the interface), never this unit.
-// - the extension loader and RollbackIfOpen live in mormot.ai.sqlite (shared with
+// - SqliteExtSuffix and RollbackIfOpen live in mormot.ai.sqlite (shared with
 //   the lembed embedder and the native store)
 // - SQL patterns mirror the public sqlite-vec interface
 unit mormot.ai.vectorstore.sqlitevec;
@@ -75,8 +75,7 @@ begin
   // mORMot sets no busy timeout: a lock held by another process (backup tool,
   // sqlite3 CLI) would fail at once with SQLITE_BUSY instead of waiting briefly.
   fDB.BusyTimeout := 5000;
-  EnableSqliteExtensions(fDB.DB);
-  LoadSqliteExtension(fDB.DB, aExtDir + '/vec0' + SqliteExtSuffix);
+  fDB.LoadExtension(Utf8ToString(aExtDir + '/vec0' + SqliteExtSuffix));
   // ext_id is the OPTIONAL stable external key (entity id) for Upsert/Delete rows;
   // NULL for anonymous Add rows. The partial UNIQUE index makes an id map to at most
   // one row (and lets Upsert find + replace it) without constraining the Add rows.

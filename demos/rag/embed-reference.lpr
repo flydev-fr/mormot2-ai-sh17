@@ -363,8 +363,7 @@ begin
         'contract (edit CONTRACT_* in this program)', [modelSha, CONTRACT_MODEL_SHA256]);
     db := TSqlDataBase.Create(Utf8ToString(SQLITE_MEMORY_DATABASE_NAME), '');
     try
-      EnableSqliteExtensions(db.DB);
-      LoadSqliteExtension(db.DB, ext + '/lembed0' + SqliteExtSuffix);
+      db.LoadExtension(Utf8ToString(ext + '/lembed0' + SqliteExtSuffix));
       db.Execute(FormatUtf8('INSERT INTO temp.lembed_models(name, model) ' +
         'VALUES (''%'', lembed_model_from_file(%));',
         [MODEL_ALIAS, QuotedStr(modelPath, '''')]));

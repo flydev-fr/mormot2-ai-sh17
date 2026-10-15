@@ -25,7 +25,8 @@ uses
   mormot.db.raw.sqlite3.static,
   mormot.ai.llm.types,
   mormot.ai.vectorstore,
-  mormot.ai.vectorstore.native;
+  mormot.ai.vectorstore.native,
+  mormot.ai.sqlite;
 
 type
   TTestVectorStoreNative = class(TSynTestCase)
@@ -57,6 +58,9 @@ type
     procedure SearchWhereViaIndex;
     procedure IndexCandidatesAtMaximumDistance;
     procedure MissingGenerationIsRefused;
+    /// a COMMIT that fails (SQLITE_BUSY) leaves the transaction open:
+    // RollbackIfOpen closes it
+    procedure RollbackAfterFailedCommit;
   end;
 
 implementation
@@ -144,6 +148,52 @@ begin
   end;
   fTempFiles := nil;
   inherited CleanUp;
+end;
+
+procedure TTestVectorStoreNative.RollbackAfterFailedCommit;
+var
+  fn: TFileName;
+  a, b: TSqlDataBase;
+  n: Int64;
+  failed: boolean;
+begin
+  fn := TempDb;
+  a := TSqlDataBase.Create(fn, '');
+  b := nil;
+  try
+    a.Execute('CREATE TABLE t(x);');
+    b := TSqlDataBase.Create(fn, '');
+    // b reads inside a transaction: its shared lock keeps the COMMIT of a
+    // from taking the exclusive one (rollback journal, no busy timeout)
+    b.TransactionBegin;
+    b.Execute('SELECT count(*) FROM t;', n);
+    a.TransactionBegin;
+    a.Execute('INSERT INTO t VALUES(1);');
+    failed := false;
+    try
+      a.Commit;
+    except
+      on ESqlite3Exception do
+        failed := true;
+    end;
+    Check(failed, 'COMMIT fails while another connection reads');
+    Check(sqlite3.get_autocommit(a.DB) = 0, 'and the transaction stays open');
+    RollbackIfOpen(a);
+    Check(sqlite3.get_autocommit(a.DB) <> 0, 'RollbackIfOpen closed it');
+    Check(not a.TransactionActive, 'TransactionActive follows');
+    RollbackIfOpen(a); // nothing open: no exception
+    b.RollBack;
+    a.Execute('SELECT count(*) FROM t;', n);
+    CheckEqual(n, 0, 'the insert was rolled back');
+    a.TransactionBegin; // a new transaction starts again
+    a.Execute('INSERT INTO t VALUES(2);');
+    a.Commit;
+    a.Execute('SELECT count(*) FROM t;', n);
+    CheckEqual(n, 1, 'and commits');
+  finally
+    b.Free;
+    a.Free;
+  end;
 end;
 
 procedure TTestVectorStoreNative.KeyedOps;
