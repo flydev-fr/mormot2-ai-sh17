@@ -37,7 +37,7 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 720 | 1587 |
 | Windows x86 | **Delphi 7** | 1253 | 708 | 891 ⁶ |
-| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | not yet run |
+| macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | 1597 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
@@ -51,6 +51,8 @@ that target.
 assertions with the model, about 170 without it).
 ⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
 model, the tokenizer and the chat template run.
+⁷ With all models, NEON dot-product kernels; the BGE-M3 corpus gate passes there too
+(nDCG@10 0.9004, the same as on the Snapdragon).
 
 Counts differ by compiler because some tests only exist where a feature does (the `vec0`
 extension has no 32-bit build, so Delphi 7 skips that test).

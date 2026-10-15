@@ -104,6 +104,15 @@ procedure InferQ8BlockDots4Pascal(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
 
 implementation
 
+{$ifdef CPUAARCH64}
+{$ifdef FPC}
+{$ifdef OSDARWIN}
+uses
+  sysctl; // FPsysctlbyname
+{$endif OSDARWIN}
+{$endif FPC}
+{$endif CPUAARCH64}
+
 procedure InferQ8BlockDotsPascal(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
   aSums: PIntegerArray);
 var
@@ -1330,6 +1339,36 @@ end;
 {$endif ASMX64AVX1}
 {$endif CPUX64}
 
+{$ifdef CPUAARCH64}
+{$ifdef FPC}
+
+/// true if this CPU has SDOT (ARMv8.2 dot product)
+// - mORMot fills the aarch64 CpuFeatures on Linux only (auxiliary vector in
+// mormot.core.base, /proc/cpuinfo fallback in mormot.core.os): on macOS and
+// iOS the set stays empty, so ask the kernel there (every Apple Silicon has
+// SDOT, the sysctl exists since macOS 12; without it the Pascal kernels stay)
+function HasArmDotProd: boolean;
+{$ifdef OSDARWIN}
+var
+  v: integer;
+  len: PtrUInt;
+{$endif OSDARWIN}
+begin
+  result := arm64ASIMDDP in CpuFeatures;
+  {$ifdef OSDARWIN}
+  if result then
+    exit;
+  v := 0;
+  len := SizeOf(v);
+  result := (FPsysctlbyname('hw.optional.arm.FEAT_DotProd', @v, @len, nil, 0) = 0) and
+            (len = SizeOf(v)) and
+            (v <> 0);
+  {$endif OSDARWIN}
+end;
+
+{$endif FPC}
+{$endif CPUAARCH64}
+
 procedure InitKernels;
 var
   h: cardinal;
@@ -1346,7 +1385,7 @@ begin
   InferDotsF32 := TInferDotsF32(@DotsF32Neon);
   InferAxpyRowsF32 := TInferDotsF32(@AxpyRowsF32Neon);
   InferQ8QuantizeRow := TInferQ8QuantizeRow(@Q8QuantizeRowNeon);
-  if arm64ASIMDDP in CpuFeatures then
+  if HasArmDotProd then
   begin
     // an assembler routine: one calling convention on aarch64 whatever the
     // procedure type says
