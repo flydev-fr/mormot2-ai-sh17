@@ -91,6 +91,17 @@ type
     procedure Attention(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
+    procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+  end;
+
+  /// one CausalAttention: its operands and the arithmetic to use
+  TInferCausalJob = record
+    Q, Keys, Values, Y: PSingleArray;
+    Rows, Heads, HeadDim, Past, KvHeads: PtrInt;
+    RowBlocks: PtrInt;
+    /// true: float lanes (the fast path), false: the double reference
+    Fast: boolean;
   end;
 
   /// one Linear of TInferCpuFastBackend: operands and quantized activations
@@ -102,7 +113,8 @@ type
     Xq: PInferBlockQ8_0Array;
     Dx: PDoubleArray;
     Dxs: PSingleArray;
-    /// true: the FP32 arithmetic of the SIMD kernel, false: the exact one
+    /// true: the FP32 arithmetic of the SIMD kernel (Q8_0 or F32 weights),
+    // false: the exact one
     Fp32: boolean;
   end;
 
@@ -133,6 +145,8 @@ type
     fGamma, fBeta: PSingleArray;
     fEps: double;
     fCols: PtrInt;
+    fCausal: TInferCausalJob;
+    procedure CausalItem(aItem: integer);
     procedure LinearTile(aItem: integer);
     procedure QuantizeRow(aItem: integer);
     procedure AttentionItem(aItem: integer);
@@ -155,6 +169,8 @@ type
       gamma, beta: PSingleArray; aEps: double; y: PSingleArray); override;
     procedure Attention(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
+    procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
     /// the threads computing, the calling one included
     property Threads: integer
       read fThreads;
@@ -540,6 +556,132 @@ begin
       aBlocks^[b].qs[j] := f;
     end;
   end;
+end;
+
+/// rows aFirst..aLast of head h of a causal attention job
+// - the reference: scores and sums in double, the softmax divided at the end;
+// with aJob.Fast and a float kernel for this CPU and head size, float lanes
+procedure CausalRows(const aJob: TInferCausalJob; h, aFirst, aLast: PtrInt);
+var
+  r, g, j, t, d, total, kvw, qw: PtrInt;
+  scale, m, sum, acc, a: double;
+  q, k, outp: PSingleArray;
+  sc: TDoubleDynArray;
+  sums: TDoubleDynArray;
+  s: TSingleDynArray;
+begin
+  d := aJob.HeadDim;
+  kvw := aJob.KvHeads * d;
+  qw := aJob.Heads * d;
+  g := h div (aJob.Heads div aJob.KvHeads); // grouped-query: the shared KV head
+  scale := 1 / Sqrt(d);
+  if aJob.Fast and Assigned(InferDotsF32) and (d and 15 = 0) then
+  begin
+    SetLength(s, aJob.Past + aLast + 1);
+    for r := aFirst to aLast do
+    begin
+      total := aJob.Past + r + 1; // causal: up to and including this token
+      InferDotsF32(@aJob.Q^[r * qw + h * d], @aJob.Keys^[g * d],
+        kvw * SizeOf(single), total, d, pointer(s));
+      m := s[0] * scale;
+      for j := 0 to total - 1 do
+      begin
+        s[j] := s[j] * scale;
+        if s[j] > m then
+          m := s[j];
+      end;
+      sum := 0;
+      for j := 0 to total - 1 do
+      begin
+        a := Exp(s[j] - m);
+        s[j] := a;
+        sum := sum + a;
+      end;
+      sum := 1 / sum;
+      for j := 0 to total - 1 do
+        s[j] := s[j] * sum;
+      outp := @aJob.Y^[r * qw + h * d];
+      FillCharFast(outp^, d * SizeOf(single), 0);
+      InferAxpyRowsF32(pointer(s), @aJob.Values^[g * d], kvw * SizeOf(single),
+        total, d, outp);
+    end;
+    exit;
+  end;
+  SetLength(sc, aJob.Past + aLast + 1);
+  SetLength(sums, d);
+  for r := aFirst to aLast do
+  begin
+    total := aJob.Past + r + 1;
+    q := @aJob.Q^[r * qw + h * d];
+    m := 0;
+    for j := 0 to total - 1 do
+    begin
+      k := @aJob.Keys^[j * kvw + g * d];
+      acc := 0;
+      for t := 0 to d - 1 do
+      begin
+        a := q^[t]; // widen before multiplying: same result on every FPU
+        acc := acc + a * k^[t];
+      end;
+      acc := acc * scale;
+      sc[j] := acc;
+      if (j = 0) or (acc > m) then
+        m := acc;
+    end;
+    sum := 0;
+    for j := 0 to total - 1 do
+    begin
+      sc[j] := Exp(sc[j] - m);
+      sum := sum + sc[j];
+    end;
+    for t := 0 to d - 1 do
+      sums[t] := 0;
+    for j := 0 to total - 1 do
+    begin
+      k := @aJob.Values^[j * kvw + g * d];
+      acc := sc[j];
+      for t := 0 to d - 1 do
+        sums[t] := sums[t] + acc * k^[t];
+    end;
+    outp := @aJob.Y^[r * qw + h * d];
+    sum := 1 / sum;
+    for t := 0 to d - 1 do
+      outp^[t] := sums[t] * sum;
+  end;
+end;
+
+function CausalJob(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+  keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
+  aFast: boolean): TInferCausalJob;
+begin
+  if (aRows <= 0) or (aHeads <= 0) or (aHeadDim <= 0) or (aPast < 0) or
+     (aKvHeads <= 0) or (aHeads mod aKvHeads <> 0) then
+    EInferError.RaiseUtf8('CausalAttention: % rows, % heads of %, % KV heads, ' +
+      'past %', [aRows, aHeads, aHeadDim, aKvHeads, aPast]);
+  result.Q := q;
+  result.Keys := keys;
+  result.Values := values;
+  result.Y := y;
+  result.Rows := aRows;
+  result.Heads := aHeads;
+  result.HeadDim := aHeadDim;
+  result.Past := aPast;
+  result.KvHeads := aKvHeads;
+  result.RowBlocks := 1;
+  result.Fast := aFast;
+end;
+
+procedure TInferCpuBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
+  aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
+  y: PSingleArray);
+var
+  job: TInferCausalJob;
+  h: PtrInt;
+begin
+  job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
+    false);
+  for h := 0 to aHeads - 1 do
+    CausalRows(job, h, 0, aRows - 1);
 end;
 
 function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolean;
@@ -1064,6 +1206,20 @@ begin
       inc(r, 1 + ord(pair));
     end;
   end
+  else if aJob.Fp32 then
+    // F32 weights in float lanes: the tile of weight rows stays in cache while
+    // every token row passes over it
+    for r := 0 to aJob.Rows - 1 do
+    begin
+      o := aTile * TILE;
+      InferDotsF32(@aJob.X^[r * aJob.InCount],
+        @PSingleArray(aJob.W.Data)^[o * aJob.InCount], aJob.InCount * SizeOf(single),
+        oEnd - o + 1, aJob.InCount, @aJob.Y^[r * aJob.OutCount + o]);
+      if aJob.Bias <> nil then
+        for o := o to oEnd do
+          aJob.Y^[r * aJob.OutCount + o] := aJob.Y^[r * aJob.OutCount + o] +
+            aJob.Bias^[o];
+    end
   else
     // F32 weights: the reference loop, split by output feature
     for r := 0 to aJob.Rows - 1 do
@@ -1116,7 +1272,12 @@ begin
   job.InCount := aIn;
   job.OutCount := aOut;
   job.Blocks := aIn shr 5;
-  job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2);
+  if w.DType = idtQ8_0 then
+    job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2)
+  else
+    // the float row kernel needs whole lanes of 16
+    job.Fp32 := not fExact and Assigned(InferDotsF32) and (aIn > 0) and
+      (aIn and 15 = 0);
   n := (aOut + TILE - 1) div TILE;
   if (Int64(aRows) * aIn * aOut >= PARALLEL_MIN) and fBusy.TryLock then
   try
@@ -1242,6 +1403,45 @@ begin
   finally
     fBusy.UnLock;
   end;
+end;
+
+const
+  /// query rows per item of a causal attention
+  CAUSAL_ROWS = 8;
+
+procedure TInferCpuFastBackend.CausalItem(aItem: integer);
+var
+  h, r: PtrInt;
+begin
+  // item = head * row blocks + row block: the rows of one head are independent
+  h := aItem div fCausal.RowBlocks;
+  r := (aItem mod fCausal.RowBlocks) * CAUSAL_ROWS;
+  CausalRows(fCausal, h, r, MinPtrInt(r + CAUSAL_ROWS, fCausal.Rows) - 1);
+end;
+
+procedure TInferCpuFastBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
+  aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
+  y: PSingleArray);
+var
+  job: TInferCausalJob;
+  h: PtrInt;
+begin
+  // split by head and row block, never inside one sum: Exact stays
+  // bit-identical to the reference
+  job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
+    not fExact);
+  job.RowBlocks := (aRows + CAUSAL_ROWS - 1) div CAUSAL_ROWS;
+  if fBusy.TryLock then
+  try
+    fCausal := job;
+    RunParallel(CausalItem, aHeads * job.RowBlocks);
+    exit;
+  finally
+    fBusy.UnLock;
+  end;
+  // the pool serves another caller: the same arithmetic on this thread
+  for h := 0 to aHeads - 1 do
+    CausalRows(job, h, 0, aRows - 1);
 end;
 
 procedure TInferCpuFastBackend.AttentionSerial(q, k, v: PSingleArray;

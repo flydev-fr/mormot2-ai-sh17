@@ -35,7 +35,8 @@ type
     ioAdd,
     ioSoftmaxMasked,
     ioAttention,
-    ioL2Normalize);
+    ioL2Normalize,
+    ioCausalAttention);
 
   /// a weight matrix [out, in] as stored in the file: its first byte and type
   // - F32 holds out * in singles, Q8_0 out rows of in div 32 blocks
@@ -78,6 +79,16 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray); virtual; abstract;
     /// x := x / ||x|| in place; a zero vector stays zero
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); virtual; abstract;
+    /// causal multi-head attention of aRows new tokens over a KV cache, with
+    // grouped-query heads (a decoder)
+    // - q and y are [aRows, aHeads * aHeadDim]; keys and values hold the rows
+    // 0 .. aPast + aRows - 1 of [*, aKvHeads * aHeadDim], the new tokens
+    // included; new row r sees the cache rows 0 .. aPast + r
+    // - head h reads KV head h div (aHeads div aKvHeads); scores scaled by
+    // 1 / sqrt(aHeadDim)
+    procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray);
+      virtual; abstract;
   end;
 
 /// a TInferWeight from its parts

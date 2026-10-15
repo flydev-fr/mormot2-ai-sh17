@@ -11,7 +11,10 @@
 // - head_dim comes from the configuration: Qwen3-0.6B has 16 heads of 128 for
 //   a hidden size of 1024, not 1024 / 16
 // - weights: F32 is used in place (memory-mapped), BF16 widened to F32 once at
-//   load (exact: BF16 is the upper half of an F32) - the FP32 path of phase 2
+//   load (exact: BF16 is the upper half of an F32) - the FP32 path of phase 2;
+//   or every matrix quantized to Q8_0 at load, byte for byte as ggml does it
+//   (phase 3: a quarter of the memory traffic, the SIMD kernels of the
+//   backend); the embedding rows are then read from the file per token
 // - arithmetic: matrix products through the backend; norms, rotary positions
 //   and attention in double, stored as single. Rotary angles follow the float32
 //   steps of the reference (inverse frequency and angle rounded to single)
@@ -42,7 +45,8 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.safetensors,
-  mormot.ai.infer.backend;
+  mormot.ai.infer.backend,
+  mormot.ai.infer.backend.cpu;
 
 type
   /// decoder hyper-parameters
@@ -85,7 +89,6 @@ type
     fOwner: integer; // serial of the model whose keys and values are cached
     fKeys, fValues: array of TSingleDynArray; // per layer [capacity, kvWidth]
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
-    fScores, fSums: TDoubleDynArray;
   public
     /// forget the cached tokens - the buffers stay allocated
     procedure Reset;
@@ -102,13 +105,18 @@ type
     fFile: TSafeTensorsFile;
     fBackend: TInferBackend;
     fOwned: array of TSingleDynArray; // BF16 tensors widened at load
+    fOwnedQ8: array of array of TInferBlockQ8_0; // matrices quantized at load
+    fWeights: TInferDType;
+    fEmbedSrc: PInferTensor; // the embedding as stored: F32 or BF16
     fEmbed, fHead: TInferWeight;
     fNorm: PSingleArray;
     fLayer: TQwen3LayerDynArray;
     fInvFreq: TSingleDynArray;
     procedure LoadConfig(const aConfigFile: TFileName);
     procedure LoadWeights;
+    function Checked(const aName: RawUtf8; const aDims: array of Int64): PInferTensor;
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
+    function Matrix(const aName: RawUtf8; aRows, aCols: Int64): TInferWeight;
     procedure Grow(aCtx: TQwen3Context; aTokens, aNew: PtrInt);
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       y: PSingleArray);
@@ -118,7 +126,11 @@ type
     /// load <aFolder>config.json and <aFolder>model.safetensors
     // - raises EInferError when a setting is unsupported or a weight is missing
     // or shaped otherwise; aBackend is not owned
-    constructor Create(const aFolder: TFileName; aBackend: TInferBackend);
+    // - aWeights: idtF32 (the reference arithmetic of phase 2) or idtQ8_0 (every
+    // matrix quantized at load; needs the hidden, attention and feed-forward
+    // widths to be multiples of 32)
+    constructor Create(const aFolder: TFileName; aBackend: TInferBackend;
+      aWeights: TInferDType = idtF32);
     /// unmap the weights
     destructor Destroy; override;
     /// a context sized for this model (KV cache grows on demand)
@@ -146,6 +158,9 @@ type
     /// the backend the model computes with (not owned)
     property Backend: TInferBackend
       read fBackend;
+    /// the type of the matrices: idtF32 or idtQ8_0
+    property Weights: TInferDType
+      read fWeights;
   end;
 
 /// the index of the highest value of aValues[0..aCount-1], the lowest index on
@@ -211,16 +226,28 @@ var
   /// the last model serial handed out (0 = none, an empty context's owner)
   Qwen3ModelSerial: integer;
 
-constructor TQwen3Model.Create(const aFolder: TFileName; aBackend: TInferBackend);
+constructor TQwen3Model.Create(const aFolder: TFileName; aBackend: TInferBackend;
+  aWeights: TInferDType);
 begin
   inherited Create;
   fSerial := InterlockedIncrement(Qwen3ModelSerial);
   if aBackend = nil then
     EInferError.RaiseUtf8('%.Create: no backend', [self]);
+  if not (aWeights in [idtF32, idtQ8_0]) then
+    EInferError.RaiseUtf8('%.Create: weights as % not supported',
+      [self, INFER_DTYPE_NAME[aWeights]]);
   fBackend := aBackend;
-  if not fBackend.Supports(ioLinear, idtF32) then
-    EInferError.RaiseUtf8('%: the backend has no F32 Linear', [self]);
+  fWeights := aWeights;
+  if not fBackend.Supports(ioLinear, aWeights) then
+    EInferError.RaiseUtf8('%: the backend has no % Linear',
+      [self, INFER_DTYPE_NAME[aWeights]]);
+  if not fBackend.Supports(ioCausalAttention, idtF32) then
+    EInferError.RaiseUtf8('%: the backend has no causal attention', [self]);
   LoadConfig(IncludeTrailingPathDelimiter(aFolder) + 'config.json');
+  if (aWeights = idtQ8_0) and
+     ((fConfig.Hidden and 31 <> 0) or (fConfig.Intermediate and 31 <> 0) or
+      ((fConfig.Heads * fConfig.HeadDim) and 31 <> 0)) then
+    EInferError.RaiseUtf8('%: Q8_0 needs widths that are multiples of 32', [self]);
   fFile := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(aFolder) +
     'model.safetensors');
   LoadWeights;
@@ -303,17 +330,14 @@ begin
       RoundToSingle((2 * i) / fConfig.HeadDim)));
 end;
 
-function TQwen3Model.Weight(const aName: RawUtf8;
-  const aDims: array of Int64): PSingleArray;
+function TQwen3Model.Checked(const aName: RawUtf8;
+  const aDims: array of Int64): PInferTensor;
 var
-  t: PInferTensor;
-  i, n: PtrInt;
-  src: PWordArray;
-  dst: PCardinalArray;
+  i: PtrInt;
   ok: boolean;
   want: TInt64DynArray;
+  t: PInferTensor;
 begin
-  result := nil; // every other type raises below
   t := fFile.Tensor(aName);
   ok := length(t^.Shape) = length(aDims);
   if ok then
@@ -328,6 +352,22 @@ begin
     EInferError.RaiseUtf8('%: % is shaped %, expected %',
       [self, aName, InferShapeText(t^.Shape), InferShapeText(want)]);
   end;
+  if not (t^.DType in [idtF32, idtBF16]) then
+    EInferError.RaiseUtf8('%: % is %, only F32 and BF16 are supported',
+      [self, aName, INFER_DTYPE_NAME[t^.DType]]);
+  result := t;
+end;
+
+function TQwen3Model.Weight(const aName: RawUtf8;
+  const aDims: array of Int64): PSingleArray;
+var
+  t: PInferTensor;
+  i, n: PtrInt;
+  src: PWordArray;
+  dst: PCardinalArray;
+begin
+  result := nil; // every other type raises in Checked
+  t := Checked(aName, aDims);
   case t^.DType of
     idtF32:
       result := t^.Data;
@@ -345,10 +385,61 @@ begin
           dst^[i] := cardinal(src^[i]) shl 16;
         result := pointer(fOwned[n]);
       end;
-  else
-    EInferError.RaiseUtf8('%: % is %, only F32 and BF16 are supported',
-      [self, aName, INFER_DTYPE_NAME[t^.DType]]);
   end;
+end;
+
+/// row aRow of an F32 or BF16 matrix of aCols columns, as singles in aDest
+procedure WidenRow(t: PInferTensor; aRow, aCols: PtrInt; aDest: PSingleArray);
+var
+  i: PtrInt;
+  src: PWordArray;
+begin
+  if t^.DType = idtF32 then
+    MoveFast(PSingleArray(t^.Data)^[aRow * aCols], aDest^, aCols * SizeOf(single))
+  else
+  begin
+    // BF16 is the upper half of an F32: widening is exact
+    src := @PWordArray(t^.Data)^[aRow * aCols];
+    for i := 0 to aCols - 1 do
+      PCardinalArray(aDest)^[i] := cardinal(src^[i]) shl 16;
+  end;
+end;
+
+function TQwen3Model.Matrix(const aName: RawUtf8; aRows, aCols: Int64): TInferWeight;
+var
+  t: PInferTensor;
+  row: TSingleDynArray;
+  nb, r, n, c: PtrInt;
+begin
+  if fWeights = idtF32 then
+  begin
+    result := InferWeight(Weight(aName, [aRows, aCols]), idtF32);
+    exit;
+  end;
+  // Q8_0: row by row through single precision, as ggml quantizes
+  t := Checked(aName, [aRows, aCols]);
+  nb := aCols shr 5;
+  n := length(fOwnedQ8);
+  SetLength(fOwnedQ8, n + 1);
+  SetLength(fOwnedQ8[n], aRows * nb);
+  SetLength(row, aCols);
+  for r := 0 to aRows - 1 do
+  begin
+    WidenRow(t, r, aCols, pointer(row));
+    // a NaN or an infinity has no Q8_0 form: refused, by its bits (no FPU)
+    for c := 0 to aCols - 1 do
+      if PCardinalArray(row)^[c] and $7f800000 = $7f800000 then
+        EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
+          [self, aName, r, c]);
+    InferQuantizeRowQ8_0(pointer(row), aCols, @fOwnedQ8[n][r * nb]);
+    // a finite weight beyond 127 * 65504 still gets the FP16 scale +Inf (ggml
+    // writes it too): every product with it would be Inf or NaN
+    for c := r * nb to r * nb + nb - 1 do
+      if fOwnedQ8[n][c].d and $7fff >= $7c00 then
+        EInferError.RaiseUtf8('%: % has a weight beyond the Q8_0 range in row %',
+          [self, aName, r]);
+  end;
+  result := InferWeight(pointer(fOwnedQ8[n]), idtQ8_0);
 end;
 
 procedure TQwen3Model.LoadWeights;
@@ -363,8 +454,10 @@ begin
   f := fConfig.Intermediate;
   qw := fConfig.Heads * fConfig.HeadDim;
   kvw := fConfig.KvHeads * fConfig.HeadDim;
-  fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
-    idtF32);
+  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h]);
+  if fWeights = idtF32 then
+    fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
+      idtF32);
   fNorm := Weight('model.norm.weight', [h]);
   used := 2;
   head := fFile.Find('lm_head.weight');
@@ -380,11 +473,14 @@ begin
           'from the embedding', [self]);
       inc(used);
     end;
-    fHead := fEmbed;
+    if fWeights = idtF32 then
+      fHead := fEmbed
+    else
+      fHead := Matrix('model.embed_tokens.weight', fConfig.VocabSize, h);
   end
   else
   begin
-    fHead := InferWeight(Weight('lm_head.weight', [fConfig.VocabSize, h]), idtF32);
+    fHead := Matrix('lm_head.weight', fConfig.VocabSize, h);
     inc(used);
   end;
   SetLength(fLayer, fConfig.Layers);
@@ -392,15 +488,15 @@ begin
   begin
     p := FormatUtf8('model.layers.%.', [i]);
     l := @fLayer[i];
-    l^.Q := InferWeight(Weight(p + 'self_attn.q_proj.weight', [qw, h]), idtF32);
-    l^.K := InferWeight(Weight(p + 'self_attn.k_proj.weight', [kvw, h]), idtF32);
-    l^.V := InferWeight(Weight(p + 'self_attn.v_proj.weight', [kvw, h]), idtF32);
-    l^.O := InferWeight(Weight(p + 'self_attn.o_proj.weight', [h, qw]), idtF32);
+    l^.Q := Matrix(p + 'self_attn.q_proj.weight', qw, h);
+    l^.K := Matrix(p + 'self_attn.k_proj.weight', kvw, h);
+    l^.V := Matrix(p + 'self_attn.v_proj.weight', kvw, h);
+    l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw);
     l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
     l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
-    l^.Gate := InferWeight(Weight(p + 'mlp.gate_proj.weight', [f, h]), idtF32);
-    l^.Up := InferWeight(Weight(p + 'mlp.up_proj.weight', [f, h]), idtF32);
-    l^.Down := InferWeight(Weight(p + 'mlp.down_proj.weight', [h, f]), idtF32);
+    l^.Gate := Matrix(p + 'mlp.gate_proj.weight', f, h);
+    l^.Up := Matrix(p + 'mlp.up_proj.weight', f, h);
+    l^.Down := Matrix(p + 'mlp.down_proj.weight', h, f);
     l^.InputNorm := Weight(p + 'input_layernorm.weight', [h]);
     l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
     inc(used, 11);
@@ -473,10 +569,6 @@ begin
   Need(aCtx.fV, aNew * kvw);
   Need(aCtx.fGate, aNew * fConfig.Intermediate);
   Need(aCtx.fUp, aNew * fConfig.Intermediate);
-  if length(aCtx.fScores) < aCtx.fCapacity then
-    SetLength(aCtx.fScores, aCtx.fCapacity); // with the cache, not per token
-  if length(aCtx.fSums) < fConfig.HeadDim then
-    SetLength(aCtx.fSums, fConfig.HeadDim);
 end;
 
 procedure TQwen3Model.RmsNorm(x: PSingleArray; aRows, aCols: PtrInt;
@@ -535,66 +627,12 @@ begin
 end;
 
 procedure TQwen3Model.Attention(aCtx: TQwen3Context; aLayer, aRows: PtrInt);
-var
-  r, h, g, j, t, d, past, total, group, kvw, qw: PtrInt;
-  scale, m, sum, acc, a: double;
-  q, k, out: PSingleArray;
-  keys, values: PSingleArray;
-  sc, sums: PDoubleArray;
 begin
-  d := fConfig.HeadDim;
-  kvw := fConfig.KvHeads * d;
-  qw := fConfig.Heads * d;
-  group := fConfig.Heads div fConfig.KvHeads;
-  past := aCtx.fLength;
-  keys := pointer(aCtx.fKeys[aLayer]);
-  values := pointer(aCtx.fValues[aLayer]);
-  sc := pointer(aCtx.fScores);
-  scale := 1 / Sqrt(d);
-  sums := pointer(aCtx.fSums);
-  for r := 0 to aRows - 1 do
-  begin
-    total := past + r + 1; // causal: up to and including this token
-    for h := 0 to fConfig.Heads - 1 do
-    begin
-      g := h div group; // grouped-query: heads share their KV head
-      q := @aCtx.fQ[r * qw + h * d];
-      m := 0;
-      for j := 0 to total - 1 do
-      begin
-        k := @keys^[j * kvw + g * d];
-        acc := 0;
-        for t := 0 to d - 1 do
-        begin
-          a := q^[t]; // widen before multiplying: same result on every FPU
-          acc := acc + a * k^[t];
-        end;
-        acc := acc * scale;
-        sc^[j] := acc;
-        if (j = 0) or (acc > m) then
-          m := acc;
-      end;
-      sum := 0;
-      for j := 0 to total - 1 do
-      begin
-        sc^[j] := Exp(sc^[j] - m);
-        sum := sum + sc^[j];
-      end;
-      for t := 0 to d - 1 do
-        sums^[t] := 0;
-      for j := 0 to total - 1 do
-      begin
-        k := @values^[j * kvw + g * d];
-        acc := sc^[j];
-        for t := 0 to d - 1 do
-          sums^[t] := sums^[t] + acc * k^[t];
-      end;
-      out := @aCtx.fAttn[r * qw + h * d];
-      sum := 1 / sum;
-      for t := 0 to d - 1 do
-        out^[t] := sums^[t] * sum;
-    end;
-  end;
+  // the reference backend computes as phase 2 did (double); a fast one splits
+  // by head and row block
+  fBackend.CausalAttention(pointer(aCtx.fQ), aRows, fConfig.Heads, fConfig.HeadDim,
+    pointer(aCtx.fKeys[aLayer]), pointer(aCtx.fValues[aLayer]), aCtx.fLength,
+    fConfig.KvHeads, pointer(aCtx.fAttn));
 end;
 
 /// 'layerNN' - two digits at least, like the reference ('layer%02d')
@@ -638,8 +676,7 @@ begin
   Grow(aCtx, past + n, n);
   // embeddings
   for i := 0 to n - 1 do
-    MoveFast(PSingleArray(fEmbed.Data)^[aIds^[i] * h], aCtx.fX[i * h],
-      h * SizeOf(single));
+    WidenRow(fEmbedSrc, aIds^[i], h, @aCtx.fX[i * h]);
   if Assigned(aOnState) then
     aOnState('embed', pointer(aCtx.fX), n, h);
   for l := 0 to fConfig.Layers - 1 do

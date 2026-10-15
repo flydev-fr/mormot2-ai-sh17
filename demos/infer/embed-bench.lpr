@@ -71,12 +71,14 @@ type
     procedure Attention(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
+    procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
     function Report(aTotal: Int64): RawUtf8;
   end;
 
 const
   OP_NAME: array[TInferOp] of RawUtf8 = (
-    'linear', 'layernorm', 'gelu', 'add', 'softmax', 'attention', 'l2');
+    'linear', 'layernorm', 'gelu', 'add', 'softmax', 'attention', 'l2', 'causal');
 
 function NotZero(v: Int64): Int64;
 begin
@@ -162,6 +164,13 @@ begin
   Enter;
   fInner.L2Normalize(x, aCount);
   Leave(ioL2Normalize);
+end;
+
+procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
+  aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
+  y: PSingleArray);
+begin
+  fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y);
 end;
 
 function TTimedBackend.Report(aTotal: Int64): RawUtf8;

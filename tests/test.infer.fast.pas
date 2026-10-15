@@ -63,6 +63,9 @@ type
     procedure ElementwiseOpsAreBitIdentical;
     /// default mode: Linear, Attention and GELU within their tolerances
     procedure FastModeWithinTolerance;
+    /// the decoder operations (phase 3): CausalAttention exact = the reference
+    // bit for bit, float within a tolerance; F32 Linear in float lanes
+    procedure DecoderOpsMatchReference;
     /// the thread pool: exactly once, bursts, exceptions
     procedure ThreadPoolRunsEveryItemOnce;
     /// two threads embedding at once through one fast backend
@@ -622,6 +625,153 @@ begin
   if aItem = 13 then
     EInferError.RaiseUtf8('item %', [aItem]);
   InterlockedIncrement(fHits[aItem]);
+end;
+
+/// causal grouped-query attention as defined, straight from the formula: an
+// independent check of the reference branch the exact path shares
+procedure NaiveCausal(const q, keys, values: TSingleDynArray; aRows, aHeads,
+  aDim, aPast, aKvHeads: PtrInt; var y: TSingleDynArray);
+var
+  r, h, g, j, t, total: PtrInt;
+  w: TDoubleDynArray;
+  m, sum, acc, a: double;
+begin
+  SetLength(y, aRows * aHeads * aDim);
+  for r := 0 to aRows - 1 do
+    for h := 0 to aHeads - 1 do
+    begin
+      g := h * aKvHeads div aHeads; // heads per KV head, in order
+      total := aPast + r + 1;
+      SetLength(w, total);
+      m := -1e300;
+      for j := 0 to total - 1 do
+      begin
+        acc := 0;
+        for t := 0 to aDim - 1 do
+        begin
+          a := q[(r * aHeads + h) * aDim + t]; // widened before the product
+          acc := acc + a * keys[(j * aKvHeads + g) * aDim + t];
+        end;
+        w[j] := acc / Sqrt(aDim);
+        if w[j] > m then
+          m := w[j];
+      end;
+      sum := 0;
+      for j := 0 to total - 1 do
+      begin
+        w[j] := Exp(w[j] - m);
+        sum := sum + w[j];
+      end;
+      for t := 0 to aDim - 1 do
+      begin
+        acc := 0;
+        for j := 0 to total - 1 do
+          acc := acc + w[j] * values[(j * aKvHeads + g) * aDim + t];
+        y[(r * aHeads + h) * aDim + t] := acc / sum;
+      end;
+    end;
+end;
+
+procedure TTestInferFast.DecoderOpsMatchReference;
+const
+  // past tokens, new rows, heads, KV heads, head size
+  CASES: array[0..7, 0..4] of integer = (
+    (0, 1, 16, 8, 128), (0, 20, 16, 8, 128), (50, 1, 16, 8, 128),
+    (50, 20, 16, 8, 128), (3, 7, 4, 1, 32), (0, 9, 2, 2, 8), (130, 3, 8, 8, 64),
+    (5, 16, 4, 2, 32)); // 16 rows: exactly two blocks of 8
+  // rows, in, out: in 1000 has no whole lanes of 16 - the exact loop
+  SHAPES: array[0..4, 0..2] of integer = (
+    (1, 1024, 300), (7, 1024, 37), (3, 1000, 20), (64, 2048, 48), (2, 64, 16));
+var
+  i, total, rows, qn, kvn, nin, nout: PtrInt;
+  q, keys, values, y1, y2, y3, x, w, bias: TSingleDynArray;
+  cmp: TInferCompare;
+  refused: boolean;
+begin
+  for i := 0 to high(CASES) do
+  begin
+    rows := CASES[i, 1];
+    total := CASES[i, 0] + rows;
+    qn := rows * CASES[i, 2] * CASES[i, 4];
+    kvn := total * CASES[i, 3] * CASES[i, 4];
+    Fill(q, qn, 300 + i, 2);
+    Fill(keys, kvn, 400 + i, 2);
+    Fill(values, kvn, 500 + i, 2);
+    SetLength(y1, qn);
+    SetLength(y2, qn);
+    SetLength(y3, qn);
+    fRef.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y1));
+    fExact.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y2));
+    fFast.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y3));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), qn),
+      'causal attention exact, case %', [i]);
+    // the reference itself against the definition, written out here
+    NaiveCausal(q, keys, values, rows, CASES[i, 2], CASES[i, 4], CASES[i, 0],
+      CASES[i, 3], y2);
+    cmp := InferCompare(pointer(y1), pointer(y2), qn, 1e-6, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'causal attention by definition, case %: %',
+      [i, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(y3), pointer(y1), qn, 1e-5, 1e-4);
+    CheckUtf8(InferCompareOk(cmp), 'causal attention float, case %: %',
+      [i, InferCompareText(cmp)]);
+    // with one key the output is that value on every path
+    if (total > 1) and (CASES[i, 4] and 15 = 0) and Assigned(InferDotsF32) then
+      Check(not SameBits(pointer(y1), pointer(y3), qn),
+        'the float path computes otherwise (a test that tests something)');
+  end;
+  // the first row of a fresh sequence sees one key: its output is that value
+  Fill(q, 128, 1, 2);
+  Fill(keys, 128, 2, 2);
+  Fill(values, 128, 3, 2);
+  SetLength(y1, 128);
+  fFast.CausalAttention(pointer(q), 1, 1, 128, pointer(keys), pointer(values), 0, 1,
+    pointer(y1));
+  cmp := InferCompare(pointer(y1), pointer(values), 128, 1e-6, 1e-6);
+  CheckUtf8(InferCompareOk(cmp), 'one key: the value itself: %', [InferCompareText(cmp)]);
+  refused := false;
+  try
+    fFast.CausalAttention(pointer(q), 1, 3, 32, pointer(keys), pointer(values), 0, 2,
+      pointer(y1));
+  except
+    on EInferError do
+      refused := true;
+  end;
+  Check(refused, 'heads no multiple of the KV heads');
+  // F32 Linear: float lanes (whole lanes of 16) or the exact loop
+  for i := 0 to high(SHAPES) do
+  begin
+    rows := SHAPES[i, 0];
+    nin := SHAPES[i, 1];
+    nout := SHAPES[i, 2];
+    Fill(x, rows * nin, 600 + i, 3);
+    Fill(w, nout * nin, 700 + i, 0.1);
+    Fill(bias, nout, 800 + i, 1);
+    if i = high(SHAPES) then
+      bias := nil; // the float path without a bias
+    SetLength(y1, rows * nout);
+    SetLength(y3, rows * nout);
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(w), idtF32), nout,
+      pointer(bias), pointer(y1));
+    fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(w), idtF32), nout,
+      pointer(bias), pointer(y3));
+    if nin and 15 <> 0 then
+      CheckUtf8(SameBits(pointer(y1), pointer(y3), rows * nout),
+        'F32 % x % x %: no whole lanes, the exact loop', [rows, nin, nout])
+    else
+    begin
+      cmp := InferCompare(pointer(y3), pointer(y1), rows * nout, 1e-4, 1e-4);
+      CheckUtf8(InferCompareOk(cmp), 'F32 % x % x % float: %',
+        [rows, nin, nout, InferCompareText(cmp)]);
+    end;
+  end;
+  // no input at all: the bias, whatever the output held before
+  Fill(bias, 3, 900, 1);
+  Fill(y3, 3, 901, 5);
+  fFast.Linear(nil, 1, 0, InferWeight(nil, idtF32), 3, pointer(bias), pointer(y3));
+  Check(SameBits(pointer(y3), pointer(bias), 3), 'F32 Linear without inputs = bias');
 end;
 
 procedure TTestInferFast.ThreadPoolRunsEveryItemOnce;

@@ -85,6 +85,8 @@ type
     procedure Qwen3ChatClient;
     /// TLlmAgent over the native client: a tool call and its answer
     procedure Qwen3AgentLoop;
+    /// the native client on Q8_0 matrices
+    procedure Qwen3ChatClientQ8;
   end;
 
 
@@ -840,6 +842,30 @@ begin
   finally
     ref.Free;
   end;
+end;
+
+procedure TTestInferLlmNative.Qwen3ChatClientQ8;
+var
+  dir: TFileName;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  req: TLlmChatRequest;
+  r: TLlmChatResponse;
+  msgs: TLlmMessageDynArray;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  client := TNativeLlmClient.Create(dir, '', nil, idtQ8_0);
+  llm := client;
+  Check(client.Model.Weights = idtQ8_0, 'Q8_0 matrices');
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'What is the capital of France? Answer in one word.');
+  req := LlmChatRequest('', msgs);
+  req.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', false])]);
+  r := llm.ChatComplete(req);
+  CheckEqual(r.Content, 'Paris', 'Q8_0 answers chat_en like FP32');
+  Check(r.FinishReason = lfrStop, 'stop');
 end;
 
 function TTestInferLlmNative.Weather(const aArgumentsJson: RawUtf8): RawUtf8;

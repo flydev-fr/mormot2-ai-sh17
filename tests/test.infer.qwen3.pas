@@ -70,6 +70,12 @@ type
     procedure Qwen3ForwardMatchesReference;
     /// Qwen3-0.6B: greedy continuations token-identical (the phase 2 gate)
     procedure Qwen3GreedyMatchesReference;
+    /// the tiny Qwen3 with Q8_0 matrices: Exact = the scalar reference bit for
+    // bit, the float path and the reference within a tolerance
+    procedure TinyQ8;
+    /// Qwen3-0.6B with Q8_0 matrices against the FP32 reference (phase 3):
+    // logits within a tolerance, greedy equal up to the first near tie
+    procedure Qwen3Q8AgainstReference;
   end;
 
 
@@ -347,6 +353,9 @@ var
   ctx: TQwen3Context;
   cfg: RawUtf8;
   refused: boolean;
+  st, bad: RawByteString;
+  hdr: variant;
+  pos: PtrInt;
 
   function LoadRefused(const aFrom, aTo: RawUtf8): boolean;
   begin
@@ -401,6 +410,36 @@ begin
     Check(LoadRefused('"tie_word_embeddings": true', '"tie_word_embeddings": false'),
       'untied without lm_head.weight');
     Check(LoadRefused('"head_dim": 32,', ''), 'no head_dim');
+    // a NaN weight: F32 carries it along, Q8_0 has no form for it
+    FileFromString(cfg, tmp + 'config.json');
+    st := StringFromFile(dir + 'model.safetensors');
+    hdr := _JsonFast(copy(st, 9, PInteger(st)^));
+    pos := 8 + PInteger(st)^ + _Safe(hdr)^.O['model.layers.0.self_attn.q_proj.weight']^.
+      A['data_offsets']^.Values[0];
+    FastSetRawByteString(bad, pointer(st), length(st)); // a copy of its own
+    PWord(@PByteArray(bad)^[pos])^ := $7fc0; // BF16 quiet NaN
+    FileFromString(bad, tmp + 'model.safetensors');
+    TQwen3Model.Create(tmp, fCpu).Free;
+    refused := false;
+    try
+      TQwen3Model.Create(tmp, fCpu, idtQ8_0).Free;
+    except
+      on E: EInferError do
+        refused := PosEx('NaN or infinite weight', StringToUtf8(E.Message)) > 0;
+    end;
+    Check(refused, 'Q8_0 refuses a NaN weight, by name');
+    // finite but beyond the Q8_0 range: 9.96e6 / 127 exceeds the largest FP16
+    PWord(@PByteArray(bad)^[pos])^ := $4b18;
+    FileFromString(bad, tmp + 'model.safetensors');
+    TQwen3Model.Create(tmp, fCpu).Free;
+    refused := false;
+    try
+      TQwen3Model.Create(tmp, fCpu, idtQ8_0).Free;
+    except
+      on E: EInferError do
+        refused := PosEx('beyond the Q8_0 range', StringToUtf8(E.Message)) > 0;
+    end;
+    Check(refused, 'Q8_0 refuses a weight beyond its range, by name');
   finally
     DirectoryDeleteAll(tmp);
     RemoveDir(tmp);
@@ -651,6 +690,184 @@ begin
     begin
       p := _Safe(prompts^.Values[i]);
       CheckStates(model, ref, p^.U['id'], 2e-3, 2e-3, false);
+    end;
+  finally
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.TinyQ8;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  exact: TInferCpuFastBackend;
+  a, b, c: TQwen3Model;
+  ca, cb, cc: TQwen3Context;
+  la, lb, lc: TSingleDynArray;
+  ids: PIntegerArray;
+  n, m, k, v: PtrInt;
+  cmp: TInferCompare;
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  exact := TInferCpuFastBackend.Create;
+  exact.Exact := true;
+  a := nil;
+  b := nil;
+  c := nil;
+  try
+    a := TQwen3Model.Create(dir, fCpu, idtQ8_0);
+    b := TQwen3Model.Create(dir, exact, idtQ8_0);
+    c := TQwen3Model.Create(dir, fFast, idtQ8_0);
+    Check(a.Weights = idtQ8_0, 'Q8_0 matrices');
+    v := a.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(la, n * v);
+      SetLength(lb, n * v);
+      SetLength(lc, n * v);
+      ca := a.NewContext;
+      cb := b.NewContext;
+      cc := c.NewContext;
+      try
+        a.Forward(ca, ids, n, pointer(la), true);
+        b.Forward(cb, ids, n, pointer(lb), true);
+        c.Forward(cc, ids, n, pointer(lc), true);
+      finally
+        ca.Free;
+        cb.Free;
+        cc.Free;
+      end;
+      Check(CompareMem(pointer(la), pointer(lb), n * v * SizeOf(single)),
+        'Exact on all cores = the scalar reference, bit for bit');
+      cmp := InferCompare(pointer(lc), pointer(la), n * v, 2e-2, 1e-2);
+      CheckUtf8(InferCompareOk(cmp), 'case % float path: %', [k, InferCompareText(cmp)]);
+      cmp := InferCompare(pointer(la), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 0.05, 0.05);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999), 'case % Q8_0 vs FP32: %',
+        [k, InferCompareText(cmp)]);
+    end;
+    // the untied head: its own matrix quantized, not the embedding
+    FreeAndNil(c);
+    FreeAndNil(b);
+    FreeAndNil(a);
+    // against the stored logits of the untied reference: an F32 model of the
+    // same code would share a mistake in the head
+    dir := MakePath([dir, 'untied'], true);
+    ref.Free;
+    ref := TInferRefSet.CreateFromFolder(dir);
+    a := TQwen3Model.Create(dir, fCpu, idtQ8_0);
+    Check(not a.Config.TiedEmbeddings, 'untied');
+    ids := ref.I32('case0.ids', n);
+    v := a.Config.VocabSize;
+    SetLength(la, n * v);
+    ca := a.NewContext;
+    try
+      a.Forward(ca, ids, n, pointer(la), true);
+    finally
+      ca.Free;
+    end;
+    cmp := InferCompare(pointer(la), ref.F32('case0.logits', m), n * v, 0.05, 0.05);
+    CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999),
+      'untied Q8_0 vs the FP32 reference: %', [InferCompareText(cmp)]);
+  finally
+    c.Free;
+    b.Free;
+    a.Free;
+    exact.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Qwen3Q8AgainstReference;
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TQwen3Model;
+  ctx: TQwen3Context;
+  prompts, p: PDocVariantData;
+  ids, want: PIntegerArray;
+  margins: PSingleArray;
+  i, n, m, diff: PtrInt;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  margin: double;
+  timer: TPrecisionTimer;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  refdir := FindInferRefDir('qwen3');
+  if CheckFailed(refdir <> '', 'qwen3 reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  try
+    timer.Start;
+    model := TQwen3Model.Create(dir, fFast, idtQ8_0);
+    AddConsole(FormatString('Q8_0 model quantized in %', [timer.Stop]));
+    prompts := ref.Manifest^.A['prompts'];
+    for i := 0 to prompts^.Count - 1 do
+    begin
+      p := _Safe(prompts^.Values[i]);
+      ids := ref.I32(p^.U['id'] + '.ids', n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      SetLength(logits, model.Config.VocabSize);
+      ctx := model.NewContext;
+      try
+        model.Forward(ctx, pointer(prompt), n, pointer(logits));
+      finally
+        ctx.Free;
+      end;
+      cmp := InferCompare(pointer(logits), ref.F32(p^.U['id'] + '.logits_last', m),
+        model.Config.VocabSize, 1, 0);
+      want := ref.I32(p^.U['id'] + '.greedy', m);
+      margins := ref.F32(p^.U['id'] + '.greedy_margin', m);
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, m, [151645, 151643]);
+      finally
+        ctx.Free;
+      end;
+      diff := 0;
+      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+        inc(diff);
+      margin := 0;
+      if diff < m then
+        margin := margins^[diff];
+      if (diff < m) and (diff < length(mine)) then
+        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, greedy equal for ' +
+          '% of % tokens, reference margin there % (Q8_0 took %, reference %)',
+          [p^.U['id'], cmp.Cosine, cmp.MaxAbs, diff, m, margin, mine[diff],
+           want^[diff]]))
+      else if diff < m then
+        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, stopped after % ' +
+          'of % tokens, reference margin there %', [p^.U['id'], cmp.Cosine,
+          cmp.MaxAbs, diff, m, margin]))
+      else
+        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, greedy equal for ' +
+          'all % tokens', [p^.U['id'], cmp.Cosine, cmp.MaxAbs, m]));
+      // the gate of Q8_0, measured 2026-10-15 on the 193 tokens of chat_tool,
+      // the most sensitive prompt: cosine 0.9935 and max error 1.72 in exact
+      // (double) arithmetic - the same bits on aarch64 and x86_64 - and 0.9965 /
+      // 1.36 with NEON, 0.9868 / 2.11 with AVX2; float against exact Q8_0
+      // alone: cosine 0.998 to 0.999, up to 0.95 apart on both platforms (likely
+      // because a changed rounding flips single int8 activations of the next
+      // layer - not measured inside).
+      // Greedy leaves the FP32 tokens only where the reference itself was less
+      // than 0.28 sure. A broken quantizer fails all three by far (shifted rows:
+      // cosine 0.23, max error 24)
+      CheckUtf8(cmp.Cosine >= 0.98, '% Q8_0 logits cosine %', [p^.U['id'], cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= 3, '% Q8_0 logits max error %', [p^.U['id'], cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < 0.5),
+        '% Q8_0 greedy leaves the reference at step % where it was % sure',
+        [p^.U['id'], diff, margin]);
     end;
   finally
     model.Free;

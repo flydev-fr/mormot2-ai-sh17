@@ -550,6 +550,58 @@ Checkpoint und eigene Eingabekonventionen, nicht nur Last-Token-Pooling. Es geh�
 **Fertig, wenn:** quantisierte Modelle die Referenztests mit festgelegter Toleranz
 bestehen und die Benchmarks dokumentiert sind.
 
+**3a, erledigt 2026-10-15: Geschwindigkeit des Decoders.**
+
+- Befund (`demos/infer/llm-bench`, Snapdragon X, 8 Threads): F32 schaffte im Prefill
+  2,7 und beim Dekodieren 1,6 Tokens/s. 96 bzw. 93 % der Zeit gingen in `Linear`, denn
+  der F32-Zweig des schnellen Backends war noch die skalare Referenzschleife.
+- Umgesetzt:
+  - **Q8_0-Gewichte:** `TQwen3Model.Create(…, idtQ8_0)` quantisiert jede Matrix beim
+    Laden zeilenweise, byte-gleich zu ggml (auch den gebundenen Kopf). Das Embedding
+    liest dann je Token die Zeile aus der Datei. Ein NaN, ein Unendlich oder ein
+    Gewicht jenseits des Q8_0-Bereichs wird beim Laden abgelehnt.
+  - **F32 im Float-Modus:** `LinearTileWork` rechnet jede Kachel mit `InferDotsF32`
+    (NEON, AVX2); `Exact` bleibt die bitgleiche Referenzschleife.
+  - **Attention als Backend-Operation** `CausalAttention` (`ioCausalAttention`): Das
+    Referenz-Backend rechnet wie in Phase 2 in Double. Das schnelle verteilt Kopf mal
+    8-Zeilen-Block auf den Pool, mit `Exact` bitgleich, sonst mit Float-Kerneln.
+- Messung (200 / 1000 Tokens Prompt, dann 32 neue; ein Lauf, der Laptop drosselt unter
+  Dauerlast):
+
+  | | Prefill | Dekodieren | Speicher-Peak |
+  |---|---|---|---|
+  | F32 vorher, 200 | 2,7 Tokens/s | 1,6 Tokens/s | 3,8 GB |
+  | F32, 200 | 103 Tokens/s | 24 Tokens/s | 3,8 GB |
+  | F32, 1000 | 87 Tokens/s | 5 Tokens/s | 4,2 GB |
+  | Q8_0, 200 | 246 Tokens/s | 36 Tokens/s | 2,2 GB |
+  | Q8_0, 1000 | 157 Tokens/s | 20 Tokens/s | 2,6 GB |
+
+  Mit Q8_0 und langem Prompt gehen inzwischen über die Hälfte der Zeit in Normen,
+  RoPE, SwiGLU und die Attention: Das ist der nächste Hebel.
+- Treue:
+  - F32 im Float-Modus: Greedy bleibt auf allen sieben Referenz-Prompts tokengleich.
+  - Q8_0: Gate in `Qwen3Q8AgainstReference`. Kosinus der Logits ≥ 0,98, höchstens
+    3 Logits Abweichung, Greedy gleich bis zum ersten Schritt, an dem die Referenz
+    weniger als 0,5 Vorsprung hatte (gemessen höchstens 0,27). Am empfindlichsten ist
+    `chat_tool` (193 Tokens): in exakter Arithmetik Kosinus 0,9935 und 1,72 Abweichung,
+    auf aarch64 und x86_64 bitgleich; mit NEON 0,9965 / 1,36, mit AVX2 0,9868 / 2,11.
+    Float gegen exakte Q8_0-Rechnung allein: Kosinus 0,998 bis 0,999, bis zu 0,95
+    Abweichung, auf beiden Plattformen. Vermutete Ursache, nicht innen gemessen: Eine
+    geänderte Rundung kippt einzelne int8-Aktivierungen der nächsten Schicht. Ein
+    kaputter Quantisierer verfehlt das Gate
+    weit (verschobene Zeilen: Kosinus 0,23, Abweichung 24).
+  - Befund: Mit Q8_0 beantwortet Qwen3-0.6B die Wetterfrage von `chat_tool` selbst
+    („Das …“), statt `get_weather` aufzurufen (Referenzabstand 0,22). Ein Versuch mit
+    quantisierten Gewichten und F32-Aktivierungen kippt genauso, ein F32-Kopf hilft
+    nicht: Ursache ist die Rundung der Gewichte, nicht unser Code. `TNativeLlmClient`
+    lädt deshalb standardmäßig F32, Q8_0 ist eine Option.
+- Gegenproben, die anschlagen: Q8-Zeilen verschoben, Attention ohne Skalierung,
+  falsche KV-Kopf-Zuordnung, F32-Kachel zu kurz, Float-Attention im Exact-Modus,
+  Referenzzweig mit einem Schlüssel zu wenig, Q8-Kopf gleich dem Embedding, fehlende
+  NaN- und Bereichsprüfung, Bias-Abfrage weg, SIMD-Pfad bei null Eingaben.
+- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Sampler,
+  Prompt-Cache, Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
+
 ### Phase 4 — GPU
 
 - CUDA über die Driver API, dynamisch geladen.

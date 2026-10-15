@@ -191,8 +191,13 @@ type
     // - aModelName: the name in Config and in every response, the folder name
     // when ''; aBackend: nil computes on a TInferCpuFastBackend of its own,
     // else on aBackend (not owned)
+    // - aWeights: idtF32 (default) keeps the model's own decisions - Qwen3-0.6B
+    // greedy is token-identical to transformers; idtQ8_0 needs a quarter of the
+    // memory and decodes about twice as fast, but rounding the weights can flip
+    // a close decision (with Q8_0, Qwen3-0.6B answers the weather question of
+    // the reference itself instead of calling the tool)
     constructor Create(const aFolder: TFileName; const aModelName: RawUtf8 = '';
-      aBackend: TInferBackend = nil); reintroduce;
+      aBackend: TInferBackend = nil; aWeights: TInferDType = idtF32); reintroduce;
     destructor Destroy; override;
     function ChatComplete(const aRequest: TLlmChatRequest): TLlmChatResponse;
     procedure ChatStream(const aRequest: TLlmChatRequest;
@@ -688,7 +693,7 @@ end;
 { TNativeLlmClient }
 
 constructor TNativeLlmClient.Create(const aFolder: TFileName;
-  const aModelName: RawUtf8; aBackend: TInferBackend);
+  const aModelName: RawUtf8; aBackend: TInferBackend; aWeights: TInferDType);
 var
   dir: TFileName;
 begin
@@ -704,7 +709,7 @@ begin
   end;
   fTokenizer := TBpeTokenizer.Create(dir + 'tokenizer.json');
   fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
-  fModel := TQwen3Model.Create(dir, fBackend);
+  fModel := TQwen3Model.Create(dir, fBackend, aWeights);
   // the stop and control tokens: fail at load, not at the first request
   TQwen3OutputParser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
