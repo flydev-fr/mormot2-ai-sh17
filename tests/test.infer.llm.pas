@@ -42,7 +42,7 @@ type
   TDeltaLog = class
   public
     Deltas, Dones, Usages, Invalid: integer;
-    AfterDone: boolean;
+    AfterDone, Fail: boolean;
     FirstRole, Content, Reasoning, Finish: RawUtf8;
     Usage: TLlmUsage;
     CallIndex: TIntegerDynArray;
@@ -82,6 +82,8 @@ type
     procedure ChatPrompt;
     /// NativeDecode on the tiny Qwen3: the reference tokens, the context limit
     procedure DecodeOnTinyModel;
+    /// the prompt cache: NativeDecode in a kept context, TNativePromptCache
+    procedure PromptCache;
     /// Qwen3-0.6B behind ILlmClient against the reference continuations
     procedure Qwen3ChatClient;
     /// TLlmAgent over the native client: a tool call and its answer
@@ -124,6 +126,8 @@ var
   r: RawUtf8;
   n: PtrInt;
 begin
+  if Fail then
+    ELlmClient.RaiseUtf8('TDeltaLog: stream cancelled', []);
   inc(Deltas);
   if Deltas = 1 then
     FirstRole := aDelta.Role;
@@ -695,6 +699,160 @@ begin
     Check(raised, 'empty prompt');
   finally
     p.Free;
+    model.Free;
+    cpu.Free;
+  end;
+end;
+
+procedure TTestInferLlmNative.PromptCache;
+var
+  dir: TFileName;
+  cpu: TInferCpuBackend;
+  model: TQwen3Model;
+  cache: TNativePromptCache;
+  c, c1, c2, c3, c4: TQwen3Context;
+  first, second, other, third: TIntegerDynArray;
+  alone, cached: RawUtf8;
+  reused, i: PtrInt;
+  raised: boolean;
+
+  function Decode(const aPrompt: TIntegerDynArray; aCtx: TQwen3Context;
+    out aReused: PtrInt): RawUtf8;
+  var
+    p: TQwen3OutputParser;
+  begin
+    p := TQwen3OutputParser.Create(fTokenizer);
+    try
+      aReused := NativeDecode(model, aPrompt, 9, p, InferSamplingGreedy, aCtx);
+      result := p.Response.Content;
+      CheckEqual(p.Response.Usage.PromptTokens, length(aPrompt),
+        'the whole prompt in the usage');
+    finally
+      p.Free;
+    end;
+  end;
+
+  function Ids(aCount, aSeed: PtrInt): TIntegerDynArray;
+  var
+    j: PtrInt;
+  begin
+    result := nil;
+    SetLength(result, aCount);
+    for j := 0 to aCount - 1 do
+      result[j] := 33 + (j * 7 + aSeed) mod 60; // printable, in the tiny vocab
+  end;
+
+  procedure Fill(aCtx: TQwen3Context; const aIds: TIntegerDynArray);
+  begin
+    aCtx.Reset;
+    model.Forward(aCtx, pointer(aIds), length(aIds), nil);
+  end;
+
+begin
+  if fTokenizer = nil then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  cpu := TInferCpuBackend.Create;
+  model := nil;
+  cache := nil;
+  c := nil;
+  try
+    model := TQwen3Model.Create(dir, cpu);
+    // NativeDecode in a given context: the second turn starts with the first
+    // prompt and its answer, only the rest is computed - the same answer
+    first := Ids(20, 0);
+    c := TQwen3Context.Create;
+    alone := Decode(first, nil, reused);
+    cached := Decode(first, c, reused);
+    CheckEqual(reused, 0, 'an empty context reuses nothing');
+    CheckEqual(cached, alone, 'decoded in a given context');
+    CheckEqual(c.Length, 20 + 9 - 1, 'the prompt and the fed tokens stay');
+    second := Ids(40, 3);
+    for i := 0 to c.Length - 1 do
+      second[i] := c.Id[i];
+    alone := Decode(second, nil, reused);
+    cached := Decode(second, c, reused);
+    CheckEqual(reused, 28, 'the first turn and its answer came from the cache');
+    CheckEqual(cached, alone, 'the same answer as a fresh decode');
+    // the same prompt once more: all but its last token
+    cached := Decode(second, c, reused);
+    CheckEqual(reused, 39, 'a repeated prompt');
+    CheckEqual(cached, alone, 'the same answer again');
+    FreeAndNil(c);
+    // the pool: the longest shared prefix wins, the least recently used goes
+    cache := TNativePromptCache.Create(2);
+    CheckEqual(cache.Slots, 2, 'slots');
+    other := Ids(30, 5);
+    third := Ids(10, 11);
+    c1 := cache.Acquire(first);
+    c2 := cache.Acquire(first);
+    Check((c1 <> nil) and (c2 <> nil) and (c1 <> c2), 'an empty cache gives new ones');
+    Fill(c1, first);
+    Fill(c2, other);
+    cache.Release(c1, 0);
+    cache.Release(c2, 5);
+    Check((cache.Requests = 2) and (cache.Hits = 1) and (cache.ReusedTokens = 5),
+      'requests, hits, reused tokens');
+    Check(cache.Acquire(second) = c1, 'second starts with first: c1');
+    Check(cache.Acquire(other) = c2, 'other: c2');
+    cache.Release(c1, 0);
+    cache.Release(c2, 0);
+    // nothing shared and the cache full: the least recently used, c1
+    c3 := cache.Acquire(third);
+    Check(c3 = c1, 'no shared token: the least recently used');
+    // nothing shared, a free slot: a new one
+    c4 := cache.Acquire(third);
+    Check((c4 <> c2) and (c4 <> c1) and (c4.Length = 0), 'a free slot: a new one');
+    Fill(c4, third);
+    cache.Release(c4, 0); // idle: c2 c4
+    Fill(c3, first);
+    cache.Release(c3, 0); // full: c2 goes, idle: c4 c3
+    c := cache.Acquire(other);
+    Check(c = c4, 'c2 was evicted: other finds nothing, gets the oldest');
+    c := nil;
+    Check(cache.Acquire(first) = c3, 'c3 kept');
+    cache.Release(c3, 0);
+    cache.Release(c4, 0); // idle: c3 c4
+    // fewer slots: the least recently used go
+    cache.Slots := 1;
+    c := cache.Acquire(first);
+    Check((c = c4) and (c.Length = length(third)), 'Slots 1 kept the newest');
+    c := nil;
+    cache.Release(c4, 0);
+    // Clear forgets every sequence
+    cache.Clear;
+    c := cache.Acquire(third);
+    CheckEqual(c.Length, 0, 'after Clear: an empty context');
+    // two contexts share a prefix: the longer one wins, not the first found
+    cache.Slots := 2;
+    Fill(c, Ids(10, 0));
+    cache.Release(c, 0);
+    c := cache.Acquire(third);
+    Fill(c, first);
+    cache.Release(c, 0);
+    c := cache.Acquire(second);
+    CheckEqual(c.Length, length(first), 'the longest shared prefix wins');
+    Fill(c, third);
+    // no slot: Release frees, every request starts empty
+    cache.Slots := 0;
+    cache.Release(c, 0);
+    c := nil;
+    c := cache.Acquire(third);
+    CheckEqual(c.Length, 0, 'Slots 0 keeps nothing');
+    FreeAndNil(c);
+    raised := false;
+    try
+      cache.Slots := -1;
+    except
+      on ELlmClient do
+        raised := true;
+    end;
+    Check(raised and (cache.Slots = 0), 'negative slots refused');
+  finally
+    c.Free;
+    cache.Free;
     model.Free;
     cpu.Free;
   end;
@@ -1339,8 +1497,11 @@ var
   agent: TLlmAgent;
   tool: TLlmTool;
   msgs: TLlmMessageDynArray;
-  r: TLlmChatResponse;
+  r, r2: TLlmChatResponse;
   timer: TPrecisionTimer;
+  log: TDeltaLog;
+  n: Int64;
+  raised: boolean;
 begin
   dir := RealModel;
   if dir = '' then
@@ -1374,6 +1535,44 @@ begin
   Check(r.ToolCalls = nil, 'the final answer calls no tool');
   Check(r.Content <> '', 'and says something');
   Check(PosEx('21', r.Content) > 0, 'with the tool result in it');
+  // the second turn started with the first one: the prompt cache took it
+  AddConsole(FormatString('prompt cache: % of % requests, % tokens reused',
+    [client.Cache.Hits, client.Cache.Requests, client.Cache.ReusedTokens]));
+  CheckEqual(client.Cache.Requests, 2, 'two requests');
+  CheckEqual(client.Cache.Hits, 1, 'the second one from the cache');
+  Check(client.Cache.ReusedTokens > 100, 'with the first prompt');
+  // without the cache: the same answer
+  client.Cache.Slots := 0;
+  fToolCalls := 0;
+  agent := TLlmAgent.Create(llm, tools, '');
+  try
+    agent.MaxIterations := 3;
+    timer.Start;
+    r2 := agent.Run(msgs);
+    AddConsole(FormatString('agent loop without the cache in %', [timer.Stop]));
+  finally
+    agent.Free;
+  end;
+  CheckEqual(r2.Content, r.Content, 'the same answer without the cache');
+  CheckEqual(client.Cache.Hits, 1, 'no hit without slots');
+  // a cancelled stream: its context is freed, not given back
+  client.Cache.Slots := 1;
+  n := client.Cache.Requests;
+  log := TDeltaLog.Create;
+  try
+    log.Fail := true;
+    raised := false;
+    try
+      llm.ChatStream(LlmChatRequest('', msgs), log.OnDelta);
+    except
+      on ELlmClient do
+        raised := true;
+    end;
+  finally
+    log.Free;
+  end;
+  Check(raised, 'the stream was cancelled');
+  CheckEqual(client.Cache.Requests, n, 'a failed request is not given back');
 end;
 
 end.

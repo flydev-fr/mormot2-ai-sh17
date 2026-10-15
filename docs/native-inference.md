@@ -525,8 +525,8 @@ Indizier-Job im Backend) und ein Lauf auf echter Sensor-Hardware.
   - Stop: `<|im_end|>` und `<|endoftext|>`. Kontextgrenze: Das letzte Token wird nicht
     zurückgeführt, ein Prompt aus P Tokens lässt MaxPositions − P + 1 neue zu.
   - Bewusst noch nicht: Sampling (Temperature wird ignoriert, gedekodiert wird greedy),
-    Prompt-Cache, Bilder und `ResponseFormat` (beides wird mit Fehler abgelehnt statt
-    still übergangen).
+    Prompt-Cache (beides seit 3b/3c da), Bilder und `ResponseFormat` (beides wird mit
+    Fehler abgelehnt statt still übergangen).
   - Tests: Parser, Prompt und Dekodierung ohne echtes Modell (winziger Byte-Tokenizer,
     das winzige Qwen3 an der Kontextgrenze); mit Qwen3-0.6B die Referenz-Prompts
     (`chat_en` „Paris“, `chat_tool` ruft `get_weather` mit `{"city": "Berlin"}`,
@@ -631,8 +631,40 @@ bestehen und die Benchmarks dokumentiert sind.
   derselbe Seed gibt dieselbe Antwort. Gegenproben (Top-p gegen die Kandidaten, Seed
   ignoriert, Temperature nicht angewandt, Top-k um eins daneben) schlagen an.
 
-- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Prompt-Cache,
-  Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
+**3c, erledigt 2026-10-15: Prompt-Cache.**
+
+- Ein Agent-Loop oder Chat schickt mit jeder Runde den ganzen Verlauf, eine Runde
+  länger. Der KV-Cache einer Position hängt nur von den Tokens bis dahin ab; was am
+  Anfang gleich ist, muss also nicht neu gerechnet werden.
+- `TQwen3Context` merkt sich das Token jeder gecachten Position. `TQwen3Model.Reuse`
+  behält den gemeinsamen Anfang mit dem neuen Prompt (höchstens alle Tokens bis auf
+  das letzte, das für die Logits gerechnet wird; nichts aus dem Kontext eines anderen
+  Modells) und vergisst den Rest.
+- `NativeDecode` nimmt optional einen Kontext und meldet, wie viele Prompt-Tokens aus
+  ihm kamen. `TNativePromptCache` hält die Kontexte fertiger Anfragen (thread-sicher;
+  der mit dem längsten gemeinsamen Anfang gewinnt, der am längsten unbenutzte fliegt
+  raus). `TNativeLlmClient.Cache` hat einen Platz; `Cache.Slots := 0` schaltet ab
+  und gibt den Speicher frei. Der Kontext einer fehlgeschlagenen Anfrage wird
+  verworfen, nicht zurückgelegt.
+- Die Antwort bleibt dieselbe: Die Logits nach einem wiederverwendeten Anfang sind
+  bitgleich zu einem frischen Durchlauf, auf dem Referenz- und dem schnellen Backend,
+  auch mit Q8_0 (jede Zeile wird unabhängig von der Zahl der Zeilen gerechnet).
+- Speicher: ein Kontext hält 2 × Layers × KvHeads × HeadDim Singles je Token seiner
+  Kapazität, bei Qwen3-0.6B 224 KB je Token, also 896 MB für 4096 Tokens, dazu
+  Zwischenpuffer für den längsten Prompt (etwa 60 KB je Token). Darum
+  standardmäßig nur ein Platz.
+- Messung (Snapdragon, F32): Der Agent-Loop des Tests (Tool-Aufruf, dann Antwort)
+  braucht mit Cache 2,5 s statt 3,5 s; die zweite Runde übernimmt 153 Tokens.
+- Tests: bitgleiche Logits für gemeinsamen Anfang, gleichen und kürzeren Prompt;
+  `Truncate`, `Id`, ein fremdes Modell; der Pool (längster Anfang, LRU, Slots, Clear);
+  `NativeDecode` im gehaltenen Kontext gibt dieselbe Antwort wie frisch; mit
+  Qwen3-0.6B trifft die zweite Agent-Runde den Cache und antwortet ohne Cache gleich.
+  Neun Gegenproben (Eigentümer ignoriert, ganzer Prompt behalten, IDs nicht
+  gespeichert, Truncate nach oben, erster statt längster Treffer, LRU verkehrt,
+  volle Liste neu angelegt, Slots kürzen verkehrt, Client ohne Cache) schlagen an.
+
+- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Q4/K-Quants
+  (GGUF), Benchmarks auf macOS und x86_64.
 
 ### Phase 4 — GPU
 

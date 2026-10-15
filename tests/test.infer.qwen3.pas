@@ -63,6 +63,9 @@ type
     procedure TinyLongContext;
     /// the context limit, Greedy edge cases, a context bound to its model
     procedure TinyLimitsAndContexts;
+    /// Reuse: a cached prompt prefix gives the logits of a fresh pass, bit for
+    // bit, on both backends and with Q8_0; Truncate, Id, another model
+    procedure TinyPromptReuse;
     /// a model with its own lm_head (tie_word_embeddings false)
     procedure TinyUntiedHead;
     /// InferArgMax: ties, NaN
@@ -594,6 +597,124 @@ begin
         refused := true;
     end;
     Check(refused, 'a freed model''s cache refused by a new instance');
+  finally
+    fresh.Free;
+    ctx.Free;
+    b.Free;
+    a.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.TinyPromptReuse;
+var
+  dir: TFileName;
+  a, b: TQwen3Model;
+  ctx, fresh: TQwen3Context;
+  first, second: TIntegerDynArray;
+  want, got: TSingleDynArray;
+  k, kept, vocab: PtrInt;
+  refused: boolean;
+
+  procedure Truncated(aLength: PtrInt);
+  begin
+    refused := false;
+    try
+      ctx.Truncate(aLength);
+    except
+      on EInferError do
+        refused := true;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  a := nil;
+  b := nil;
+  ctx := nil;
+  fresh := nil;
+  try
+    for k := 0 to 2 do
+    begin
+      // the reference backend, the fast one, the fast one on Q8_0: the cache
+      // of position i only depends on tokens 0..i, so a reused prefix gives
+      // the same bits
+      FreeAndNil(a);
+      case k of
+        0:
+          a := TQwen3Model.Create(dir, fCpu);
+        1:
+          a := TQwen3Model.Create(dir, fFast);
+      else
+        a := TQwen3Model.Create(dir, fFast, idtQ8_0);
+      end;
+      vocab := a.Config.VocabSize;
+      SetLength(want, vocab);
+      SetLength(got, vocab);
+      FreeAndNil(ctx);
+      FreeAndNil(fresh);
+      ctx := a.NewContext;
+      fresh := a.NewContext;
+      // a first request, then a second one sharing its first 40 tokens
+      first := RandomIds(60, vocab);
+      second := RandomIds(90, vocab);
+      for kept := 40 to 59 do
+        second[kept] := (first[kept] + 1) mod vocab;
+      a.Forward(ctx, pointer(first), length(first), pointer(got));
+      CheckEqual(ctx.Common(pointer(second), length(second)), 40, 'common prefix');
+      CheckEqual(ctx.Id[39], first[39], 'Id of a cached position');
+      kept := a.Reuse(ctx, pointer(second), length(second));
+      CheckEqual(kept, 40, 'the shared tokens stay');
+      CheckEqual(ctx.Length, 40, 'the others are forgotten');
+      a.Forward(ctx, @second[kept], length(second) - kept, pointer(got));
+      a.Forward(fresh, pointer(second), length(second), pointer(want));
+      Check(CompareMem(pointer(got), pointer(want), vocab * SizeOf(single)),
+        'logits after a reused prefix bit-identical to a fresh pass');
+      // the same prompt again: its last token is computed for the logits
+      kept := a.Reuse(ctx, pointer(second), length(second));
+      CheckEqual(kept, length(second) - 1, 'all but the last token stay');
+      a.Forward(ctx, @second[kept], 1, pointer(got));
+      Check(CompareMem(pointer(got), pointer(want), vocab * SizeOf(single)),
+        'the same prompt, the same logits');
+      // a prompt that is a prefix of the cached sequence
+      kept := a.Reuse(ctx, pointer(second), 30);
+      CheckEqual(kept, 29, 'a shorter prompt keeps all but its last token');
+      fresh.Reset;
+      a.Forward(fresh, pointer(second), 30, pointer(want));
+      a.Forward(ctx, @second[kept], 1, pointer(got));
+      Check(CompareMem(pointer(got), pointer(want), vocab * SizeOf(single)),
+        'a shorter prompt, the logits of a fresh pass');
+      // nothing shared: everything is computed again
+      first[0] := (second[0] + 1) mod vocab;
+      CheckEqual(a.Reuse(ctx, pointer(first), length(first)), 0, 'no common token');
+      CheckEqual(ctx.Length, 0, 'empty');
+    end;
+    // Truncate and Id outside the cached tokens
+    a.Forward(ctx, pointer(first), 10, nil);
+    Truncated(11);
+    Check(refused and (ctx.Length = 10), 'Truncate beyond Length refused');
+    Truncated(-1);
+    Check(refused, 'Truncate(-1) refused');
+    Truncated(10);
+    Check(not refused and (ctx.Length = 10), 'Truncate(Length) keeps all');
+    refused := false;
+    try
+      Check(ctx.Id[10] = -1, 'no Id beyond Length');
+    except
+      on EInferError do
+        refused := true;
+    end;
+    Check(refused, 'Id beyond Length refused');
+    CheckEqual(a.Reuse(ctx, pointer(first), 0), 0, 'an empty prompt reuses nothing');
+    // another model of the same shape never takes the cached keys
+    a.Forward(ctx, pointer(first), 10, nil);
+    b := TQwen3Model.Create(dir, fCpu);
+    CheckEqual(b.Reuse(ctx, pointer(first), length(first)), 0,
+      'another model reuses nothing');
+    CheckEqual(ctx.Length, 0, 'and empties the context');
+    b.Forward(ctx, pointer(first), 5, nil);
+    CheckEqual(ctx.Length, 5, 'which it then takes over');
   finally
     fresh.Free;
     ctx.Free;

@@ -181,14 +181,78 @@ function NativeSampling(const aRequest: TLlmChatRequest;
 // token is not fed back, so a prompt of P tokens leaves MaxPositions - P + 1
 // - raises ELlmClient for an empty prompt, one longer than the context, or
 // aMaxNew <= 0
-procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling);
+// - aContext: nil decodes in a context of its own; else the tokens it caches
+// at the start of aPrompt are not computed again (a prompt cache), and it
+// holds the prompt and the drawn tokens afterwards (but the last one); after
+// an exception, free or Reset it
+// - returns how many prompt tokens came from aContext
+function NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling;
+  aContext: TQwen3Context = nil): PtrInt;
+
+const
+  /// how many finished requests a TNativeLlmClient keeps the KV cache of
+  NATIVE_LLM_DEFAULT_CACHE_SLOTS = 1;
 
 type
+  /// contexts of the prompt cache
+  TQwen3ContextDynArray = array of TQwen3Context;
+
+  /// the KV caches of finished requests, kept for the next request whose
+  // prompt starts with the same tokens - an agent loop or a chat sends the
+  // whole conversation again, one turn longer: only the new turn is computed
+  // - thread-safe; a context serves one request at a time (Acquire, Release)
+  // - memory: a context keeps 2 x Layers x KvHeads x HeadDim singles per token
+  // of its capacity (its longest sequence, grown by doubling) - 224 KB per
+  // token for Qwen3-0.6B, 896 MB for 4096 - and scratch buffers for its
+  // longest prompt (about 60 KB per token more)
+  // tokens - so few slots, and none on a small device
+  TNativePromptCache = class
+  protected
+    fSafe: TLightLock;
+    fIdle: TQwen3ContextDynArray; // the least recently used first
+    fSlots: integer;
+    fRequests, fHits, fReused: Int64;
+    procedure SetSlots(aSlots: integer);
+    function GetRequests: Int64;
+    function GetHits: Int64;
+    function GetReused: Int64;
+  public
+    /// keep at most aSlots idle contexts (0: none, every request starts empty)
+    constructor Create(aSlots: integer = NATIVE_LLM_DEFAULT_CACHE_SLOTS);
+    /// free the idle contexts
+    destructor Destroy; override;
+    /// a context for aPrompt, out of the cache: the idle one caching the most
+    // of its first tokens; when none caches any, the least recently used one
+    // if the cache is full, else a new one
+    function Acquire(const aPrompt: TIntegerDynArray): TQwen3Context;
+    /// give back the context of a finished request, which took aReused prompt
+    // tokens from it: kept as the most recently used, the least recently used
+    // one freed beyond Slots
+    // - the context of a failed request is freed instead, not given back
+    procedure Release(aContext: TQwen3Context; aReused: PtrInt);
+    /// forget every cached sequence
+    procedure Clear;
+    /// how many idle contexts are kept
+    property Slots: integer
+      read fSlots write SetSlots;
+    /// the requests given back so far (a failed one is not given back)
+    property Requests: Int64
+      read GetRequests;
+    /// how many of them took prompt tokens from the cache
+    property Hits: Int64
+      read GetHits;
+    /// prompt tokens not computed again, over every request
+    property ReusedTokens: Int64
+      read GetReused;
+  end;
+
   /// a local ILlmClient: a Qwen3 model folder run by the native engine
   // - thread-safe: the model is immutable, every request decodes in its own
   // context (KV cache) with its own parser
-  // - every request starts from an empty context: no prompt cache yet
+  // - prompt cache: the context of a finished request is kept (Cache), and a
+  // request that starts with the same tokens - the next turn of the same
+  // conversation - only computes the rest; the answer stays the same
   TNativeLlmClient = class(TInterfacedObject, ILlmClient)
   protected
     fBackend: TInferBackend;
@@ -196,6 +260,7 @@ type
     fTokenizer: TBpeTokenizer;
     fTemplate: TQwen3ChatTemplate;
     fModel: TQwen3Model;
+    fCache: TNativePromptCache;
     fConfig: TLlmProviderConfig;
     fMaxTokens: integer;
     fEnableThinking: boolean;
@@ -231,6 +296,10 @@ type
     // every request draws its own unless Extra.seed is given
     property Sampling: TInferSampling
       read fSampling write fSampling;
+    /// the prompt cache (NATIVE_LLM_DEFAULT_CACHE_SLOTS slots); Cache.Slots :=
+    // 0 frees the memory and turns it off
+    property Cache: TNativePromptCache
+      read fCache;
     /// the model
     property Model: TQwen3Model
       read fModel;
@@ -741,8 +810,9 @@ end;
 
 { NativeDecode }
 
-procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling);
+function NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling;
+  aContext: TQwen3Context): PtrInt;
 var
   logits: TSingleDynArray;
   ctx: TQwen3Context;
@@ -763,10 +833,14 @@ begin
     aMaxNew := aModel.Config.MaxPositions - length(aPrompt) + 1;
   SetLength(logits, aModel.Config.VocabSize);
   sampler := nil;
-  ctx := aModel.NewContext;
+  ctx := aContext;
+  if ctx = nil then
+    ctx := aModel.NewContext;
   try
     sampler := TInferSampler.Create(aSampling);
-    aModel.Forward(ctx, pointer(aPrompt), length(aPrompt), pointer(logits));
+    // the cached start of the prompt stays, the rest is computed
+    result := aModel.Reuse(ctx, pointer(aPrompt), length(aPrompt));
+    aModel.Forward(ctx, @aPrompt[result], length(aPrompt) - result, pointer(logits));
     n := 0;
     repeat
       id := sampler.Next(pointer(logits), aModel.Config.VocabSize);
@@ -778,9 +852,167 @@ begin
     until false;
   finally
     sampler.Free;
-    ctx.Free;
+    if ctx <> aContext then
+      ctx.Free;
   end;
   aParser.Finish(not stopped, length(aPrompt));
+end;
+
+
+{ TNativePromptCache }
+
+constructor TNativePromptCache.Create(aSlots: integer);
+begin
+  inherited Create;
+  SetSlots(aSlots);
+end;
+
+destructor TNativePromptCache.Destroy;
+begin
+  Clear;
+  inherited Destroy;
+end;
+
+procedure TNativePromptCache.SetSlots(aSlots: integer);
+var
+  i, n: PtrInt;
+  drop: TQwen3ContextDynArray;
+begin
+  if aSlots < 0 then
+    ELlmClient.RaiseUtf8('%.Slots = %', [self, aSlots]);
+  drop := nil;
+  fSafe.Lock;
+  try
+    fSlots := aSlots;
+    n := length(fIdle) - aSlots;
+    if n > 0 then
+    begin
+      // the least recently used go
+      SetLength(drop, n);
+      for i := 0 to n - 1 do
+        drop[i] := fIdle[i];
+      for i := n to high(fIdle) do
+        fIdle[i - n] := fIdle[i];
+      SetLength(fIdle, aSlots);
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  for i := 0 to high(drop) do
+    drop[i].Free; // outside the lock: freeing a large cache takes a while
+end;
+
+procedure TNativePromptCache.Clear;
+var
+  i: PtrInt;
+  drop: TQwen3ContextDynArray;
+begin
+  fSafe.Lock;
+  try
+    drop := fIdle;
+    fIdle := nil;
+  finally
+    fSafe.UnLock;
+  end;
+  for i := 0 to high(drop) do
+    drop[i].Free;
+end;
+
+function TNativePromptCache.Acquire(const aPrompt: TIntegerDynArray): TQwen3Context;
+var
+  i, best, common, longest: PtrInt;
+begin
+  result := nil;
+  fSafe.Lock;
+  try
+    best := -1;
+    longest := 0;
+    for i := 0 to high(fIdle) do
+    begin
+      common := fIdle[i].Common(pointer(aPrompt), length(aPrompt));
+      if common > longest then
+      begin
+        longest := common;
+        best := i;
+      end;
+    end;
+    // no shared token: the buffers of the least recently used, once full
+    if (best < 0) and (fIdle <> nil) and (length(fIdle) >= fSlots) then
+      best := 0;
+    if best >= 0 then
+    begin
+      result := fIdle[best];
+      for i := best to high(fIdle) - 1 do
+        fIdle[i] := fIdle[i + 1];
+      SetLength(fIdle, length(fIdle) - 1);
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  if result = nil then
+    result := TQwen3Context.Create;
+end;
+
+procedure TNativePromptCache.Release(aContext: TQwen3Context; aReused: PtrInt);
+var
+  drop: TQwen3Context;
+  i: PtrInt;
+begin
+  if aContext = nil then
+    exit;
+  drop := nil;
+  fSafe.Lock;
+  try
+    inc(fRequests);
+    if aReused > 0 then
+    begin
+      inc(fHits);
+      inc(fReused, aReused);
+    end;
+    if fSlots = 0 then
+      drop := aContext
+    else
+    begin
+      if length(fIdle) >= fSlots then
+      begin
+        drop := fIdle[0];
+        for i := 1 to high(fIdle) do
+          fIdle[i - 1] := fIdle[i];
+        fIdle[high(fIdle)] := aContext;
+      end
+      else
+      try
+        SetLength(fIdle, length(fIdle) + 1);
+        fIdle[high(fIdle)] := aContext;
+      except
+        drop := aContext; // no memory to keep it: caching is best effort
+      end;
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  drop.Free;
+end;
+
+function TNativePromptCache.GetRequests: Int64;
+begin
+  fSafe.Lock; // an Int64 is no atomic read on a 32-bit CPU
+  result := fRequests;
+  fSafe.UnLock;
+end;
+
+function TNativePromptCache.GetHits: Int64;
+begin
+  fSafe.Lock;
+  result := fHits;
+  fSafe.UnLock;
+end;
+
+function TNativePromptCache.GetReused: Int64;
+begin
+  fSafe.Lock;
+  result := fReused;
+  fSafe.UnLock;
 end;
 
 
@@ -805,6 +1037,7 @@ begin
   fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
   fModel := TQwen3Model.Create(dir, fBackend, aWeights);
   fSampling := InferSamplingFromConfig(dir + 'generation_config.json');
+  fCache := TNativePromptCache.Create;
   // the stop and control tokens: fail at load, not at the first request
   TQwen3OutputParser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
@@ -814,6 +1047,7 @@ end;
 
 destructor TNativeLlmClient.Destroy;
 begin
+  fCache.Free;
   fModel.Free;
   fTemplate.Free;
   fTokenizer.Free;
@@ -825,13 +1059,24 @@ end;
 procedure TNativeLlmClient.Generate(const aRequest: TLlmChatRequest;
   aParser: TQwen3OutputParser);
 var
-  maxNew: PtrInt;
+  maxNew, reused: PtrInt;
+  prompt: TIntegerDynArray;
+  sampling: TInferSampling;
+  ctx: TQwen3Context;
 begin
   maxNew := aRequest.MaxTokens;
   if maxNew <= 0 then
     maxNew := fMaxTokens;
-  NativeDecode(fModel, NativeChatPrompt(fTemplate, aRequest, fEnableThinking),
-    maxNew, aParser, NativeSampling(aRequest, fSampling));
+  prompt := NativeChatPrompt(fTemplate, aRequest, fEnableThinking);
+  sampling := NativeSampling(aRequest, fSampling);
+  ctx := fCache.Acquire(prompt);
+  try
+    reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx);
+  except
+    ctx.Free; // a failed request leaves nothing in the cache
+    raise;
+  end;
+  fCache.Release(ctx, reused);
 end;
 
 function TNativeLlmClient.ChatComplete(

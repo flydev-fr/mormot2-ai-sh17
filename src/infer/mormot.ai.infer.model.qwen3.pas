@@ -83,19 +83,33 @@ type
   /// the KV cache and scratch buffers of one sequence
   // - one per concurrent sequence; may be reused for another sequence after
   // Reset, and for another model of the same shape
+  // - remembers the id at every cached position: a prompt that starts with
+  // the same tokens keeps their keys and values (Common, then Truncate) - the
+  // cache of position i depends on the tokens 0..i only
   TQwen3Context = class
   protected
     fLength, fCapacity: PtrInt;
     fKvWidth, fLayers: PtrInt;
     fOwner: integer; // serial of the model whose keys and values are cached
     fKeys, fValues: array of TSingleDynArray; // per layer [capacity, kvWidth]
+    fIds: TIntegerDynArray; // [capacity] the token at every cached position
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
+    function GetId(aPosition: PtrInt): integer;
   public
     /// forget the cached tokens - the buffers stay allocated
     procedure Reset;
+    /// keep the first aLength cached tokens, forget the others
+    // - raises EInferError unless 0 <= aLength <= Length
+    procedure Truncate(aLength: PtrInt);
+    /// how many of the first tokens of aIds[0..aCount-1] the cache holds:
+    // the length of the common prefix
+    function Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
     /// tokens in the KV cache = position of the next token
     property Length: PtrInt
       read fLength;
+    /// the token cached at aPosition (0 .. Length - 1)
+    property Id[aPosition: PtrInt]: integer
+      read GetId;
   end;
 
   /// a Qwen3 causal language model over a safetensors file
@@ -137,14 +151,20 @@ type
     /// a context sized for this model (KV cache grows on demand)
     function NewContext: TQwen3Context;
     /// append aCount tokens to the sequence of aCtx and compute them
-    // - their positions are aCtx.Length .. aCtx.Length + aCount - 1; their keys
-    // and values enter the KV cache
+    // - their positions are aCtx.Length .. aCtx.Length + aCount - 1; their ids,
+    // keys and values enter the KV cache - Length only grows once every layer
+    // is computed, so an exception in the layers leaves the tokens it held
     // - aLogits: nil computes no logits; else it receives the logits of the
     // last token ([VocabSize]), or of every new token when aAllLogits
     // ([aCount, VocabSize])
     procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false;
       const aOnState: TOnQwen3State = nil);
+    /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
+    // others, and return how many stayed: the rest of aIds is to be computed
+    // - at most aCount - 1 stay, so a Forward of the rest has a token to give
+    // logits for; none when aCtx holds a sequence of another model
+    function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt): PtrInt;
     /// greedy continuation: the prompt is fed after aCtx's cached tokens, then
     // the highest logit is taken until one of aStop or aMaxNew tokens
     // - returns the new ids, the stop token included when one was produced;
@@ -182,6 +202,29 @@ end;
 procedure TQwen3Context.Reset;
 begin
   fLength := 0;
+end;
+
+procedure TQwen3Context.Truncate(aLength: PtrInt);
+begin
+  if (aLength < 0) or (aLength > fLength) then
+    EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
+  fLength := aLength;
+end;
+
+function TQwen3Context.Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+begin
+  result := 0;
+  if aCount > fLength then
+    aCount := fLength;
+  while (result < aCount) and (fIds[result] = aIds^[result]) do
+    inc(result);
+end;
+
+function TQwen3Context.GetId(aPosition: PtrInt): integer;
+begin
+  if (aPosition < 0) or (aPosition >= fLength) then
+    EInferError.RaiseUtf8('%.Id[%] of % tokens', [self, aPosition, fLength]);
+  result := fIds[aPosition];
 end;
 
 
@@ -505,11 +548,13 @@ begin
   end;
   if (aCtx.fKvWidth <> kvw) or (aCtx.fLayers <> fConfig.Layers) then
   begin
-    aCtx.fKvWidth := kvw;
-    aCtx.fLayers := fConfig.Layers;
+    // the shape is only taken once its arrays are there: a failed SetLength
+    // leaves a context that tries again
     aCtx.fCapacity := 0;
     SetLength(aCtx.fKeys, fConfig.Layers);
     SetLength(aCtx.fValues, fConfig.Layers);
+    aCtx.fKvWidth := kvw;
+    aCtx.fLayers := fConfig.Layers;
   end;
   if aTokens > aCtx.fCapacity then
   begin
@@ -529,6 +574,7 @@ begin
       SetLength(aCtx.fKeys[i], cap * kvw);
       SetLength(aCtx.fValues[i], cap * kvw);
     end;
+    SetLength(aCtx.fIds, cap);
     aCtx.fCapacity := cap;
   end;
   Need(aCtx.fX, aNew * fConfig.Hidden);
@@ -689,6 +735,7 @@ begin
     if Assigned(aOnState) then
       aOnState(LayerName(l), pointer(aCtx.fX), n, h);
   end;
+  MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer));
   aCtx.fLength := past + n;
   if (aLogits = nil) and not Assigned(aOnState) then
     exit;
@@ -702,6 +749,17 @@ begin
   else
     fBackend.Linear(@aCtx.fH[(n - 1) * h], 1, h, fHead, fConfig.VocabSize, nil,
       aLogits);
+end;
+
+function TQwen3Model.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
+  aCount: PtrInt): PtrInt;
+begin
+  if aCtx = nil then
+    EInferError.RaiseUtf8('%.Reuse: no context', [self]);
+  result := 0;
+  if (aCtx.fOwner = fSerial) and (aCount > 0) then
+    result := aCtx.Common(aIds, aCount - 1);
+  aCtx.Truncate(result);
 end;
 
 function TQwen3Model.Greedy(aCtx: TQwen3Context; const aPrompt: array of integer;
