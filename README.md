@@ -6,20 +6,21 @@ vector search and RAG, and it brings **its own inference engine in plain Object 
 no Python, no llama.cpp, no foreign `.so`/`.dll` at run time. mORMot2's HTTP stack, JSON,
 RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
-> **Status, 2026-10-14:** MCP, LLM clients, agent loop, RAG and the native vector store
+> **Status, 2026-10-15:** MCP, LLM clients, agent loop, RAG and the native vector store
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
 > GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
 > it passes all suites, its quality gate and a 90-minute soak test on Linux x86_64 too,
 > and it is the recommended provider of the consuming backend. The Qwen3 decoder passes
-> its gate: on a fixed prompt set, greedy output in FP32 is token-identical to
-> `transformers`. Next: the decoder behind `ILlmClient`, then quantisation and CUDA. Three test suites, about 3600 assertions, green wherever they have run (table below).
+> its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
+> `ILlmClient`: the agent loop calls tools with a model on this machine. Correct, not yet
+> fast. Next: quantisation and speed, then CUDA. Three test suites, about 3700 assertions, green wherever they have run (table below).
 
 ## What it does
 
 | Area | Units | In short |
 |---|---|---|
 | **MCP server** | `mormot.ai.mcp[.server/.stdio/.tools]` | protocol revision **2026-07-28** (stateless); tools from typed records, input schema generated from RTTI; stdio, HTTP, Streamable HTTP, in-process; OAuth 2.1 resource server (opt-in) |
-| **LLM clients** | `mormot.ai.llm[.openai/.anthropic/.sse/.structured]` | OpenAI wire as lingua franca (OpenAI, LiteLLM, Ollama-compatible), native Anthropic driver; streaming, tool calls, structured output, vision |
+| **LLM clients** | `mormot.ai.llm[.openai/.anthropic/.native/.sse/.structured]` | OpenAI wire as lingua franca (OpenAI, LiteLLM, Ollama-compatible), native Anthropic driver, a local Qwen3 on the native engine; streaming, tool calls, structured output, vision |
 | **Agent** | `mormot.ai.agent[.mcp]` | tool-calling loop; MCP tools usable by the agent |
 | **Embeddings** | `mormot.ai.embeddings`, `.embed.{native,provider,lembed}` | one `IEmbedder` seam: the native engine, any OpenAI-compatible API, or sqlite-lembed |
 | **Vector search** | `mormot.ai.vectorstore[.native/.sqlitevec]` | native store in mORMot's SQLite: float32 rows as the truth, 1-bit RAM index with exact rescoring, SQL key filters — measured at 2 million × 1024 |
@@ -33,10 +34,10 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1597 |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1757 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 720 | 1587 |
-| Windows x86 | **Delphi 7** | 1253 | 708 | 891 ⁶ |
+| Windows x64 | Delphi 13 | 1257 | 720 | 1747 |
+| Windows x86 | **Delphi 7** | 1253 | 708 | 1018 ⁶ |
 | macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | 1597 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
@@ -47,12 +48,15 @@ that target.
 ³ The production target (Docker uses the same FPC 3.2.2), with the BGE-M3 corpus gate
 (`LAI_INFER_GATE=1`) included: nDCG@10 0.8994 on the AVX2 path.
 ⁴ Run before the load governor tests were added (they bring about 60 assertions).
-⁵ Run before the Qwen3 tests were added (tokenizer, chat template, decoder: about 380
-assertions with the model, about 170 without it).
+⁵ Run before the Qwen3 tests were added (tokenizer, chat template, decoder and the native
+client: about 540 assertions with the model, about 300 without it).
 ⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
 model, the tokenizer and the chat template run.
 ⁷ With all models, NEON dot-product kernels; the BGE-M3 corpus gate passes there too
-(nDCG@10 0.9004, the same as on the Snapdragon).
+(nDCG@10 0.9004, the same as on the Snapdragon). Run before the native client tests were
+added (about 160 assertions with the model).
+⁸ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
+(without the model).
 
 Counts differ by compiler because some tests only exist where a feature does (the `vec0`
 extension has no 32-bit build, so Delphi 7 skips that test).
@@ -318,6 +322,13 @@ driver** behind the same `ILlmClient` seam:
   top-level `system`, mandatory `max_tokens`, `input_schema`/`tool_use`/`tool_result`,
   `x-api-key` + `anthropic-version`, event-typed SSE. The agent loop, RAG and structured
   output stay provider-agnostic; only the `ILlmClient` instance changes.
+- **Native** (`mormot.ai.llm.native`, `TNativeLlmClient`): Qwen3 from a model folder on
+  this machine, run by the native engine. The prompt is the model's chat template; the
+  answer is parsed token by token - a leading `<think>` block becomes `reasoning_content`
+  in `Raw` (as vLLM returns it), each `<tool_call>` a `TLlmToolCall`. `ChatComplete` and
+  `ChatStream` share one decoding path. Thinking is switched per request through
+  `Extra.chat_template_kwargs.enable_thinking`, as with vLLM. Greedy decoding until the
+  sampler arrives; images and `ResponseFormat` are refused rather than ignored.
 
 **Vision:** `TLlmMessage.Images` carries attachments (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`); both wires serialise them (OpenAI `image_url` including base64 `data:` URIs,
@@ -478,7 +489,7 @@ provider or runtime, not only against tests.
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
-| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) | **works, not wired yet** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; correctness first, slow (scalar FP32); not yet behind `ILlmClient` |
+| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works, slow** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; greedy only, scalar FP32, no prompt cache |
 | Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
@@ -504,15 +515,15 @@ Done:
 - ✓ **Qwen3 decoder up to its gate** — byte-level BPE tokenizer and chat template
   identical to Hugging Face on every reference case; Qwen3-0.6B in FP32 with KV cache,
   greedy output token-identical to `transformers` for all seven reference prompts.
+- ✓ **Qwen3 behind `ILlmClient`** — `mormot.ai.llm.native`: streaming, stop tokens, tool
+  calls, reasoning; the agent loop runs a tool with the local model.
 
 Next, in this order:
-1. **Decoder LLMs behind `ILlmClient`** — the Qwen3 engine is in place and passes its
-   gate (greedy output token-identical to `transformers` in FP32); next is
-   `mormot.ai.llm.native` with streaming, stop tokens and tool calls.
-2. **Quantisation and speed** — Q4_0, later K-quants, sampling (temperature, top-k,
-   top-p), benchmarks per platform.
-3. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
-4. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
+1. **Quantisation and speed** — Q4_0, later K-quants, the SIMD kernels and threads for
+   the decoder, sampling (temperature, top-k, top-p), a prompt cache, benchmarks per
+   platform.
+2. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
+3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
 Alongside, as a separate track: **distributed execution** - big inference jobs pulled

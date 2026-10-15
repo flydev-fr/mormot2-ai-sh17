@@ -9,8 +9,10 @@
 > Provider (`AI_EMBED_PROVIDER=native`). Phase 1c ist damit abgeschlossen.
 > Phase 2 (Decoder Qwen3) bis 2c erledigt: Tokenizer und Chat-Template treffen
 > transformers in jedem Referenzfall, und die Greedy-Ausgabe von Qwen3-0.6B in FP32 ist
-> für alle sieben Referenz-Prompts tokengleich - das Gate von Phase 2. Offen ist 2d, die
-> Anbindung hinter `ILlmClient`.
+> für alle sieben Referenz-Prompts tokengleich - das Gate von Phase 2. 2d ist seit
+> 2026-10-15 erledigt: `mormot.ai.llm.native` stellt das Modell hinter `ILlmClient`, der
+> Agent-Loop ruft damit Tools auf. Phase 2 ist abgeschlossen; als Nächstes kommt
+> Phase 3 (Geschwindigkeit).
 > Grundlage ist der Entwurf des Nutzers
 > („Plan: Native Embedding- und LLM-Inferenz in Pascal", 2026-10-14). Er wurde mit dem
 > bestehenden Plan für Embeddings ([native-embeddings.md](native-embeddings.md),
@@ -498,10 +500,41 @@ Indizier-Job im Backend) und ein Lauf auf echter Sensor-Hardware.
   - Zeiten auf dem Snapdragon X (WSL, FP32, Pascal-Skalarcode): 4 + 48 Tokens in
     13 s, 193 + 20 Tokens in 46 s. Phase 2 ist bewusst auf Korrektheit gebaut,
     Geschwindigkeit ist Phase 3.
-- **2d, offen:** `mormot.ai.llm.native` hinter `ILlmClient`. Dazu gehören:
-  - Streaming aus der Dekodier-Schleife;
-  - Stop-Tokens;
-  - das Übersetzen von `<tool_call>` in `TLlmToolCall`.
+- **2d, erledigt 2026-10-15:** `mormot.ai.llm.native` (`TNativeLlmClient`) hinter
+  `ILlmClient`.
+  - Prompt: das Chat-Template mit geöffnetem Assistant-Turn. `enable_thinking` kommt
+    pro Anfrage aus `Extra.chat_template_kwargs` (wie bei vLLM), sonst gilt die
+    Voreinstellung des Clients (an, wie beim Modell).
+  - Antwort: `TQwen3OutputParser` liest Token für Token.
+    - Ein `<think>` als erstes Token öffnet die Denkphase. Sie landet wie bei vLLM als
+      `reasoning_content` in `Raw`, nie in `Content`.
+    - Jeder `<tool_call>`-Block aus striktem JSON mit genau
+      `{"name": …, "arguments": {…}}` wird ein `TLlmToolCall`. Die Argumente stehen wie
+      bei `json.dumps`, so rendert das Template sie im Verlauf zurück; nur ein Float, den
+      `json.dumps` runden würde (mehr als 15 Stellen oder außerhalb des
+      Double-Bereichs), bleibt so, wie das Modell ihn schrieb - ein Tool, das seine
+      Argumente als Double liest, rundet oder verweigert diesen Wert. Alles andere
+      bleibt sichtbar als Text.
+    - Ein Token kann mitten in einem UTF-8-Zeichen enden; diese Bytes warten auf das
+      nächste Token. Ungültiges UTF-8 wird U+FFFD.
+    - Zeilenumbrüche: am Anfang, am Ende der Denkphase und vor einem gültigen
+      Tool-Call fallen sie weg (das Template schreibt dort eigene), am Ende einer
+      normalen Antwort und vor einem Block, der Text bleibt, bleiben sie.
+  - `ChatComplete` und `ChatStream` laufen über denselben Weg, die gestreamte Antwort
+    ist also die vollständige in Stücken.
+  - Stop: `<|im_end|>` und `<|endoftext|>`. Kontextgrenze: Das letzte Token wird nicht
+    zurückgeführt, ein Prompt aus P Tokens lässt MaxPositions − P + 1 neue zu.
+  - Bewusst noch nicht: Sampling (Temperature wird ignoriert, gedekodiert wird greedy),
+    Prompt-Cache, Bilder und `ResponseFormat` (beides wird mit Fehler abgelehnt statt
+    still übergangen).
+  - Tests: Parser, Prompt und Dekodierung ohne echtes Modell (winziger Byte-Tokenizer,
+    das winzige Qwen3 an der Kontextgrenze); mit Qwen3-0.6B die Referenz-Prompts
+    (`chat_en` „Paris“, `chat_tool` ruft `get_weather` mit `{"city": "Berlin"}`,
+    `chat_think` gibt genau die Referenz-Denkphase, `chat_de` gestreamt genau den
+    Referenztext) und ein Agent-Loop mit Tool. Gegenproben schlagen an, u. a.: Kontext
+    um ein Token zu knapp, Zeilenumbruch am Anfang behalten oder am Ende verworfen,
+    Think-Erkennung aus, zusätzlicher (auch leerer) Schlüssel im Tool-Call, ein
+    4-Byte-Zeichen zu früh ausgegeben.
 
 Qwen3-Embedding ist **kein** Nebenprodukt: Es braucht einen eigenen, separat trainierten
 Checkpoint und eigene Eingabekonventionen, nicht nur Last-Token-Pooling. Es gehört zu

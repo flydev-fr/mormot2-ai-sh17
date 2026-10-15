@@ -93,7 +93,11 @@ type
 // 1e-307..1e308 raises EInferError instead of guessing the binary rounding
 // - also raises EInferError for invalid JSON, duplicate keys, NaN/Infinity,
 // lone surrogates or invalid UTF-8
-function PythonJson(const aJson: RawUtf8): RawUtf8;
+// - aKeepInexactFloats: such a float is written as it stands in aJson instead
+// of raising - for text that must pass on as it is (a model's tool call);
+// every other rule stays, an exponent of more than six digits still raises
+function PythonJson(const aJson: RawUtf8;
+  aKeepInexactFloats: boolean = false): RawUtf8;
 
 /// a JSON string literal the way Python json.dumps writes it (see PythonJson)
 // - raises EInferError for invalid UTF-8
@@ -167,6 +171,7 @@ type
     P, Start: PUtf8Char;
     Out: RawUtf8;
     Depth: integer;
+    KeepInexactFloats: boolean;
     procedure Fail(const aWhat: RawUtf8);
     procedure SkipBlanks;
     procedure Value;
@@ -304,7 +309,9 @@ var
   expNeg: boolean;
   digits, m, s: RawUtf8;
   i, k, lead, decpt: integer;
+  numStart: PUtf8Char;
 begin
+  numStart := P;
   neg := P^ = '-';
   if neg then
     inc(P);
@@ -387,11 +394,17 @@ begin
     exit;
   end;
   m := copy(digits, lead, k - lead + 1);
-  if length(m) > 15 then
-    Fail('float with more than 15 significant digits not supported');
   decpt := length(m) + e; // value = 0.m x 10^decpt
-  if (decpt > 308) or (decpt < -306) then
-    Fail('float out of the supported range');
+  if (length(m) > 15) or (decpt > 308) or (decpt < -306) then
+    if KeepInexactFloats then
+    begin
+      Append(Out, numStart, P - numStart); // the literal, already validated
+      exit;
+    end
+    else if length(m) > 15 then
+      Fail('float with more than 15 significant digits not supported')
+    else
+      Fail('float out of the supported range');
   // Python repr: fixed notation for -4 < decpt <= 16, else exponent
   if (decpt > -4) and (decpt <= 16) then
   begin
@@ -523,7 +536,7 @@ begin
   end;
 end;
 
-function PythonJson(const aJson: RawUtf8): RawUtf8;
+function PythonJson(const aJson: RawUtf8; aKeepInexactFloats: boolean): RawUtf8;
 var
   w: TPythonJsonWriter;
 begin
@@ -531,6 +544,7 @@ begin
   w.P := w.Start;
   w.Out := '';
   w.Depth := 0;
+  w.KeepInexactFloats := aKeepInexactFloats;
   if w.P = nil then
     w.Fail('empty');
   w.Value;

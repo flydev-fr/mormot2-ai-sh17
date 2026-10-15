@@ -22,7 +22,8 @@ uses
   test.infer.gguf,
   test.infer.fast,
   test.infer.bpe,
-  test.infer.qwen3;
+  test.infer.qwen3,
+  test.infer.llm;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -40,7 +41,8 @@ begin
     TTestInferGguf,
     TTestInferFast,
     TTestInferBpe,
-    TTestInferQwen3
+    TTestInferQwen3,
+    TTestInferLlmNative
   ]);
 end;
 

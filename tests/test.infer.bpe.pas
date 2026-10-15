@@ -60,6 +60,13 @@ type
 /// the folder of the Qwen3-0.6B files, '' when absent
 function FindQwen3Folder(const aFile: TFileName): TFileName;
 
+/// a byte-level tokenizer.json: the 256 byte tokens (id = byte) plus aExtra
+// and aMerges, and <|im_end|> as added token 300
+function TinyBpeJson(const aNormalizer, aExtraVocab, aMerges: RawUtf8): RawUtf8;
+
+/// a tokenizer from aJson, nil and aError when it is refused
+function LoadBpe(const aJson: RawUtf8; out aError: RawUtf8): TBpeTokenizer;
+
 
 implementation
 
@@ -248,7 +255,6 @@ begin
   CheckUtf8(timer.TimeInMicroSec < 5000000, 'marks sorted in %', [timer.Stop]);
 end;
 
-/// a byte-level tokenizer.json: the 256 byte tokens plus aExtra and aMerges
 function TinyBpeJson(const aNormalizer, aExtraVocab, aMerges: RawUtf8): RawUtf8;
 const
   HEX: array[0..15] of AnsiChar = '0123456789abcdef';

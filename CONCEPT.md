@@ -253,7 +253,7 @@ hier gilt „Interface tief, Bindung hoch" — die Engine kennt nur `IEmbedder` 
 | **lembed** (heute) | GGUF-Modell in SQLite via `lembed0` | `lembed0` + `libllama`/`ggml` **je Arch** (`.so`/`.dll`), `load_extension` | ✓ gebaut, prozessweiter Singleton |
 | **Provider** | OpenAI-Wire `/embeddings` | Netz + API-Key | ✓ gebaut |
 | **Ollama** | HTTP an lokalen Ollama-Server | **externer Prozess** | ○ kommt mit §4 |
-| **native** | eigene Pascal-Engine (`src/infer/`): Embedder **und** `ILlmClient` | **keine** | ○ geplant (2026-10-14), [docs/native-inference.md](docs/native-inference.md) |
+| **native** | eigene Pascal-Engine (`src/infer/`): Embedder **und** `ILlmClient` | **keine** | ✓ Embedder (2026-10-14), ✓ `ILlmClient` mit Qwen3 (2026-10-15, noch langsam), [docs/native-inference.md](docs/native-inference.md) |
 | ~~neural-api~~ | native Pascal-Inferenz (LGPL) | – | ✗ **nicht weiter verfolgt** (2026-10-14) |
 
 > **Stand 2026-10-13:** Die Ablösung von `vec0` **und** `lembed0` durch nativen Pascal-Code
@@ -305,8 +305,9 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
    und Soak-Test grün):
    - „native" ist der empfohlene Provider im Backend (`AI_EMBED_PROVIDER=native`);
    - lembed bleibt Fallback und Orakel.
-7. Phase 2, Decoder Qwen3 (2-0 bis 2c ✓ 2026-10-14: Tokenizer, Chat-Template, Forward,
-   KV-Cache; Greedy in FP32 tokengleich zu transformers; offen 2d hinter `ILlmClient`)
+7. Phase 2, Decoder Qwen3 ✓ (2-0 bis 2c 2026-10-14: Tokenizer, Chat-Template, Forward,
+   KV-Cache; Greedy in FP32 tokengleich zu transformers. 2d 2026-10-15:
+   `mormot.ai.llm.native` hinter `ILlmClient`, Agent-Loop mit Tool getestet)
 8. Phase 3, Quantisierung und SIMD
 9. Phase 4, CUDA
 
@@ -596,9 +597,9 @@ Roadmap — DESIGN.md verweist hierher.
      Phase 1b (dasselbe Q8-GGUF wie lembed, trifft das Orakel, nDCG@10 0,8989) ✓
      2026-10-14; 1c ✓ 2026-10-14: NEON und AVX2, auf x86_64 1,6- bis 2-mal so schnell
      wie lembed, Linux x86_64 grün, Soak-Test über 90 Minuten bestanden, im Backend der
-     empfohlene Provider; dazu der Load Governor (Punkt 10.7). Phase 2 bis 2c ✓
-     2026-10-14: Qwen3-0.6B in FP32, Greedy tokengleich zu transformers; offen 2d
-     (`mormot.ai.llm.native` hinter `ILlmClient`).
+     empfohlene Provider; dazu der Load Governor (Punkt 10.7). Phase 2 ✓: bis 2c
+     2026-10-14 (Qwen3-0.6B in FP32, Greedy tokengleich zu transformers), 2d
+     2026-10-15 (`mormot.ai.llm.native` hinter `ILlmClient`).
    - Ziel: Alle nativen Fremd-`.so` und der Docker-Bundle-Download entfallen. vec0 und
      lembed gehen **unabhängig** voneinander, jeweils nach ihrem Gate. lembed bleibt bis
      dahin Fallback und Orakel.
@@ -663,8 +664,8 @@ Roadmap — DESIGN.md verweist hierher.
     Eine eigene Spur neben der Engine-Roadmap, deren Reihenfolge bleibt unverändert.
     - **Phase 1:** Embeddings im LAN. Sie kann sofort beginnen, die Engine-Phase 1 ist
       fertig.
-    - **Später:** Robustheit, GPU-Rechner und LLM-Jobs. LLM-Jobs setzen 2d und
-      Engine-Phase 3 voraus.
+    - **Später:** Robustheit, GPU-Rechner und LLM-Jobs. LLM-Jobs setzen
+      Engine-Phase 3 voraus (2d ist erledigt).
     Bausteine sind vorhanden:
     - `mormot.ai.embed.native`;
     - der Load Governor (Punkt 10.7) als Bremse des Executors;

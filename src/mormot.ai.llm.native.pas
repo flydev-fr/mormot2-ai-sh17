@@ -1,0 +1,770 @@
+/// LandrixAI LLM Client - local ILlmClient on the native inference engine
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
+// - runs Qwen3 (src/infer, docs/native-inference.md phase 2) behind the same
+//   ILlmClient contract as the HTTP providers: the agent loop, the MCP tool
+//   bridge and RAG work unchanged against a model on this machine
+// - the prompt is the model's chat template (TQwen3ChatTemplate); the answer is
+//   parsed token by token: a leading <think> block becomes reasoning (returned
+//   like vLLM does, as reasoning_content in Raw, never in Content), every
+//   <tool_call> block a TLlmToolCall, the rest the content
+// - ChatComplete and ChatStream share one decoding path, so a streamed answer
+//   is the complete answer cut into pieces - nothing else
+// - decoding is greedy for now: Temperature is ignored until the sampler of
+//   phase 3; Images and ResponseFormat are refused (text model, no constrained
+//   decoding yet) rather than silently dropped
+unit mormot.ai.llm.native;
+
+{
+  *****************************************************************************
+
+    - TQwen3OutputParser: generated token ids to content, reasoning, tool calls
+    - NativeChatPrompt: a TLlmChatRequest as prompt ids
+    - TNativeLlmClient: ILlmClient over a Qwen3 model folder
+
+  *****************************************************************************
+}
+
+interface
+
+{$I mormot.defines.inc}
+
+uses
+  sysutils,
+  mormot.core.base,
+  mormot.core.os,
+  mormot.core.unicode,
+  mormot.core.text,
+  mormot.core.variants,
+  mormot.core.json,
+  mormot.core.search,
+  mormot.ai.llm.types,
+  mormot.ai.llm.sse,
+  mormot.ai.llm,
+  mormot.ai.infer.tensor,
+  mormot.ai.infer.unicode,
+  mormot.ai.infer.tokenizer.bpe,
+  mormot.ai.infer.chat,
+  mormot.ai.infer.backend,
+  mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.model.qwen3;
+
+const
+  /// the answer cap when a request leaves MaxTokens at 0
+  // - the reasoning of a thinking model counts: a cap that cuts the think
+  // block leaves an empty Content with finish reason length
+  NATIVE_LLM_DEFAULT_MAX_TOKENS = 4096;
+
+type
+  /// the bytes of one kind of output text on their way to UTF-8 deltas
+  // - a token may end inside a multi-byte character: those bytes wait for the
+  // next token; newlines at the very start are dropped, newlines at the end
+  // wait until text follows or Flush decides - the chat template strips them
+  // around <think> blocks and writes its own before a tool call, but renders
+  // the content of a plain answer verbatim
+  // - invalid UTF-8 becomes U+FFFD, one per invalid byte
+  TNativeTextChannel = object
+  public
+    /// bytes not given out yet: a cut character, or trailing newlines
+    Pending: RawUtf8;
+    /// true once some text was given out
+    Started: boolean;
+    /// everything given out so far
+    Text: RawUtf8;
+    /// append aBytes; returns the text that can be given out now
+    function Add(const aBytes: RawUtf8): RawUtf8;
+    /// the end of the text (or of a piece of it): returns what is left, a cut
+    // character as U+FFFD, trailing newlines dropped when aDropNewlines
+    function Flush(aDropNewlines: boolean): RawUtf8;
+  end;
+
+  /// where the parser is inside the generated answer
+  TQwen3ParserState = (
+    qpsStart,
+    qpsReasoning,
+    qpsContent,
+    qpsToolCall);
+
+  /// turns the token ids a Qwen3 model generates into a TLlmChatResponse
+  // - Push one id after the other, then Finish; with aOnDelta assigned every
+  // piece is also given out as a TLlmStreamDelta as soon as it is known
+  // - <think> as the first token opens the reasoning, </think> closes it; a
+  // <tool_call> ... </tool_call> block whose JSON is {"name": string,
+  // "arguments": object} and nothing else becomes a tool call, its arguments
+  // written like Python json.dumps (as the chat template renders them back),
+  // only a float json.dumps would round kept as the model wrote it;
+  // any other block stays in the content as text, like vLLM's hermes parser
+  // - control tokens anywhere else are text: their content goes out verbatim
+  // - newlines: dropped at the start of reasoning and content, at the end of
+  // the reasoning and before a tool call (the template writes them itself);
+  // kept at the end of a plain answer, which the template renders verbatim
+  TQwen3OutputParser = class
+  protected
+    fTokenizer: TBpeTokenizer;
+    fOnDelta: TLlmStreamDeltaEvent;
+    fStop, fEndOfText, fThink, fThinkEnd, fToolCall, fToolCallEnd: integer;
+    fState: TQwen3ParserState;
+    fContent, fReasoning: TNativeTextChannel;
+    fToolBody: RawUtf8;
+    fCalls: TLlmToolCallDynArray;
+    fCount: integer;
+    fRoleSent, fFinished: boolean;
+    fResponse: TLlmChatResponse;
+    procedure Send(var aDelta: TLlmStreamDelta);
+    procedure SendContent(const aText: RawUtf8);
+    procedure SendReasoning(const aText: RawUtf8);
+    procedure EndToolCall;
+    /// the bytes of a token as RawUtf8 - copied, so no code page is involved
+    function Bytes(aId: integer): RawUtf8;
+  public
+    /// aTokenizer (not owned) must know <|im_end|>, <think>, </think>,
+    // <tool_call> and </tool_call> - raises EInferError otherwise
+    constructor Create(aTokenizer: TBpeTokenizer;
+      const aOnDelta: TLlmStreamDeltaEvent = nil);
+    /// one generated id; returns true for a stop token (<|im_end|> or
+    // <|endoftext|>), which adds no text
+    // - raises ELlmClient for an id outside the tokenizer
+    function Push(aId: integer): boolean;
+    /// the answer is complete: aLength = true when it was cut by the token cap
+    // or the context, false when it stopped on a stop token
+    // - gives out the final delta (finish reason and usage), then the Done one
+    procedure Finish(aLength: boolean; aPromptTokens: integer);
+    /// the answer, after Finish
+    property Response: TLlmChatResponse
+      read fResponse;
+    /// the reasoning text (also in Response.Raw as reasoning_content)
+    property Reasoning: RawUtf8
+      read fReasoning.Text;
+    /// the ids pushed so far, stop token included
+    property Count: integer
+      read fCount;
+  end;
+
+/// the enable_thinking switch of a request: Extra.chat_template_kwargs.
+// enable_thinking as vLLM and SGLang read it, else aDefault
+// - raises ELlmClient when the value is there but no boolean
+function NativeEnableThinking(const aRequest: TLlmChatRequest;
+  aDefault: boolean): boolean;
+
+/// the prompt ids of a request: its messages and tools through aTemplate, with
+// the assistant turn opened
+// - raises ELlmClient for what the engine cannot honour (no messages, images,
+// ResponseFormat) and for a tool the template refuses
+function NativeChatPrompt(aTemplate: TQwen3ChatTemplate;
+  const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
+
+/// parse the text between <tool_call> and </tool_call>
+// - true when it is strict JSON (see PythonJson) and an object with exactly
+// the keys "name" (a non-empty string) and "arguments" (an object);
+// aArguments is then that object as Python json.dumps writes it, except a
+// float of more than 15 digits or beyond the double range: kept verbatim, so
+// a tool that reads its arguments as doubles rounds or refuses that value
+function ParseQwen3ToolCall(const aBody: RawUtf8;
+  out aName, aArguments: RawUtf8): boolean;
+
+/// greedy decoding of aPrompt into aParser, which is finished afterwards
+// - at most aMaxNew tokens, and never more than the context holds: the last
+// token is not fed back, so a prompt of P tokens leaves MaxPositions - P + 1
+// - raises ELlmClient for an empty prompt, one longer than the context, or
+// aMaxNew <= 0
+procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser);
+
+type
+  /// a local ILlmClient: a Qwen3 model folder run by the native engine
+  // - thread-safe: the model is immutable, every request decodes in its own
+  // context (KV cache) with its own parser
+  // - every request starts from an empty context: no prompt cache yet
+  TNativeLlmClient = class(TInterfacedObject, ILlmClient)
+  protected
+    fBackend: TInferBackend;
+    fOwnBackend: boolean;
+    fTokenizer: TBpeTokenizer;
+    fTemplate: TQwen3ChatTemplate;
+    fModel: TQwen3Model;
+    fConfig: TLlmProviderConfig;
+    fMaxTokens: integer;
+    fEnableThinking: boolean;
+    procedure Generate(const aRequest: TLlmChatRequest; aParser: TQwen3OutputParser);
+  public
+    /// load tokenizer.json, config.json and model.safetensors of aFolder
+    // - aModelName: the name in Config and in every response, the folder name
+    // when ''; aBackend: nil computes on a TInferCpuFastBackend of its own,
+    // else on aBackend (not owned)
+    constructor Create(const aFolder: TFileName; const aModelName: RawUtf8 = '';
+      aBackend: TInferBackend = nil); reintroduce;
+    destructor Destroy; override;
+    function ChatComplete(const aRequest: TLlmChatRequest): TLlmChatResponse;
+    procedure ChatStream(const aRequest: TLlmChatRequest;
+      const aOnDelta: TLlmStreamDeltaEvent);
+    function Config: TLlmProviderConfig;
+    /// the answer cap of a request without MaxTokens (default 4096, the
+    // reasoning included)
+    property MaxTokens: integer
+      read fMaxTokens write fMaxTokens;
+    /// whether Qwen3 thinks before it answers when a request does not say
+    // (default true, the model's own default)
+    property EnableThinking: boolean
+      read fEnableThinking write fEnableThinking;
+    /// the model
+    property Model: TQwen3Model
+      read fModel;
+    /// the chat template, and through it the tokenizer
+    property Template: TQwen3ChatTemplate
+      read fTemplate;
+  end;
+
+
+implementation
+
+{ TNativeTextChannel }
+
+/// append aLen bytes to aDest, no code page conversion on any compiler
+procedure AppendBytes(var aDest: RawUtf8; p: pointer; aLen: PtrInt);
+var
+  n: PtrInt;
+begin
+  if aLen <= 0 then
+    exit;
+  n := length(aDest);
+  SetLength(aDest, n + aLen);
+  MoveFast(p^, PByteArray(aDest)^[n], aLen);
+end;
+
+/// how many bytes at the end of p[0..aLen-1] start a character that is not
+// complete yet
+function IncompleteTail(p: PByteArray; aLen: PtrInt): PtrInt;
+var
+  i, need: PtrInt;
+  b: byte;
+begin
+  result := 0;
+  i := aLen - 1;
+  // back over at most three continuation bytes to the lead byte
+  while (i >= 0) and (i >= aLen - 4) and (p^[i] and $c0 = $80) do
+    dec(i);
+  if (i < 0) or (i < aLen - 4) then
+    exit;
+  b := p^[i];
+  if (b >= $c2) and (b <= $df) then
+    need := 2
+  else if (b >= $e0) and (b <= $ef) then
+    need := 3
+  else if (b >= $f0) and (b <= $f4) then
+    need := 4
+  else
+    exit; // ASCII or an invalid lead: nothing to wait for
+  if aLen - i < need then
+    result := aLen - i;
+end;
+
+/// aText as valid UTF-8: every invalid byte becomes U+FFFD
+function ValidUtf8(const aText: RawUtf8): RawUtf8;
+var
+  cp: TCardinalDynArray;
+  n: PtrInt;
+begin
+  if IsStrictUtf8(pointer(aText), length(aText)) then
+  begin
+    result := aText;
+    exit;
+  end;
+  n := Utf8ToCodePoints(pointer(aText), length(aText), cp);
+  result := CodePointsToUtf8(pointer(cp), n);
+end;
+
+function TNativeTextChannel.Add(const aBytes: RawUtf8): RawUtf8;
+var
+  n, lead: PtrInt;
+begin
+  result := '';
+  AppendBytes(Pending, pointer(aBytes), length(aBytes));
+  if not Started then
+  begin
+    lead := 0;
+    while (lead < length(Pending)) and (Pending[lead + 1] = #10) do
+      inc(lead);
+    if lead > 0 then
+      delete(Pending, 1, lead);
+  end;
+  n := length(Pending) - IncompleteTail(pointer(Pending), length(Pending));
+  while (n > 0) and (Pending[n] = #10) do
+    dec(n); // held back until text follows or Flush decides
+  if n = 0 then
+    exit;
+  result := ValidUtf8(copy(Pending, 1, n));
+  delete(Pending, 1, n);
+  Started := true;
+  AppendBytes(Text, pointer(result), length(result));
+end;
+
+function TNativeTextChannel.Flush(aDropNewlines: boolean): RawUtf8;
+var
+  n: PtrInt;
+begin
+  result := ValidUtf8(Pending);
+  Pending := '';
+  n := length(result);
+  if aDropNewlines then
+    while (n > 0) and (result[n] = #10) do
+      dec(n);
+  SetLength(result, n);
+  if not Started then
+  begin
+    n := 0;
+    while (n < length(result)) and (result[n + 1] = #10) do
+      inc(n);
+    delete(result, 1, n);
+  end;
+  if result <> '' then
+    Started := true;
+  AppendBytes(Text, pointer(result), length(result));
+end;
+
+
+{ TQwen3OutputParser }
+
+function FinishReasonText(aReason: TLlmFinishReason): RawUtf8;
+begin
+  case aReason of
+    lfrStop:
+      result := 'stop';
+    lfrLength:
+      result := 'length';
+    lfrToolCalls:
+      result := 'tool_calls';
+    lfrContentFilter:
+      result := 'content_filter';
+  else
+    result := '';
+  end;
+end;
+
+function NeedToken(aTokenizer: TBpeTokenizer; const aContent: RawUtf8): integer;
+begin
+  result := aTokenizer.TokenId(aContent);
+  if result < 0 then
+    EInferError.RaiseUtf8('TQwen3OutputParser: no % token', [aContent]);
+end;
+
+constructor TQwen3OutputParser.Create(aTokenizer: TBpeTokenizer;
+  const aOnDelta: TLlmStreamDeltaEvent);
+begin
+  inherited Create;
+  fTokenizer := aTokenizer;
+  fOnDelta := aOnDelta;
+  fStop := NeedToken(aTokenizer, '<|im_end|>');
+  fEndOfText := aTokenizer.TokenId('<|endoftext|>'); // -1 when absent
+  fThink := NeedToken(aTokenizer, '<think>');
+  fThinkEnd := NeedToken(aTokenizer, '</think>');
+  fToolCall := NeedToken(aTokenizer, '<tool_call>');
+  fToolCallEnd := NeedToken(aTokenizer, '</tool_call>');
+end;
+
+function TQwen3OutputParser.Bytes(aId: integer): RawUtf8;
+var
+  b: RawByteString;
+begin
+  b := fTokenizer.TokenBytes(aId);
+  FastSetString(result, pointer(b), length(b));
+end;
+
+procedure TQwen3OutputParser.Send(var aDelta: TLlmStreamDelta);
+begin
+  if not Assigned(fOnDelta) then
+    exit;
+  if not fRoleSent then
+  begin
+    aDelta.Role := 'assistant';
+    fRoleSent := true;
+  end;
+  fOnDelta(aDelta);
+end;
+
+procedure TQwen3OutputParser.SendContent(const aText: RawUtf8);
+var
+  d: TLlmStreamDelta;
+begin
+  if (aText = '') or not Assigned(fOnDelta) then
+    exit;
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.ContentDelta := aText;
+  Send(d);
+end;
+
+procedure TQwen3OutputParser.SendReasoning(const aText: RawUtf8);
+var
+  d: TLlmStreamDelta;
+begin
+  if (aText = '') or not Assigned(fOnDelta) then
+    exit;
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  // the chunk shape of vLLM's reasoning parser
+  d.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,
+    'delta', _ObjFast(['reasoning_content', aText])])])]);
+  Send(d);
+end;
+
+procedure TQwen3OutputParser.EndToolCall;
+var
+  call: TLlmToolCall;
+  d: TLlmStreamDelta;
+  n: PtrInt;
+begin
+  if not ParseQwen3ToolCall(fToolBody, call.Name, call.ArgumentsJson) then
+  begin
+    // not a call the agent could run: keep it visible as text
+    SendContent(fContent.Add(Bytes(fToolCall) + fToolBody + Bytes(fToolCallEnd)));
+    exit;
+  end;
+  // a call: the newlines before it are the template's, which writes its own
+  SendContent(fContent.Flush(true));
+  call.Id := 'call_' + CardinalToHexLower(Random32) + CardinalToHexLower(Random32);
+  n := length(fCalls);
+  SetLength(fCalls, n + 1);
+  fCalls[n] := call;
+  if not Assigned(fOnDelta) then
+    exit;
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.HasToolCall := true;
+  d.ToolCallIndex := n;
+  d.ToolCallId := call.Id;
+  d.ToolCallName := call.Name;
+  d.ToolCallArgsDelta := call.ArgumentsJson; // complete: parsed as a whole
+  Send(d);
+end;
+
+function TQwen3OutputParser.Push(aId: integer): boolean;
+begin
+  if fFinished then
+    ELlmClient.RaiseUtf8('%.Push after Finish', [self]);
+  if (aId < 0) or (aId >= fTokenizer.VocabSize) then
+    ELlmClient.RaiseUtf8('%.Push: the model generated id %, outside the ' +
+      'tokenizer (0..%)', [self, aId, fTokenizer.VocabSize - 1]);
+  inc(fCount);
+  result := (aId = fStop) or ((fEndOfText >= 0) and (aId = fEndOfText));
+  if result then
+    exit;
+  if fState = qpsStart then
+    if aId = fThink then
+    begin
+      fState := qpsReasoning;
+      exit;
+    end
+    else
+      fState := qpsContent;
+  case fState of
+    qpsReasoning:
+      if aId = fThinkEnd then
+      begin
+        SendReasoning(fReasoning.Flush(true));
+        fState := qpsContent;
+      end
+      else
+        SendReasoning(fReasoning.Add(Bytes(aId)));
+    qpsContent:
+      if aId = fToolCall then
+      begin
+        fToolBody := '';
+        fState := qpsToolCall;
+      end
+      else
+        SendContent(fContent.Add(Bytes(aId)));
+    qpsToolCall:
+      if aId = fToolCallEnd then
+      begin
+        EndToolCall;
+        fState := qpsContent;
+      end
+      else
+        fToolBody := fToolBody + Bytes(aId);
+  end;
+end;
+
+procedure TQwen3OutputParser.Finish(aLength: boolean; aPromptTokens: integer);
+var
+  d: TLlmStreamDelta;
+begin
+  if fFinished then
+    ELlmClient.RaiseUtf8('%.Finish called twice', [self]);
+  fFinished := true;
+  case fState of
+    qpsReasoning:
+      SendReasoning(fReasoning.Flush(true));
+    qpsToolCall:
+      // cut before </tool_call>: no call, the text stays
+      SendContent(fContent.Add(Bytes(fToolCall) + fToolBody));
+  end;
+  // after tool calls, trailing newlines only separated them
+  SendContent(fContent.Flush(fCalls <> nil));
+  Finalize(fResponse);
+  FillCharFast(fResponse, SizeOf(fResponse), 0);
+  fResponse.Content := fContent.Text;
+  fResponse.ToolCalls := fCalls;
+  if aLength then
+    fResponse.FinishReason := lfrLength
+  else if fCalls <> nil then
+    fResponse.FinishReason := lfrToolCalls
+  else
+    fResponse.FinishReason := lfrStop;
+  fResponse.Usage.PromptTokens := aPromptTokens;
+  fResponse.Usage.CompletionTokens := fCount;
+  fResponse.Usage.TotalTokens := aPromptTokens + fCount;
+  if fReasoning.Text <> '' then
+    // the message shape of vLLM's reasoning parser
+    fResponse.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,
+      'message', _ObjFast(['role', 'assistant',
+        'reasoning_content', fReasoning.Text])])])]);
+  if not Assigned(fOnDelta) then
+    exit;
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.FinishReason := FinishReasonText(fResponse.FinishReason);
+  d.HasUsage := true;
+  d.Usage := fResponse.Usage;
+  Send(d);
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.Done := true;
+  Send(d);
+end;
+
+
+{ request helpers }
+
+function NativeEnableThinking(const aRequest: TLlmChatRequest;
+  aDefault: boolean): boolean;
+var
+  kw: PDocVariantData;
+  i: integer;
+begin
+  result := aDefault;
+  kw := _Safe(aRequest.Extra)^.O['chat_template_kwargs'];
+  i := kw^.GetValueIndex('enable_thinking');
+  if i < 0 then
+    exit;
+  if TVarData(kw^.Values[i]).VType <> varBoolean then
+    ELlmClient.RaiseUtf8('chat_template_kwargs.enable_thinking: % is no boolean',
+      [VariantSaveJson(kw^.Values[i])]);
+  result := kw^.Values[i];
+end;
+
+function NativeChatPrompt(aTemplate: TQwen3ChatTemplate;
+  const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
+var
+  i: PtrInt;
+  thinking: boolean;
+begin
+  if aRequest.Messages = nil then
+    ELlmClient.RaiseUtf8('NativeChatPrompt: no messages', []);
+  for i := 0 to high(aRequest.Messages) do
+    if aRequest.Messages[i].Images <> nil then
+      ELlmClient.RaiseUtf8('NativeChatPrompt: message % carries images - ' +
+        'the native engine runs text models only', [i]);
+  if aRequest.ResponseFormat <> '' then
+    ELlmClient.RaiseUtf8('NativeChatPrompt: ResponseFormat is not supported ' +
+      'by the native engine yet (no constrained decoding)', []);
+  thinking := NativeEnableThinking(aRequest, aDefaultThinking);
+  try
+    result := aTemplate.Encode(aRequest.Messages, aRequest.Tools,
+      {addgenerationprompt=}true, thinking);
+  except
+    on E: EInferError do
+      ELlmClient.RaiseUtf8('NativeChatPrompt: %', [E.Message]);
+  end;
+end;
+
+function ParseQwen3ToolCall(const aBody: RawUtf8;
+  out aName, aArguments: RawUtf8): boolean;
+var
+  body, canon: RawUtf8;
+  doc: TDocVariantData;
+  iname, iargs: integer;
+  p, e: PUtf8Char;
+begin
+  result := false;
+  aName := '';
+  aArguments := '';
+  body := TrimU(aBody);
+  if (body = '') or (body[1] <> '{') then
+    exit;
+  try
+    // strict JSON (no duplicate key, valid UTF-8, no raw control character)
+    // in json.dumps formatting, keys unescaped; a float json.dumps would
+    // round stays as the model wrote it
+    canon := PythonJson(body, {keepinexactfloats=}true);
+  except
+    on EInferError do
+      exit;
+  end;
+  // two top-level keys, counted on the text: the document skips a key with
+  // an empty name
+  if JsonObjectPropCount(PUtf8Char(pointer(canon)) + 1, nil, true) <> 2 then
+    exit;
+  // only names and kinds are read: JSON_FAST keeps a float like 1e999 as text
+  // where a double would refuse it
+  if not doc.InitJson(canon, JSON_FAST) or
+     not doc.IsObject or
+     (doc.Count <> 2) then
+    exit;
+  // exact names: the document lookup would ignore the case
+  iname := -1;
+  iargs := -1;
+  if doc.Names[0] = 'name' then
+    iname := 0
+  else if doc.Names[1] = 'name' then
+    iname := 1;
+  if doc.Names[0] = 'arguments' then
+    iargs := 0
+  else if doc.Names[1] = 'arguments' then
+    iargs := 1;
+  if (iname < 0) or (iargs < 0) or
+     not _Safe(doc.Values[iargs])^.IsObject then
+    exit;
+  // the kind of the name on the text: JSON_FAST keeps a number it cannot hold
+  // (0.00001) as a string too
+  p := JsonObjectItem(pointer(canon), 'name');
+  if (p = nil) or (p^ <> '"') then
+    exit;
+  VariantToUtf8(doc.Values[iname], aName);
+  if aName = '' then
+    exit;
+  // the arguments as they stand in the canonical text, digits untouched
+  p := JsonObjectItem(pointer(canon), 'arguments');
+  if p = nil then
+    exit;
+  e := GotoEndJsonItem(p);
+  if e = nil then
+    exit;
+  FastSetString(aArguments, p, e - p);
+  result := true;
+end;
+
+
+{ NativeDecode }
+
+procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser);
+var
+  logits: TSingleDynArray;
+  ctx: TQwen3Context;
+  n: PtrInt;
+  id: integer;
+  stopped: boolean;
+begin
+  if aPrompt = nil then
+    ELlmClient.RaiseUtf8('NativeDecode: empty prompt', []);
+  if length(aPrompt) > aModel.Config.MaxPositions then
+    ELlmClient.RaiseUtf8('NativeDecode: a prompt of % tokens exceeds the ' +
+      'context of %', [length(aPrompt), aModel.Config.MaxPositions]);
+  if aMaxNew <= 0 then
+    ELlmClient.RaiseUtf8('NativeDecode: % new tokens', [aMaxNew]);
+  // token n is fed at position P + n - 1 only when another one follows
+  if aMaxNew > aModel.Config.MaxPositions - length(aPrompt) + 1 then
+    aMaxNew := aModel.Config.MaxPositions - length(aPrompt) + 1;
+  SetLength(logits, aModel.Config.VocabSize);
+  ctx := aModel.NewContext;
+  try
+    aModel.Forward(ctx, pointer(aPrompt), length(aPrompt), pointer(logits));
+    n := 0;
+    repeat
+      id := InferArgMax(pointer(logits), aModel.Config.VocabSize);
+      inc(n);
+      stopped := aParser.Push(id);
+      if stopped or (n = aMaxNew) then
+        break;
+      aModel.Forward(ctx, @id, 1, pointer(logits));
+    until false;
+  finally
+    ctx.Free;
+  end;
+  aParser.Finish(not stopped, length(aPrompt));
+end;
+
+
+{ TNativeLlmClient }
+
+constructor TNativeLlmClient.Create(const aFolder: TFileName;
+  const aModelName: RawUtf8; aBackend: TInferBackend);
+var
+  dir: TFileName;
+begin
+  inherited Create;
+  dir := IncludeTrailingPathDelimiter(aFolder);
+  fMaxTokens := NATIVE_LLM_DEFAULT_MAX_TOKENS;
+  fEnableThinking := true;
+  fBackend := aBackend;
+  if fBackend = nil then
+  begin
+    fBackend := TInferCpuFastBackend.Create;
+    fOwnBackend := true;
+  end;
+  fTokenizer := TBpeTokenizer.Create(dir + 'tokenizer.json');
+  fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
+  fModel := TQwen3Model.Create(dir, fBackend);
+  // the stop and control tokens: fail at load, not at the first request
+  TQwen3OutputParser.Create(fTokenizer).Free;
+  fConfig.DefaultModel := aModelName;
+  if fConfig.DefaultModel = '' then
+    fConfig.DefaultModel := StringToUtf8(ExtractFileName(ExcludeTrailingPathDelimiter(aFolder)));
+end;
+
+destructor TNativeLlmClient.Destroy;
+begin
+  fModel.Free;
+  fTemplate.Free;
+  fTokenizer.Free;
+  if fOwnBackend then
+    fBackend.Free;
+  inherited Destroy;
+end;
+
+procedure TNativeLlmClient.Generate(const aRequest: TLlmChatRequest;
+  aParser: TQwen3OutputParser);
+var
+  maxNew: PtrInt;
+begin
+  maxNew := aRequest.MaxTokens;
+  if maxNew <= 0 then
+    maxNew := fMaxTokens;
+  NativeDecode(fModel, NativeChatPrompt(fTemplate, aRequest, fEnableThinking),
+    maxNew, aParser);
+end;
+
+function TNativeLlmClient.ChatComplete(
+  const aRequest: TLlmChatRequest): TLlmChatResponse;
+var
+  parser: TQwen3OutputParser;
+begin
+  parser := TQwen3OutputParser.Create(fTokenizer);
+  try
+    Generate(aRequest, parser);
+    result := parser.Response;
+    result.Model := fConfig.DefaultModel;
+  finally
+    parser.Free;
+  end;
+end;
+
+procedure TNativeLlmClient.ChatStream(const aRequest: TLlmChatRequest;
+  const aOnDelta: TLlmStreamDeltaEvent);
+var
+  parser: TQwen3OutputParser;
+begin
+  parser := TQwen3OutputParser.Create(fTokenizer, aOnDelta);
+  try
+    Generate(aRequest, parser);
+  finally
+    parser.Free;
+  end;
+end;
+
+function TNativeLlmClient.Config: TLlmProviderConfig;
+begin
+  result := fConfig;
+end;
+
+end.
