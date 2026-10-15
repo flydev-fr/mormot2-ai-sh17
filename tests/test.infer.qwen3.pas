@@ -50,6 +50,13 @@ type
       const aPrefix: RawUtf8; aAtol, aRtol: double; aAllLogits: boolean);
     /// the real model folder, '' (and SKIP or a failure) when absent
     function RealModel: TFileName;
+    /// the tiny Qwen3 quantized to aType: Exact = the scalar reference bit for
+    // bit, the float path within aFloatTol, both against FP32 within aRefTol
+    procedure TinyQuantized(aType: TInferDType; aFloatTol, aRefTol, aRefCos: double);
+    /// Qwen3-0.6B quantized to aType against the FP32 reference: last logits
+    // within aCos / aMaxAbs, greedy equal up to a step the reference was less
+    // than aMargin sure of
+    procedure Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs, aMargin: double);
   published
     /// the tiny Qwen3 (BF16 weights): every state and all logits
     procedure TinyForwardMatchesReference;
@@ -80,6 +87,10 @@ type
     /// Qwen3-0.6B with Q8_0 matrices against the FP32 reference (phase 3):
     // logits within a tolerance, greedy equal up to the first near tie
     procedure Qwen3Q8AgainstReference;
+    /// the tiny Qwen3 with Q4_0 layers (and a Q8_0 head)
+    procedure TinyQ4;
+    /// Qwen3-0.6B with Q4_0 layers against the FP32 reference
+    procedure Qwen3Q4AgainstReference;
   end;
 
 
@@ -819,7 +830,8 @@ begin
   end;
 end;
 
-procedure TTestInferQwen3.TinyQ8;
+procedure TTestInferQwen3.TinyQuantized(aType: TInferDType; aFloatTol, aRefTol,
+  aRefCos: double);
 var
   dir: TFileName;
   ref: TInferRefSet;
@@ -841,10 +853,10 @@ begin
   b := nil;
   c := nil;
   try
-    a := TQwen3Model.Create(dir, fCpu, idtQ8_0);
-    b := TQwen3Model.Create(dir, exact, idtQ8_0);
-    c := TQwen3Model.Create(dir, fFast, idtQ8_0);
-    Check(a.Weights = idtQ8_0, 'Q8_0 matrices');
+    a := TQwen3Model.Create(dir, fCpu, aType);
+    b := TQwen3Model.Create(dir, exact, aType);
+    c := TQwen3Model.Create(dir, fFast, aType);
+    Check(a.Weights = aType, 'quantized matrices');
     v := a.Config.VocabSize;
     for k := 0 to 2 do
     begin
@@ -866,12 +878,13 @@ begin
       end;
       Check(CompareMem(pointer(la), pointer(lb), n * v * SizeOf(single)),
         'Exact on all cores = the scalar reference, bit for bit');
-      cmp := InferCompare(pointer(lc), pointer(la), n * v, 2e-2, 1e-2);
-      CheckUtf8(InferCompareOk(cmp), 'case % float path: %', [k, InferCompareText(cmp)]);
+      cmp := InferCompare(pointer(lc), pointer(la), n * v, aFloatTol, aFloatTol / 2);
+      CheckUtf8(InferCompareOk(cmp), 'case % % float path: %',
+        [k, INFER_DTYPE_NAME[aType], InferCompareText(cmp)]);
       cmp := InferCompare(pointer(la), ref.F32(FormatUtf8('case%.logits', [k]), m),
-        n * v, 0.05, 0.05);
-      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999), 'case % Q8_0 vs FP32: %',
-        [k, InferCompareText(cmp)]);
+        n * v, aRefTol, aRefTol);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > aRefCos), 'case % % vs FP32: %',
+        [k, INFER_DTYPE_NAME[aType], InferCompareText(cmp)]);
     end;
     // the untied head: its own matrix quantized, not the embedding
     FreeAndNil(c);
@@ -882,7 +895,7 @@ begin
     dir := MakePath([dir, 'untied'], true);
     ref.Free;
     ref := TInferRefSet.CreateFromFolder(dir);
-    a := TQwen3Model.Create(dir, fCpu, idtQ8_0);
+    a := TQwen3Model.Create(dir, fCpu, aType);
     Check(not a.Config.TiedEmbeddings, 'untied');
     ids := ref.I32('case0.ids', n);
     v := a.Config.VocabSize;
@@ -893,9 +906,11 @@ begin
     finally
       ca.Free;
     end;
-    cmp := InferCompare(pointer(la), ref.F32('case0.logits', m), n * v, 0.05, 0.05);
-    CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999),
-      'untied Q8_0 vs the FP32 reference: %', [InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(la), ref.F32('case0.logits', m), n * v, aRefTol,
+      aRefTol);
+    CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > aRefCos),
+      'untied % vs the FP32 reference: %', [INFER_DTYPE_NAME[aType],
+      InferCompareText(cmp)]);
   finally
     c.Free;
     b.Free;
@@ -905,7 +920,8 @@ begin
   end;
 end;
 
-procedure TTestInferQwen3.Qwen3Q8AgainstReference;
+procedure TTestInferQwen3.Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs,
+  aMargin: double);
 var
   dir, refdir: TFileName;
   ref: TInferRefSet;
@@ -931,8 +947,9 @@ begin
   model := nil;
   try
     timer.Start;
-    model := TQwen3Model.Create(dir, fFast, idtQ8_0);
-    AddConsole(FormatString('Q8_0 model quantized in %', [timer.Stop]));
+    model := TQwen3Model.Create(dir, fFast, aType);
+    AddConsole(FormatString('% model quantized in %', [INFER_DTYPE_NAME[aType],
+      timer.Stop]));
     prompts := ref.Manifest^.A['prompts'];
     for i := 0 to prompts^.Count - 1 do
     begin
@@ -964,37 +981,69 @@ begin
       if diff < m then
         margin := margins^[diff];
       if (diff < m) and (diff < length(mine)) then
-        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, greedy equal for ' +
-          '% of % tokens, reference margin there % (Q8_0 took %, reference %)',
-          [p^.U['id'], cmp.Cosine, cmp.MaxAbs, diff, m, margin, mine[diff],
-           want^[diff]]))
+        AddConsole(FormatString('% %: logits cos % maxabs %, greedy equal for ' +
+          '% of % tokens, reference margin there % (took %, reference %)',
+          [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.Cosine, cmp.MaxAbs, diff, m,
+           margin, mine[diff], want^[diff]]))
       else if diff < m then
-        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, stopped after % ' +
-          'of % tokens, reference margin there %', [p^.U['id'], cmp.Cosine,
-          cmp.MaxAbs, diff, m, margin]))
+        AddConsole(FormatString('% %: logits cos % maxabs %, stopped after % ' +
+          'of % tokens, reference margin there %', [p^.U['id'],
+          INFER_DTYPE_NAME[aType], cmp.Cosine, cmp.MaxAbs, diff, m, margin]))
       else
-        AddConsole(FormatString('% Q8_0: logits cos % maxabs %, greedy equal for ' +
-          'all % tokens', [p^.U['id'], cmp.Cosine, cmp.MaxAbs, m]));
-      // the gate of Q8_0, measured 2026-10-15 on the 193 tokens of chat_tool,
-      // the most sensitive prompt: cosine 0.9935 and max error 1.72 in exact
-      // (double) arithmetic - the same bits on aarch64 and x86_64 - and 0.9965 /
-      // 1.36 with NEON, 0.9868 / 2.11 with AVX2; float against exact Q8_0
-      // alone: cosine 0.998 to 0.999, up to 0.95 apart on both platforms (likely
-      // because a changed rounding flips single int8 activations of the next
-      // layer - not measured inside).
-      // Greedy leaves the FP32 tokens only where the reference itself was less
-      // than 0.28 sure. A broken quantizer fails all three by far (shifted rows:
-      // cosine 0.23, max error 24)
-      CheckUtf8(cmp.Cosine >= 0.98, '% Q8_0 logits cosine %', [p^.U['id'], cmp.Cosine]);
-      CheckUtf8(cmp.MaxAbs <= 3, '% Q8_0 logits max error %', [p^.U['id'], cmp.MaxAbs]);
-      CheckUtf8((diff >= m) or (margin < 0.5),
-        '% Q8_0 greedy leaves the reference at step % where it was % sure',
-        [p^.U['id'], diff, margin]);
+        AddConsole(FormatString('% %: logits cos % maxabs %, greedy equal for ' +
+          'all % tokens', [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.Cosine,
+          cmp.MaxAbs, m]));
+      CheckUtf8(cmp.Cosine >= aCos, '% % logits cosine %',
+        [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% % logits max error %',
+        [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < aMargin),
+        '% % greedy leaves the reference at step % where it was % sure',
+        [p^.U['id'], INFER_DTYPE_NAME[aType], diff, margin]);
     end;
   finally
     model.Free;
     ref.Free;
   end;
+end;
+
+procedure TTestInferQwen3.TinyQ8;
+begin
+  TinyQuantized(idtQ8_0, 2e-2, 0.05, 0.999);
+end;
+
+procedure TTestInferQwen3.TinyQ4;
+begin
+  // 4 bits of random weights: measured 2026-10-15 cosine 0.959 to 0.995 and up
+  // to 0.77 apart from FP32 - the gate is the real model, here the bits of
+  // Exact and the float path count
+  TinyQuantized(idtQ4_0, 2e-2, 1, 0.9);
+end;
+
+procedure TTestInferQwen3.Qwen3Q8AgainstReference;
+begin
+  // the gate of Q8_0, measured 2026-10-15 on the 193 tokens of chat_tool,
+  // the most sensitive prompt: cosine 0.9935 and max error 1.72 in exact
+  // (double) arithmetic - the same bits on aarch64 and x86_64 - and 0.9965 /
+  // 1.36 with NEON, 0.9868 / 2.11 with AVX2; float against exact Q8_0
+  // alone: cosine 0.998 to 0.999, up to 0.95 apart on both platforms (likely
+  // because a changed rounding flips single int8 activations of the next
+  // layer - not measured inside).
+  // Greedy leaves the FP32 tokens only where the reference itself was less
+  // than 0.28 sure. A broken quantizer fails all three by far (shifted rows:
+  // cosine 0.23, max error 24)
+  Qwen3Quantized(idtQ8_0, 0.98, 3, 0.5);
+end;
+
+procedure TTestInferQwen3.Qwen3Q4AgainstReference;
+begin
+  // Q4_0 layers, Q8_0 head, measured 2026-10-15: cosine 0.764 (chat_tool) to
+  // 0.959 and max error up to 9.6 with NEON, 0.7636 to 0.956 and up to 9.9 with
+  // AVX2 - 4 bits are too coarse for a 0.6B model:
+  // greedy leaves the reference even where it was 1.94 sure (raw_fox, step 1),
+  // and chat_tool answers instead of calling the tool. No greedy condition then;
+  // the bounds still catch a broken quantizer or kernel by far
+  Qwen3Quantized(idtQ4_0, 0.7, 12, 1e9);
 end;
 
 procedure TTestInferQwen3.Qwen3GreedyMatchesReference;

@@ -711,7 +711,39 @@ Der M2 Pro dekodiert 9 bis 33 % schneller als der Snapdragon (vermutlich die hö
 Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt auch unter macOS
 (`getrusage`).
 
-- Offen in Phase 3: Q4/K-Quants (GGUF), Benchmark auf x86_64 (RTX-Rechner).
+**3e-1, erledigt 2026-10-15: Q4_0 (experimentell).**
+
+- `idtQ4_0`: 32 Werte je Block, eine FP16-Skala, Nibbles (18 Bytes). Der Quantisierer
+  `InferQuantizeRowQ4_0` liefert die Bytes von ggmls `quantize_row_q4_0_ref` (d = der
+  vorzeichenbehaftete erste Wert größten Betrags / −8, q = min(15, trunc(x/d + 8,5)),
+  jeder Schritt in Single), `InferRowToF32` dequantisiert, der GGUF-Leser nimmt Q4_0
+  (ggml-Typ 2) an.
+- `Linear` mit Q4_0: Ein Q4_0-Block ist verlustfrei ein Q8_0-Block mit derselben Skala
+  (q − 8). Das Referenz-Backend entpackt die Matrix, das schnelle je Kachel von 16
+  Zeilen; danach rechnen die Q8_0-Kernel unverändert, `Exact` bleibt bitgleich.
+- Qwen3: `TQwen3Model.Create(…, idtQ4_0)` quantisiert die Layer nach Q4_0, den Kopf nach
+  Q8_0 (wie llama.cpp den Ausgabekopf feiner hält).
+- Prüfung gegen ggml selbst (neues Referenzziel `q4` in `tools/infer-ref`): Bytes des
+  Quantisierers (erster größter Betrag mit Vorzeichen, Summen genau auf .5 und ganzen
+  Zahlen, Nullblock, winzige und große Werte, Kappung bei 15), Dequantisierung, Linear
+  gegen `ggml_vec_dot_q4_0_q8_0`.
+- Ergebnis auf Qwen3-0.6B: zu grob. Die Logits liegen bei Kosinus 0,76 bis 0,96 (Fehler
+  bis 9,6), Greedy verlässt die Referenz teils schon beim zweiten Token, `chat_tool`
+  ruft das Tool nicht mehr auf. Das Gate prüft deshalb nur Schranken, die ein kaputter
+  Quantisierer weit verfehlt.
+- **Offen: eigene Kernel.** Ohne sie dekodiert Q4_0 halb so schnell wie Q8_0 (31 statt 63
+  Tokens/s, Snapdragon): Das Entpacken in Pascal je Kachel und Token kostet mehr, als die
+  halbe Speicherbandbreite spart. ggml löst das mit fusionierten Kerneln (die Nibbles in
+  den Registern entpackt und gleich multipliziert, NEON und AVX2) und auf ARM zusätzlich
+  mit Repacking (Q4_0-Zeilen beim Laden zu 4×4 oder 8×4 verschränkt, ein Kernel rechnet
+  4 oder 8 Zeilen). Sinnvoll vor allem für größere Qwen3-Modelle (4B, 8B), bei denen 4 Bit
+  qualitativ reichen. Der Speicher sinkt erst mit fertig quantisierten GGUF-Dateien
+  spürbar (heute 1,9 statt 2,1 GB, weil die BF16-Datei gemappt bleibt).
+- Weiter (Entscheid 2026-10-15): 3e-2 Qwen3 direkt aus GGUF laden, 3e-3 Q4_K/Q6_K (die
+  Mischung Q4_K_M) mit fusionierten NEON- und AVX2-Kerneln nach ggml-Vorbild.
+
+- Offen in Phase 3: GGUF-Laden und K-Quants (3e-2, 3e-3), Q4_0-Kernel (s. o.),
+  Benchmark auf x86_64 (RTX-Rechner).
 
 ### Phase 4 — GPU
 

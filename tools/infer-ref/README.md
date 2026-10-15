@@ -22,7 +22,8 @@ VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirement
 ```
 
 Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate),
-dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens`.
+dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens` und für Phase 3e `q4` (Q4_0 aus
+ggml selbst: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`).
 Mit `bge-m3` oder `tokens` lädt das Skript BAAI/bge-m3 in der festen Revision
 `5617a9f61b028005a4858fdac845db406aefb181` (rund 2,3 GB in den Hugging-Face-Cache).
 
@@ -36,7 +37,7 @@ GGUF `vendor/models/bge-m3-q8_0.gguf` (mit `LAI_GGUF` umlenkbar); das Skript bri
 wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
 
 ```bash
-LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 tiny-gguf lembed-tokens
+LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 tiny-gguf lembed-tokens
 ```
 
 ## Qwen3 (Phase 2)

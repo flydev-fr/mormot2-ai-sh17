@@ -730,6 +730,7 @@ GGUF_Q8 = os.environ.get("LAI_GGUF") or os.path.join(ROOT, "vendor", "models",
 # the file of reference contract v1 (tests/data/embed-de/reference/manifest.json)
 GGUF_Q8_SHA256 = "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173"
 Q8_BLOCK = 34  # bytes of one Q8_0 block: FP16 scale + 32 int8
+Q4_BLOCK = 18  # bytes of one Q4_0 block: FP16 scale + 32 nibbles
 
 
 class Ggml:
@@ -757,16 +758,22 @@ class Ggml:
                                                     ctypes.c_size_t, vp, ctypes.c_size_t,
                                                     ctypes.c_int]
         self.cpu.ggml_vec_dot_q8_0_q8_0.restype = None
+        self.base.quantize_row_q4_0_ref.argtypes = [fp, vp, i64]
+        self.base.quantize_row_q4_0_ref.restype = None
+        self.base.dequantize_row_q4_0.argtypes = [vp, fp, i64]
+        self.base.dequantize_row_q4_0.restype = None
+        self.cpu.ggml_vec_dot_q4_0_q8_0.argtypes = self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes
+        self.cpu.ggml_vec_dot_q4_0_q8_0.restype = None
         self.base.ggml_fp32_to_fp16.argtypes = [ctypes.c_float]
         self.base.ggml_fp32_to_fp16.restype = ctypes.c_uint16
         self.libs = {n: sha256_file(os.path.join(GGML_DIR, n))
                      for n in ["libggml-base.so", "libggml-cpu.so"]}
 
-    def _quant(self, fn, x):
+    def _quant(self, fn, x, block=Q8_BLOCK):
         x = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
         if x.size % 32:
-            raise ValueError("Q8_0 needs whole blocks")
-        out = self.ct.create_string_buffer(x.size // 32 * Q8_BLOCK)
+            raise ValueError("Q8_0 / Q4_0 need whole blocks")
+        out = self.ct.create_string_buffer(x.size // 32 * block)
         fn(x.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), out, x.size)
         return out.raw
 
@@ -777,6 +784,20 @@ class Ggml:
     def quant_ref(self, x):
         """weights, as a GGUF writer quantizes them"""
         return self._quant(self.base.quantize_row_q8_0_ref, x)
+
+    def quant_q4(self, x):
+        """weights, as a GGUF writer quantizes them to Q4_0"""
+        return self._quant(self.base.quantize_row_q4_0_ref, x, Q4_BLOCK)
+
+    def dequant_q4(self, raw, n):
+        y = np.zeros(n, dtype=np.float32)
+        self.base.dequantize_row_q4_0(raw, y.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), n)
+        return y
+
+    def dot_q4(self, n, w, x):
+        s = self.ct.c_float()
+        self.cpu.ggml_vec_dot_q4_0_q8_0(n, self.ct.byref(s), 0, w, 0, x, 0, 1)
+        return s.value
 
     def dequant(self, raw, n):
         y = np.zeros(n, dtype=np.float32)
@@ -846,6 +867,57 @@ def q8():
                                     for o in range(n_out)]), "dequantize_row_q8_0 of the weights")
     blob.write(os.path.join(OUT, "q8"), {
         "dataset": "q8", "environment": environment(),
+        "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
+                 "note": "the ggml build of the lembed oracle"}})
+
+
+def q4():
+    """Q4_0 fixtures from ggml itself (phase 3e): the reference quantizer of a GGUF
+    writer, dequantization, and the Q4_0 x Q8_0 dot product of ggml-cpu"""
+    print("q4")
+    g = Ggml()
+    rng = np.random.default_rng(TINY_SEED + 4)
+    f32 = lambda a: np.asarray(a, dtype=np.float32)
+    blob = Blob()
+    x = f32(rng.standard_normal((8, 96)))
+    # d = max / -8 with the signed value of the first largest magnitude
+    x[0, :32] = 0.25
+    x[0, 0] = -8.0             # d = 1: x + 8.5 lands on .5 and on whole numbers
+    x[0, 1:12] = [0.5, -0.5, 6.5, 7.0, -7.5, 1.0, -1.0, 7.49, -8.0, 3.5, -3.5]
+    x[1, :32] = rng.standard_normal(32)
+    x[1, 3], x[1, 9] = -5.0, 5.0   # equal magnitudes: the first one (negative) wins
+    x[1, 32:64] = rng.standard_normal(32)
+    x[1, 40], x[1, 41] = 5.0, -5.0  # the first one (positive) wins
+    x[2, :32] = 0                  # a zero block
+    x[3] *= 1e-6
+    x[4] *= 1e4
+    x[5, 64:96] = f32(rng.standard_normal(32) * 1e-30)
+    x[6, 32:64] = 7.0              # one value repeated: all at the clip
+    blob.add("quant/x", x)
+    blob.add("quant/blocks", np.frombuffer(b"".join(g.quant_q4(r) for r in x), dtype=np.uint8)
+             .reshape(8, 3 * Q4_BLOCK), "quantize_row_q4_0_ref per row")
+    blob.add("dequant/y", np.stack([g.dequant_q4(g.quant_q4(r), 96) for r in x]),
+             "dequantize_row_q4_0 of those blocks")
+    # Q4_0 linear: weights from the reference quantizer, activations quantized by ggml-cpu
+    n_in, n_out = 128, 6
+    xs = f32(rng.standard_normal((3, n_in)))
+    w = f32(rng.standard_normal((n_out, n_in)) * 0.2)
+    b = f32(rng.standard_normal(n_out))
+    wq = b"".join(g.quant_q4(r) for r in w)
+    rb = n_in // 32 * Q4_BLOCK
+    y = np.zeros((3, n_out), dtype=np.float64)
+    for r in range(3):
+        xq = g.quant(xs[r])
+        for o in range(n_out):
+            y[r, o] = g.dot_q4(n_in, wq[o * rb:(o + 1) * rb], xq)
+    blob.add("linear/x", xs)
+    blob.add("linear/weight", np.frombuffer(wq, dtype=np.uint8).reshape(n_out, -1),
+             "[out, in/32 blocks] Q4_0")
+    blob.add("linear/bias", b)
+    blob.add("linear/y", y + b.astype(np.float64),
+             "ggml_vec_dot_q4_0_q8_0 (float sums) + bias in float64")
+    blob.write(os.path.join(OUT, "q4"), {
+        "dataset": "q4", "environment": environment(),
         "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
                  "note": "the ggml build of the lembed oracle"}})
 
@@ -1138,8 +1210,8 @@ def lembed_tokens():
 
 def main():
     setup_determinism()
-    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens", "q8", "tiny-gguf",
-                                 "lembed-tokens"}
+    what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens", "q8", "q4",
+                                 "tiny-gguf", "lembed-tokens"}
     if "ops" in what:
         ops()
     if "tiny" in what:
@@ -1152,6 +1224,8 @@ def main():
         tokens(fetch_model())
     if "q8" in what:
         q8()
+    if "q4" in what:
+        q4()
     if "tiny-gguf" in what:
         tiny_gguf()
     if "lembed-tokens" in what:

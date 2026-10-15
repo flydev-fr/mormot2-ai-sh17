@@ -311,7 +311,7 @@ das Ranking ist identisch (Referenzvertrag v1 in docs/native-embeddings.md).
 8. Phase 3, Quantisierung und SIMD (3a ✓ 2026-10-15: Q8_0-Gewichte, F32 und Attention
    mit SIMD und Threads, Dekodieren 15-mal (F32) bzw. 22-mal (Q8_0) so schnell; 3b ✓
    2026-10-15: Sampler; 3c ✓ 2026-10-15: Prompt-Cache; 3d ✓ 2026-10-15: Normen/RoPE/SwiGLU
-   parallel; offen Q4/K-Quants)
+   parallel; 3e-1 ✓ Q4_0 experimentell; offen GGUF-Laden, K-Quants, Q4_0-Kernel)
 9. Phase 4, CUDA
 
 Details stehen in [docs/native-inference.md](docs/native-inference.md).

@@ -122,6 +122,7 @@ type
     fBackend: TInferBackend;
     fOwned: array of TSingleDynArray; // BF16 tensors widened at load
     fOwnedQ8: array of array of TInferBlockQ8_0; // matrices quantized at load
+    fOwnedQ4: array of array of TInferBlockQ4_0;
     fWeights: TInferDType;
     fEmbedSrc: PInferTensor; // the embedding as stored: F32 or BF16
     fEmbed, fHead: TInferWeight;
@@ -132,7 +133,8 @@ type
     procedure LoadWeights;
     function Checked(const aName: RawUtf8; const aDims: array of Int64): PInferTensor;
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
-    function Matrix(const aName: RawUtf8; aRows, aCols: Int64): TInferWeight;
+    function Matrix(const aName: RawUtf8; aRows, aCols: Int64;
+      aType: TInferDType): TInferWeight;
     procedure Grow(aCtx: TQwen3Context; aTokens, aNew: PtrInt);
     procedure RopeFactors(aCtx: TQwen3Context; aRows, aFirstPos: PtrInt);
     procedure Attention(aCtx: TQwen3Context; aLayer, aRows: PtrInt);
@@ -140,9 +142,10 @@ type
     /// load <aFolder>config.json and <aFolder>model.safetensors
     // - raises EInferError when a setting is unsupported or a weight is missing
     // or shaped otherwise; aBackend is not owned
-    // - aWeights: idtF32 (the reference arithmetic of phase 2) or idtQ8_0 (every
-    // matrix quantized at load; needs the hidden, attention and feed-forward
-    // widths to be multiples of 32)
+    // - aWeights: idtF32 (the reference arithmetic of phase 2), idtQ8_0 (every
+    // matrix quantized at load) or idtQ4_0 (the layers in Q4_0, the head in
+    // Q8_0); both need the hidden, attention and feed-forward widths to be
+    // multiples of 32
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend;
       aWeights: TInferDType = idtF32);
     /// unmap the weights
@@ -178,7 +181,7 @@ type
     /// the backend the model computes with (not owned)
     property Backend: TInferBackend
       read fBackend;
-    /// the type of the matrices: idtF32 or idtQ8_0
+    /// the type of the layer matrices: idtF32, idtQ8_0 or idtQ4_0
     property Weights: TInferDType
       read fWeights;
   end;
@@ -246,7 +249,7 @@ begin
   fSerial := InterlockedIncrement(Qwen3ModelSerial);
   if aBackend = nil then
     EInferError.RaiseUtf8('%.Create: no backend', [self]);
-  if not (aWeights in [idtF32, idtQ8_0]) then
+  if not (aWeights in [idtF32, idtQ8_0, idtQ4_0]) then
     EInferError.RaiseUtf8('%.Create: weights as % not supported',
       [self, INFER_DTYPE_NAME[aWeights]]);
   fBackend := aBackend;
@@ -260,10 +263,11 @@ begin
      not fBackend.Supports(ioRope, idtF32) then
     EInferError.RaiseUtf8('%: the backend lacks a decoder operation', [self]);
   LoadConfig(IncludeTrailingPathDelimiter(aFolder) + 'config.json');
-  if (aWeights = idtQ8_0) and
+  if (aWeights <> idtF32) and
      ((fConfig.Hidden and 31 <> 0) or (fConfig.Intermediate and 31 <> 0) or
       ((fConfig.Heads * fConfig.HeadDim) and 31 <> 0)) then
-    EInferError.RaiseUtf8('%: Q8_0 needs widths that are multiples of 32', [self]);
+    EInferError.RaiseUtf8('%: % needs widths that are multiples of 32',
+      [self, INFER_DTYPE_NAME[aWeights]]);
   fFile := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(aFolder) +
     'model.safetensors');
   LoadWeights;
@@ -421,41 +425,62 @@ begin
   end;
 end;
 
-function TQwen3Model.Matrix(const aName: RawUtf8; aRows, aCols: Int64): TInferWeight;
+function TQwen3Model.Matrix(const aName: RawUtf8; aRows, aCols: Int64;
+  aType: TInferDType): TInferWeight;
 var
   t: PInferTensor;
   row: TSingleDynArray;
   nb, r, n, c: PtrInt;
+  d: word;
 begin
-  if fWeights = idtF32 then
+  if aType = idtF32 then
   begin
     result := InferWeight(Weight(aName, [aRows, aCols]), idtF32);
     exit;
   end;
-  // Q8_0: row by row through single precision, as ggml quantizes
+  // Q8_0 or Q4_0: row by row through single precision, as ggml quantizes
   t := Checked(aName, [aRows, aCols]);
   nb := aCols shr 5;
-  n := length(fOwnedQ8);
-  SetLength(fOwnedQ8, n + 1);
-  SetLength(fOwnedQ8[n], aRows * nb);
+  if aType = idtQ8_0 then
+  begin
+    n := length(fOwnedQ8);
+    SetLength(fOwnedQ8, n + 1);
+    SetLength(fOwnedQ8[n], aRows * nb);
+    result := InferWeight(pointer(fOwnedQ8[n]), idtQ8_0);
+  end
+  else
+  begin
+    n := length(fOwnedQ4);
+    SetLength(fOwnedQ4, n + 1);
+    SetLength(fOwnedQ4[n], aRows * nb);
+    result := InferWeight(pointer(fOwnedQ4[n]), idtQ4_0);
+  end;
   SetLength(row, aCols);
   for r := 0 to aRows - 1 do
   begin
     WidenRow(t, r, aCols, pointer(row));
-    // a NaN or an infinity has no Q8_0 form: refused, by its bits (no FPU)
+    // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
     for c := 0 to aCols - 1 do
       if PCardinalArray(row)^[c] and $7f800000 = $7f800000 then
         EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
           [self, aName, r, c]);
-    InferQuantizeRowQ8_0(pointer(row), aCols, @fOwnedQ8[n][r * nb]);
-    // a finite weight beyond 127 * 65504 still gets the FP16 scale +Inf (ggml
+    if aType = idtQ8_0 then
+      InferQuantizeRowQ8_0(pointer(row), aCols, @fOwnedQ8[n][r * nb])
+    else
+      InferQuantizeRowQ4_0(pointer(row), aCols, @fOwnedQ4[n][r * nb]);
+    // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
     // writes it too): every product with it would be Inf or NaN
     for c := r * nb to r * nb + nb - 1 do
-      if fOwnedQ8[n][c].d and $7fff >= $7c00 then
-        EInferError.RaiseUtf8('%: % has a weight beyond the Q8_0 range in row %',
-          [self, aName, r]);
+    begin
+      if aType = idtQ8_0 then
+        d := fOwnedQ8[n][c].d
+      else
+        d := fOwnedQ4[n][c].d;
+      if d and $7fff >= $7c00 then
+        EInferError.RaiseUtf8('%: % has a weight beyond the % range in row %',
+          [self, aName, INFER_DTYPE_NAME[aType], r]);
+    end;
   end;
-  result := InferWeight(pointer(fOwnedQ8[n]), idtQ8_0);
 end;
 
 procedure TQwen3Model.LoadWeights;
@@ -465,7 +490,13 @@ var
   p: RawUtf8;
   l: ^TQwen3Layer;
   head, emb: PInferTensor;
+  headType: TInferDType;
 begin
+  // with Q4_0 the head stays Q8_0, as llama.cpp keeps the output matrix finer
+  // than the layers: it decides every token
+  headType := fWeights;
+  if headType = idtQ4_0 then
+    headType := idtQ8_0;
   h := fConfig.Hidden;
   f := fConfig.Intermediate;
   qw := fConfig.Heads * fConfig.HeadDim;
@@ -492,11 +523,11 @@ begin
     if fWeights = idtF32 then
       fHead := fEmbed
     else
-      fHead := Matrix('model.embed_tokens.weight', fConfig.VocabSize, h);
+      fHead := Matrix('model.embed_tokens.weight', fConfig.VocabSize, h, headType);
   end
   else
   begin
-    fHead := Matrix('lm_head.weight', fConfig.VocabSize, h);
+    fHead := Matrix('lm_head.weight', fConfig.VocabSize, h, headType);
     inc(used);
   end;
   SetLength(fLayer, fConfig.Layers);
@@ -504,15 +535,15 @@ begin
   begin
     p := FormatUtf8('model.layers.%.', [i]);
     l := @fLayer[i];
-    l^.Q := Matrix(p + 'self_attn.q_proj.weight', qw, h);
-    l^.K := Matrix(p + 'self_attn.k_proj.weight', kvw, h);
-    l^.V := Matrix(p + 'self_attn.v_proj.weight', kvw, h);
-    l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw);
+    l^.Q := Matrix(p + 'self_attn.q_proj.weight', qw, h, fWeights);
+    l^.K := Matrix(p + 'self_attn.k_proj.weight', kvw, h, fWeights);
+    l^.V := Matrix(p + 'self_attn.v_proj.weight', kvw, h, fWeights);
+    l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw, fWeights);
     l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
     l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
-    l^.Gate := Matrix(p + 'mlp.gate_proj.weight', f, h);
-    l^.Up := Matrix(p + 'mlp.up_proj.weight', f, h);
-    l^.Down := Matrix(p + 'mlp.down_proj.weight', h, f);
+    l^.Gate := Matrix(p + 'mlp.gate_proj.weight', f, h, fWeights);
+    l^.Up := Matrix(p + 'mlp.up_proj.weight', f, h, fWeights);
+    l^.Down := Matrix(p + 'mlp.down_proj.weight', h, f, fWeights);
     l^.InputNorm := Weight(p + 'input_layernorm.weight', [h]);
     l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
     inc(used, 11);

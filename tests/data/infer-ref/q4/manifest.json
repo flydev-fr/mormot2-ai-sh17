@@ -1,0 +1,119 @@
+{
+ "dataset": "q4",
+ "environment": {
+  "created_utc": "2026-10-15T18:05:09Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  },
+  "note": "the ggml build of the lembed oracle"
+ },
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 8640,
+  "sha256": "a78d59f7029c199e386cb3c0c22f9bbcd8e8a81d0f786d827cc32663fa806d3e",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "quant/x",
+   "dtype": "f32",
+   "shape": [
+    8,
+    96
+   ],
+   "offset": 0,
+   "bytes": 3072,
+   "sha256": "03855ccb63e5645034905f94978d26da540aa064f3d4661a8126d94ffe4ed578"
+  },
+  {
+   "name": "quant/blocks",
+   "dtype": "u8",
+   "shape": [
+    8,
+    54
+   ],
+   "offset": 3072,
+   "bytes": 432,
+   "sha256": "bc51f552855032e381bc5e3f861b52448243dafb1919e5fc2e4113ad8e3ecf8a",
+   "note": "quantize_row_q4_0_ref per row"
+  },
+  {
+   "name": "dequant/y",
+   "dtype": "f32",
+   "shape": [
+    8,
+    96
+   ],
+   "offset": 3504,
+   "bytes": 3072,
+   "sha256": "893d3922418953f3b180b8543cad618d55fa988f8754a850e36da101d011b96e",
+   "note": "dequantize_row_q4_0 of those blocks"
+  },
+  {
+   "name": "linear/x",
+   "dtype": "f32",
+   "shape": [
+    3,
+    128
+   ],
+   "offset": 6576,
+   "bytes": 1536,
+   "sha256": "378dcbdc12eb2500098eb8db4f0533b826e07bede2c3374494d058b9f355cff6"
+  },
+  {
+   "name": "linear/weight",
+   "dtype": "u8",
+   "shape": [
+    6,
+    72
+   ],
+   "offset": 8112,
+   "bytes": 432,
+   "sha256": "d01fab7a364eed14806f630da156803245e5db592ebe824cc908f91d8ba1c41d",
+   "note": "[out, in/32 blocks] Q4_0"
+  },
+  {
+   "name": "linear/bias",
+   "dtype": "f32",
+   "shape": [
+    6
+   ],
+   "offset": 8544,
+   "bytes": 24,
+   "sha256": "462ee43e1c690b446d2e232f748e32381a52b21ca08e308b32426ad69b0d3807"
+  },
+  {
+   "name": "linear/y",
+   "dtype": "f32",
+   "shape": [
+    3,
+    6
+   ],
+   "offset": 8568,
+   "bytes": 72,
+   "sha256": "bb6457782741693f0b85cc73c61168fdc17897fdfd923afbd84accb488e06b13",
+   "note": "ggml_vec_dot_q4_0_q8_0 (float sums) + bias in float64"
+  }
+ ]
+}

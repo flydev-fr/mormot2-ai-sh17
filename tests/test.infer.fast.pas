@@ -61,6 +61,9 @@ type
     /// exact mode: Attention (with a mask), GELU and LayerNorm (both modes):
     // the same bytes as the reference
     procedure ElementwiseOpsAreBitIdentical;
+    /// Q4_0 Linear: exact on all cores = the reference bit for bit (partial
+    // tiles, rows beyond the stack buffer), the float path within tolerance
+    procedure LinearQ4MatchesReference;
     /// default mode: Linear, Attention and GELU within their tolerances
     procedure FastModeWithinTolerance;
     /// the decoder operations (phase 3): CausalAttention exact = the reference
@@ -113,6 +116,27 @@ begin
     begin
       aSeed := aSeed * 1103515245 + 12345;
       blk^.qs[j] := shortint(aSeed shr 24); // -128 .. 127
+    end;
+    inc(blk);
+  end;
+end;
+
+/// random Q4_0 rows: every nibble, scales of both signs
+function RandomQ4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+var
+  b, j: PtrInt;
+  blk: PInferBlockQ4_0;
+begin
+  SetLength(result, aOut * (aIn div 32) * SizeOf(TInferBlockQ4_0));
+  blk := pointer(result);
+  for b := 0 to aOut * (aIn div 32) - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    blk^.d := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 16384 + 1e-4);
+    for j := 0 to 15 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qs[j] := aSeed shr 24;
     end;
     inc(blk);
   end;
@@ -453,6 +477,45 @@ begin
       nil, pointer(y2));
     CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'Q8_0 no bias % x % x %',
       [rows, nin, nout]);
+  end;
+end;
+
+procedure TTestInferFast.LinearQ4MatchesReference;
+const
+  // rows, in, out: partial tiles, and 4352 inputs = 136 blocks per row, beyond
+  // the tile buffer on the stack
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 32, 1), (3, 96, 17), (37, 256, 33), (64, 1024, 100), (5, 3072, 48),
+    (2, 4352, 20));
+var
+  i, rows, nin, nout: PtrInt;
+  x, bias, y1, y2, y3: TSingleDynArray;
+  wq: RawByteString;
+  e: double;
+begin
+  for i := 0 to high(SHAPES) do
+  begin
+    rows := SHAPES[i, 0];
+    nin := SHAPES[i, 1];
+    nout := SHAPES[i, 2];
+    Fill(x, rows * nin, 211 + i, 3);
+    Fill(bias, nout, 231 + i, 1);
+    wq := RandomQ4(nout, nin, 241 + i);
+    SetLength(y1, rows * nout);
+    SetLength(y2, rows * nout);
+    SetLength(y3, rows * nout);
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ4_0), nout,
+      pointer(bias), pointer(y1));
+    fExact.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ4_0), nout,
+      pointer(bias), pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'Q4_0 exact % x % x %',
+      [rows, nin, nout]);
+    fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ4_0), nout,
+      nil, pointer(y3));
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ4_0), nout,
+      nil, pointer(y1));
+    e := RelError(pointer(y3), pointer(y1), rows * nout);
+    CheckUtf8(e <= 2e-6, 'Q4_0 float % x % x %: relative error %', [rows, nin, nout, e]);
   end;
 end;
 

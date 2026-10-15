@@ -6,7 +6,7 @@
 //   the peak memory
 //
 //   usage: llm-bench [model folder] [prompt tokens=200] [new tokens=32]
-//                    [threads=0 (default) | ref | exact] [q8 (default) | f32]
+//                    [threads=0 (default) | ref | exact] [q8 (default) | q4 | f32]
 //   - ref: the scalar reference backend; exact: TInferCpuFastBackend with
 //     Exact = true; otherwise TInferCpuFastBackend in its float mode
 //   e.g.   llm-bench vendor/models/qwen3-0.6b 200 32
@@ -283,6 +283,8 @@ begin
     TInferCpuFastBackend(inner).Exact := mode = 'exact';
   end;
   weights := idtQ8_0;
+  if (ParamCount >= 5) and (ParamStr(5) = 'q4') then
+    weights := idtQ4_0;
   if (ParamCount >= 5) and (ParamStr(5) = 'f32') then
     weights := idtF32;
   timed := TTimedBackend.Create(inner);

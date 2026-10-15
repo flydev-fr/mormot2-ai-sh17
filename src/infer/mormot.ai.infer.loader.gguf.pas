@@ -178,6 +178,8 @@ begin
       result := idtF32;
     1:
       result := idtF16;
+    2:
+      result := idtQ4_0;
     8:
       result := idtQ8_0;
     30:

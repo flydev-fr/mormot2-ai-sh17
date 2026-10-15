@@ -35,10 +35,10 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 2010 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 2082 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 720 | 2000 |
-| Windows x86 | **Delphi 7** | 1253 | 708 | 1230 ⁶ |
+| Windows x64 | Delphi 13 | 1257 | 720 | 2072 |
+| Windows x86 | **Delphi 7** | 1253 | 708 | 1280 ⁶ |
 | macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2010 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
@@ -552,7 +552,10 @@ Next, in this order:
    (decoding 15x faster in FP32, 22x in Q8_0). Sampling is done too (temperature, top-k, top-p, min-p,
    reproducible per seed), and so is a prompt cache (the next turn of a conversation
    only computes what is new), and norms, RoPE and SwiGLU run on all cores (prefill
-   up to 1.8x faster). Next: Q4_0 and K-quants, benchmarks per platform.
+   up to 1.8x faster). Q4_0 works (byte-identical to ggml) but is experimental: too
+   coarse for a 0.6B model and, without kernels of its own, slower than Q8_0. Next:
+   Qwen3 straight from GGUF files, then the K-quants (Q4_K_M) with fused SIMD kernels,
+   then Q4_0 kernels; a benchmark on x86_64.
 2. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

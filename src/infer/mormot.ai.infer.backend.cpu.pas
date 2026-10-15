@@ -70,8 +70,21 @@ procedure InferQuantizeRowQ8_0(x: PSingleArray; aCount: PtrInt;
 procedure InferQuantizeRowQ8_0Pascal(x: PSingleArray; aCount: PtrInt;
   aBlocks: PInferBlockQ8_0Array);
 
+/// quantize aCount (a multiple of 32) singles into aCount div 32 Q4_0 blocks
+// - the bytes of ggml's quantize_row_q4_0_ref (what a GGUF writer stores): d =
+// m / -8 with m the first value of the largest magnitude (kept as FP16), q =
+// min(15, trunc(x * (1 / d) + 8.5)), every step a single
+// - NaN and infinity are refused (EInferError); a block whose 1 / d would
+// overflow a single stores q = 8 (value 0) - ggml leaves that case undefined
+procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ4_0Array);
+
+/// aBlocks Q4_0 blocks as Q8_0 blocks: the same scale, q - 8 as the signed
+// value - exact, so every Q8_0 kernel computes the Q4_0 x Q8_0 dot product
+procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+
 type
-  /// scalar reference backend: every operation; Linear takes F32 or Q8_0
+  /// scalar reference backend: every operation; Linear takes F32, Q8_0 or Q4_0
   TInferCpuBackend = class(TInferBackend)
   protected
     /// query rows aFirst..aLast of one head: scores, masked softmax, weighted
@@ -571,6 +584,76 @@ begin
   end;
 end;
 
+procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ4_0Array);
+var
+  b, j, q0, q1: PtrInt;
+  amax, m, v, d, id, t: single;
+  xb: PSingleArray;
+begin
+  for b := 0 to (aCount shr 5) - 1 do
+  begin
+    xb := @x^[b * 32];
+    amax := 0;
+    m := 0;
+    for j := 0 to 31 do
+    begin
+      if PCardinal(@xb^[j])^ and $7f800000 = $7f800000 then
+        EInferError.RaiseUtf8('InferQuantizeRowQ4_0: non-finite value at %',
+          [b * 32 + j]);
+      v := Abs(xb^[j]);
+      if amax < v then // the first of equal magnitudes, as ggml
+      begin
+        amax := v;
+        m := xb^[j];
+      end;
+    end;
+    d := m / -8; // one correctly rounded single division
+    aBlocks^[b].d := InferSingleToHalf(d);
+    // d = 0 (ggml: q = 8 as well), or so small that 1 / d is no single
+    if Abs(d) < 2.9387359e-39 then // 1 / 3.4028235e38
+    begin
+      FillCharFast(aBlocks^[b].qs, SizeOf(aBlocks^[b].qs), $88);
+      continue;
+    end;
+    id := 1 / d;
+    for j := 0 to 15 do
+    begin
+      // each step rounded to single, as the C float arithmetic
+      t := xb^[j] * id;
+      t := t + 8.5;
+      q0 := Trunc(t);
+      if q0 > 15 then
+        q0 := 15;
+      t := xb^[j + 16] * id;
+      t := t + 8.5;
+      q1 := Trunc(t);
+      if q1 > 15 then
+        q1 := 15;
+      aBlocks^[b].qs[j] := q0 or (q1 shl 4);
+    end;
+  end;
+end;
+
+procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+var
+  b, j: PtrInt;
+  v: PtrInt;
+begin
+  for b := 0 to aBlocks - 1 do
+  begin
+    aDst^.d := aSrc^.d;
+    for j := 0 to 15 do
+    begin
+      v := aSrc^.qs[j];
+      aDst^.qs[j] := (v and 15) - 8;
+      aDst^.qs[j + 16] := (v shr 4) - 8;
+    end;
+    inc(aSrc);
+    inc(aDst);
+  end;
+end;
+
 /// rows aFirst..aLast of head h of a causal attention job
 // - the reference: scores and sums in double, the softmax divided at the end;
 // with aJob.Fast and a float kernel for this CPU and head size, float lanes
@@ -700,7 +783,7 @@ end;
 function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolean;
 begin
   if aOp = ioLinear then
-    result := aWeights in [idtF32, idtQ8_0]
+    result := aWeights in [idtF32, idtQ8_0, idtQ4_0]
   else
     result := aWeights = idtF32;
 end;
@@ -752,6 +835,7 @@ var
   r, o, i: PtrInt;
   acc, a: double;
   xr, wo: PSingleArray;
+  w8: array of TInferBlockQ8_0;
 begin
   case w.DType of
     idtF32:
@@ -762,6 +846,17 @@ begin
           EInferError.RaiseUtf8('%.Linear: % inputs are no whole Q8_0 blocks',
             [self, aIn]);
         LinearQ8_0(x, aRows, aIn, w.Data, aOut, bias, y);
+        exit;
+      end;
+    idtQ4_0:
+      begin
+        if aIn and 31 <> 0 then
+          EInferError.RaiseUtf8('%.Linear: % inputs are no whole Q4_0 blocks',
+            [self, aIn]);
+        // the reference: the whole matrix as Q8_0 blocks, then the Q8_0 path
+        SetLength(w8, aOut * (aIn shr 5));
+        InferQ4ToQ8(w.Data, length(w8), pointer(w8));
+        LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
         exit;
       end;
   else
@@ -1133,6 +1228,12 @@ var
   xr, wo: PSingleArray;
   wq, wb: PInferBlockQ8_0;
   pair: boolean;
+  // the weight rows of the tile as Q8_0: the matrix itself, or its Q4_0 rows
+  // unpacked once per tile (on the stack up to 128 blocks per row)
+  wbase: PInferBlockQ8_0Array;
+  wfirst: PtrInt;
+  unpacked: array[0..TILE * 128 - 1] of TInferBlockQ8_0;
+  unpackedHeap: array of TInferBlockQ8_0;
 
   function Bias(aOut: PtrInt): double;
   begin
@@ -1154,7 +1255,7 @@ var
     for c := 0 to nb - 1 do
       for j := 0 to 3 do
       begin
-        dw := INFER_HALF[PInferBlockQ8_0Array(aJob.W.Data)^[(o + j) * nb + c].d];
+        dw := INFER_HALF[wbase^[(o - wfirst + j) * nb + c].d];
         acc8[aFirst + j] := acc8[aFirst + j] + sums^[c * 4 + j] * (dw * d^[c]);
       end;
   end;
@@ -1199,9 +1300,24 @@ var
 
 begin
   oEnd := MinPtrInt((aTile + 1) * TILE, aJob.OutCount) - 1;
-  if aJob.W.DType = idtQ8_0 then
+  if aJob.W.DType <> idtF32 then
   begin
     nb := aJob.Blocks;
+    wbase := aJob.W.Data;
+    wfirst := 0;
+    if aJob.W.DType = idtQ4_0 then
+    begin
+      wfirst := aTile * TILE;
+      if nb <= 128 then
+        wbase := @unpacked
+      else
+      begin
+        SetLength(unpackedHeap, (oEnd - wfirst + 1) * nb);
+        wbase := pointer(unpackedHeap);
+      end;
+      InferQ4ToQ8(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
+        (oEnd - wfirst + 1) * nb, @wbase^[0]);
+    end;
     sums := @local;
     if nb * 4 > length(local) then
     begin
@@ -1222,7 +1338,7 @@ begin
         o := aTile * TILE;
         while o + 3 <= oEnd do
         begin
-          wq := @PInferBlockQ8_0Array(aJob.W.Data)^[o * nb];
+          wq := @wbase^[(o - wfirst) * nb];
           if pair then
             InferQ8DotF32x4x2(wq, @aJob.Xq^[r * nb], @aJob.Xq^[(r + 1) * nb], nb,
               @aJob.Dxs^[r * nb], @aJob.Dxs^[(r + 1) * nb], stride, @out8)
@@ -1238,7 +1354,7 @@ begin
         end;
         while o <= oEnd do
         begin
-          wq := @PInferBlockQ8_0Array(aJob.W.Data)^[o * nb];
+          wq := @wbase^[(o - wfirst) * nb];
           Row1F32(r);
           if pair then
             Row1F32(r + 1);
@@ -1252,7 +1368,7 @@ begin
         o := aTile * TILE;
         while o + 3 <= oEnd do
         begin
-          wq := @PInferBlockQ8_0Array(aJob.W.Data)^[o * nb];
+          wq := @wbase^[(o - wfirst) * nb];
           for k := 0 to 3 do
             acc8[k] := Bias(o + k);
           if pair then
@@ -1276,7 +1392,7 @@ begin
         end;
         while o <= oEnd do
         begin
-          wq := @PInferBlockQ8_0Array(aJob.W.Data)^[o * nb];
+          wq := @wbase^[(o - wfirst) * nb];
           Row1(r);
           if pair then
             Row1(r + 1);
@@ -1338,8 +1454,8 @@ var
   dxs: TSingleDynArray;
   r, t, n: PtrInt;
 begin
-  if not (w.DType in [idtF32, idtQ8_0]) or
-     ((w.DType = idtQ8_0) and (aIn and 31 <> 0)) then
+  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0]) or
+     ((w.DType <> idtF32) and (aIn and 31 <> 0)) then
   begin
     inherited Linear(x, aRows, aIn, w, aOut, bias, y); // raises
     exit;
@@ -1352,7 +1468,7 @@ begin
   job.InCount := aIn;
   job.OutCount := aOut;
   job.Blocks := aIn shr 5;
-  if w.DType = idtQ8_0 then
+  if w.DType <> idtF32 then // Q4_0 tiles become Q8_0: the same kernels
     job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2)
   else
     // the float row kernel needs whole lanes of 16
@@ -1362,7 +1478,7 @@ begin
   if (Int64(aRows) * aIn * aOut >= PARALLEL_MIN) and fBusy.TryLock then
   try
     // on the pool: the buffers of the backend, items shared by every thread
-    if w.DType = idtQ8_0 then
+    if w.DType <> idtF32 then
     begin
       if length(fXq) < aRows * job.Blocks then
       begin
@@ -1375,7 +1491,7 @@ begin
       job.Dxs := pointer(fDxs);
     end;
     fJob := job;
-    if w.DType = idtQ8_0 then
+    if w.DType <> idtF32 then
       RunParallel(QuantizeRow, aRows);
     RunParallel(LinearTile, n);
     exit;
@@ -1384,7 +1500,7 @@ begin
   end;
   // too small, or the pool is busy with another caller: the same kernels and
   // arithmetic on this thread, with buffers of its own
-  if w.DType = idtQ8_0 then
+  if w.DType <> idtF32 then
   begin
     SetLength(xq, aRows * job.Blocks);
     SetLength(dx, aRows * job.Blocks);

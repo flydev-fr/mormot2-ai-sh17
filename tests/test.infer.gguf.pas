@@ -60,6 +60,9 @@ type
     procedure QuantizeLikeGgml;
     /// the Q8_0 Linear against ggml_vec_dot_q8_0_q8_0, and dequantization
     procedure LinearQ8LikeGgml;
+    /// Q4_0 weights quantize to the bytes of ggml's reference quantizer,
+    // dequantize exactly and give the Q4_0 Linear of ggml-cpu
+    procedure Q4LikeGgml;
     /// the tiny GGUF: metadata, tensors, typed access
     procedure ReaderReadsTinyFile;
     /// truncated, malformed and hostile files are refused, never read past
@@ -408,6 +411,77 @@ begin
   end;
 end;
 
+procedure TTestInferGguf.Q4LikeGgml;
+var
+  ref: TInferRefSet;
+  dir: TFileName;
+  x, b, y, deq: PSingleArray;
+  blocks, w: PByteArray;
+  t: PInferRefTensor;
+  n, m, rows, cols, nin, nout, r: PtrInt;
+  mine: RawByteString;
+  out, row: TSingleDynArray;
+  cmp: TInferCompare;
+  refused: boolean;
+begin
+  dir := FindInferRefDir('q4');
+  if CheckFailed(dir <> '', 'q4 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    // weights quantize to the bytes of quantize_row_q4_0_ref: the signed value
+    // of the first largest magnitude, sums landing on .5 and whole numbers, a
+    // zero block, tiny and large rows, the clip at 15
+    t := ref.Tensor('quant/x');
+    rows := t^.Shape[0];
+    cols := t^.Shape[1];
+    x := ref.F32('quant/x', n);
+    blocks := ref.U8('quant/blocks', m);
+    CheckEqual(m, rows * (cols div 32) * SizeOf(TInferBlockQ4_0), 'block bytes');
+    SetLength(mine, (cols div 32) * SizeOf(TInferBlockQ4_0));
+    deq := ref.F32('dequant/y', n);
+    SetLength(row, cols);
+    for r := 0 to rows - 1 do
+    begin
+      InferQuantizeRowQ4_0(@x^[r * cols], cols, pointer(mine));
+      CheckUtf8(CompareMem(pointer(mine), @blocks^[r * length(mine)], length(mine)),
+        'row % quantized like quantize_row_q4_0_ref', [r]);
+      // dequantized: d * (q - 8) is exact in single
+      InferRowToF32(@blocks^[r * length(mine)], idtQ4_0, 0, cols, pointer(row));
+      cmp := InferCompare(pointer(row), @deq^[r * cols], cols, 0, 0);
+      CheckUtf8(InferCompareOk(cmp), 'dequantized row %: %', [r, InferCompareText(cmp)]);
+    end;
+    // a NaN or an infinity has no Q4_0 form
+    SetLength(out, 32);
+    PCardinal(@out[7])^ := $7f800000;
+    refused := false;
+    try
+      InferQuantizeRowQ4_0(pointer(out), 32, pointer(mine));
+    except
+      on EInferError do
+        refused := true;
+    end;
+    Check(refused, 'infinity refused');
+    // the Linear against ggml_vec_dot_q4_0_q8_0
+    t := ref.Tensor('linear/x');
+    rows := t^.Shape[0];
+    nin := t^.Shape[1];
+    nout := ref.Tensor('linear/bias')^.Shape[0];
+    x := ref.F32('linear/x', n);
+    b := ref.F32('linear/bias', n);
+    y := ref.F32('linear/y', n);
+    w := ref.U8('linear/weight', n);
+    CheckUtf8(fCpu.Supports(ioLinear, idtQ4_0), 'the CPU backend takes Q4_0');
+    SetLength(out, rows * nout);
+    fCpu.Linear(x, rows, nin, InferWeight(w, idtQ4_0), nout, b, pointer(out));
+    // ggml sums in single, we in double: the integer block sums are the same
+    cmp := InferCompare(pointer(out), y, rows * nout, 1e-5, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'Q4_0 linear like ggml: %', [InferCompareText(cmp)]);
+  finally
+    ref.Free;
+  end;
+end;
+
 procedure TTestInferGguf.ReaderReadsTinyFile;
 var
   dir: TFileName;
@@ -519,8 +593,10 @@ begin
   CheckUtf8(Refused(GFile(3, 0, 1, GKv('general.alignment', 10, GU64(32)), '', ''),
     'UINT32'), 'alignment of another type');
   // tensor infos
-  CheckUtf8(Refused(GFile(3, 1, 0, '', GTi('a', [4], 2, 0), data), 'ggml type'),
-    'Q4_0 not supported');
+  CheckUtf8(Refused(GFile(3, 1, 0, '', GTi('a', [4], 3, 0), data), 'ggml type'),
+    'Q4_1 not supported');
+  CheckUtf8(Refused(GFile(3, 1, 0, '', GTi('a', [4], 2, 0), data), 'blocks'),
+    'Q4_0 needs whole blocks');
   CheckUtf8(Refused(GFile(3, 1, 0, '', GTi('a', [0], 0, 0), data), 'dimension'),
     'zero dimension');
   CheckUtf8(Refused(GFile(3, 1, 0, '', GTi('a', [1, 1, 1, 1, 1], 0, 0), data),

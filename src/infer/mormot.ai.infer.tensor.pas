@@ -32,8 +32,9 @@ type
 
   /// element type of a tensor
   // - names follow safetensors: F32, F16, BF16, I32, I64, U8, I8
-  // - idtQ8_0 is a block type of GGUF files: 32 elements share one FP16 scale
-  // (see TInferBlockQ8_0) - only GGUF files hold it, safetensors never
+  // - idtQ8_0 and idtQ4_0 are block types of GGUF files: 32 elements share one
+  // FP16 scale (see TInferBlockQ8_0, TInferBlockQ4_0) - only GGUF files hold
+  // them, safetensors never
   TInferDType = (
     idtUnknown,
     idtF32,
@@ -43,7 +44,8 @@ type
     idtI64,
     idtU8,
     idtI8,
-    idtQ8_0);
+    idtQ8_0,
+    idtQ4_0);
 
   /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
   // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
@@ -55,6 +57,18 @@ type
   TInferBlockQ8_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ8_0)) - 1] of
     TInferBlockQ8_0;
   PInferBlockQ8_0Array = ^TInferBlockQ8_0Array;
+
+  /// one Q4_0 block as ggml stores it: value[i] = d * (q[i] - 8), q in 0..15
+  // - d is an IEEE half float (raw bits); qs[j] holds q[j] in its low and
+  // q[j + 16] in its high nibble - 18 bytes per 32 elements
+  TInferBlockQ4_0 = packed record
+    d: word;
+    qs: array[0..15] of byte;
+  end;
+  PInferBlockQ4_0 = ^TInferBlockQ4_0;
+  TInferBlockQ4_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ4_0)) - 1] of
+    TInferBlockQ4_0;
+  PInferBlockQ4_0Array = ^TInferBlockQ4_0Array;
 
   /// a named, typed, shaped view on elements owned by someone else
   TInferTensor = record
@@ -77,15 +91,15 @@ type
 const
   /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1, 34);
+    0, 4, 2, 2, 4, 8, 1, 1, 34, 18);
 
   /// elements per block of each type: 1 for plain element types
   INFER_DTYPE_BLOCK: array[TInferDType] of byte = (
-    0, 1, 1, 1, 1, 1, 1, 1, 32);
+    0, 1, 1, 1, 1, 1, 1, 1, 32, 32);
 
   /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
-    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0');
+    '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0');
 
 /// the element type of a safetensors dtype name, idtUnknown if not supported
 // - block types are no safetensors types and never returned
@@ -109,8 +123,8 @@ function InferHalfToSingleBits(aHalf: word): cardinal;
 function InferSingleToHalf(aValue: single): word;
 
 /// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
-// - F32 is copied, Q8_0 dequantized (d * q, exact in single); aCols must be a
-// multiple of the block size
+// - F32 is copied, Q8_0 and Q4_0 dequantized (d * q, d * (q - 8): exact in
+// single); aCols must be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 
@@ -243,6 +257,7 @@ procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
 var
   b, j, nb: PtrInt;
   blk: PInferBlockQ8_0;
+  b4: PInferBlockQ4_0;
   d: single;
 begin
   case aType of
@@ -258,6 +273,21 @@ begin
           for j := 0 to 31 do
             aDst^[b * 32 + j] := d * blk^.qs[j];
           inc(blk);
+        end;
+      end;
+    idtQ4_0:
+      begin
+        nb := aCols div 32;
+        b4 := @PInferBlockQ4_0Array(aData)^[aRow * nb];
+        for b := 0 to nb - 1 do
+        begin
+          d := InferHalfToSingle(b4^.d);
+          for j := 0 to 15 do
+          begin
+            aDst^[b * 32 + j] := d * (integer(b4^.qs[j] and 15) - 8);
+            aDst^[b * 32 + j + 16] := d * (integer(b4^.qs[j] shr 4) - 8);
+          end;
+          inc(b4);
         end;
       end;
   else
