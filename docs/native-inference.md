@@ -742,7 +742,48 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
 - Weiter (Entscheid 2026-10-15): 3e-2 Qwen3 direkt aus GGUF laden, 3e-3 Q4_K/Q6_K (die
   Mischung Q4_K_M) mit fusionierten NEON- und AVX2-Kerneln nach ggml-Vorbild.
 
-- Offen in Phase 3: GGUF-Laden und K-Quants (3e-2, 3e-3), Q4_0-Kernel (s. o.),
+**3e-2, erledigt 2026-10-15: Qwen3 direkt aus GGUF** (`TQwen3Model.CreateFromGguf`).
+
+- Die Einstellungen kommen aus den Metadaten (`qwen3.block_count`, `…embedding_length`,
+  `…attention.key_length` als Kopfbreite, `…context_length`, `…rope.freq_base`,
+  `…layer_norm_rms_epsilon`), die Tensoren unter llama.cpps Namen (`token_embd`,
+  `blk.N.attn_q` … `ffn_down`, `output_norm`, `output`). Fehlt `output.weight`, ist
+  der Kopf an `token_embd` gebunden. Q8_0- und Q4_0-Matrizen werden direkt aus der
+  gemappten Datei benutzt (jede FP16-Skala beim Laden auf endlich geprüft), F32 ebenso,
+  F16 und BF16 auf F32 erweitert; das Embedding wird je Token aus dem Dateityp gelesen.
+- Abgelehnt: eine andere Architektur, RoPE-Skalierung, Sliding Window, ein fehlender,
+  zusätzlicher oder falsch geformter Tensor, eine unendliche Skala.
+- Zwei Rundungsfunde dabei, beide gegen ggml selbst geprüft:
+  - Q8_0-**Gewichte** quantisiert ein GGUF-Writer mit `quantize_row_q8_0_ref`:
+    Gleichstände werden von der Null weg gerundet (`roundf`), bei den Aktivierungen
+    zur geraden Zahl. Das Laden aus safetensors nutzte bisher die Aktivierungsregel,
+    und BF16-Gewichte (8 Mantissenbits) treffen solche Gleichstände tatsächlich. Neu:
+    `InferQuantizeRowQ8_0Ref` für Gewichte; das Q8_0-Gate liegt danach etwas näher an
+    FP32 (`chat_tool`: Kosinus 0,9972 statt 0,9965 mit NEON).
+  - Q4_0: Die gebauten ggml-Bibliotheken rechnen `x · (1/d) + 8,5` als fused
+    multiply-add (GCC fasst es auf aarch64 und mit `-march=native` auf x86 zusammen),
+    also mit einer Rundung statt zweien. Der Quantisierer rechnet jetzt ebenso (Produkt
+    exakt in Double); mit zwei Rundungen wichen beim winzigen Modell einige Bytes ab.
+- Tests ohne großes Modell: ein winziges Qwen3 als GGUF (`tiny-qwen3-gguf`, von ggmls
+  Quantisierern geschrieben): Einstellungen wie `config.json`, jede Matrix byte-gleich
+  zu unserer Quantisierung (Q8_0 und Q4_0), Logits gegen FP32, `Exact` bitgleich, F16
+  mit eigenem `output.weight`, acht beschädigte Dateien abgelehnt.
+- Mit Qwens eigener Datei (`Qwen/Qwen3-0.6B-GGUF`, `Qwen3-0.6B-Q8_0.gguf`, Revision
+  `23749fe`, SHA-256 `9465e63a…`, als `vendor/models/qwen3-0.6b-q8_0.gguf`): Sie stammt
+  aus anderen Gewichten als die BF16-Veröffentlichung unserer Referenz
+  (`token_embd` ist byte-gleich zu ggmls Quantisierer darauf, in den Layern weichen die
+  Skalen der meisten Blöcke und die Werte um einige Prozent ab). Geprüft wird deshalb:
+  jede Matrix mit Kosinus ≥ 0,999 an ihren BF16-Gewichten (gemessen 0,9998; eine falsch
+  zugeordnete läge nahe 0) und das Q8_0-Gate mit Greedy-Schwelle 1 statt 0,5 (`raw_fox`
+  weicht an einem Schritt ab, an dem die Referenz 0,71 sicher war). Auch Qwens Datei ruft
+  bei `chat_tool` das Tool nicht auf.
+- Laden: unter Windows 0,4 s (die Datei wird gemappt, jede Skala einmal gelesen), in der
+  WSL auf `/mnt/d` gut 4 s - statt etwa 13 s Quantisieren aus safetensors.
+- Abgelehnt werden auch RoPE über nur einen Teil des Kopfes
+  (`qwen3.rope.dimension_count`) und eine nicht endliche Skala im Embedding, auch wenn
+  der Kopf nicht daran gebunden ist (Review-Fund).
+
+- Offen in Phase 3: Tokenizer und Client aus GGUF, K-Quants (3e-3), Q4_0-Kernel (s. o.),
   Benchmark auf x86_64 (RTX-Rechner).
 
 ### Phase 4 — GPU

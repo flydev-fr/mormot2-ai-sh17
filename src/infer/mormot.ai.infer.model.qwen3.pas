@@ -12,9 +12,11 @@
 //   a hidden size of 1024, not 1024 / 16
 // - weights: F32 is used in place (memory-mapped), BF16 widened to F32 once at
 //   load (exact: BF16 is the upper half of an F32) - the FP32 path of phase 2;
-//   or every matrix quantized to Q8_0 at load, byte for byte as ggml does it
-//   (phase 3: a quarter of the memory traffic, the SIMD kernels of the
-//   backend); the embedding rows are then read from the file per token
+//   or every matrix quantized to Q8_0 (or Q4_0) at load, byte for byte as a
+//   GGUF writer does it (phase 3: a quarter of the memory traffic, the SIMD
+//   kernels of the backend); the embedding rows are then read per token
+// - or a llama.cpp GGUF file of the qwen3 architecture (CreateFromGguf): its
+//   metadata for the settings, its Q8_0 / Q4_0 matrices used in place
 // - arithmetic: matrix products through the backend; norms, rotary positions
 //   and attention in double, stored as single. Rotary angles follow the float32
 //   steps of the reference (inverse frequency and angle rounded to single)
@@ -45,6 +47,7 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.safetensors,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.sampler; // InferArgMax
@@ -113,25 +116,33 @@ type
       read GetId;
   end;
 
-  /// a Qwen3 causal language model over a safetensors file
+  /// a Qwen3 causal language model over a safetensors or a GGUF file
   TQwen3Model = class
   protected
     fSerial: integer; // unique per instance: an address may be reused after Free
     fConfig: TQwen3Config;
-    fFile: TSafeTensorsFile;
+    fFile: TSafeTensorsFile; // Create: a Hugging Face folder
+    fGguf: TGgufFile; // CreateFromGguf: one llama.cpp file
     fBackend: TInferBackend;
     fOwned: array of TSingleDynArray; // BF16 tensors widened at load
     fOwnedQ8: array of array of TInferBlockQ8_0; // matrices quantized at load
     fOwnedQ4: array of array of TInferBlockQ4_0;
     fWeights: TInferDType;
-    fEmbedSrc: PInferTensor; // the embedding as stored: F32 or BF16
+    fEmbedSrc: PInferTensor; // the embedding as stored: read per token
     fEmbed, fHead: TInferWeight;
     fNorm: PSingleArray;
     fLayer: TQwen3LayerDynArray;
     fInvFreq: TSingleDynArray;
+    procedure Init(aBackend: TInferBackend);
     procedure LoadConfig(const aConfigFile: TFileName);
+    procedure LoadGgufConfig;
+    procedure CheckConfig(const aSource: TFileName);
     procedure LoadWeights;
-    function Checked(const aName: RawUtf8; const aDims: array of Int64): PInferTensor;
+    /// a tensor by its Hugging Face name - in a GGUF file by llama.cpp's name
+    function Find(const aName: RawUtf8): PInferTensor;
+    function TensorCount: PtrInt;
+    function Checked(const aName: RawUtf8; const aDims: array of Int64;
+      aBlocks: boolean = false): PInferTensor;
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
     function Matrix(const aName: RawUtf8; aRows, aCols: Int64;
       aType: TInferDType): TInferWeight;
@@ -148,6 +159,13 @@ type
     // multiples of 32
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend;
       aWeights: TInferDType = idtF32);
+    /// load a llama.cpp GGUF file of the qwen3 architecture: the settings
+    // from its metadata, every matrix as stored (Q8_0 and Q4_0 used in place,
+    // F16 and BF16 widened to F32), a head tied to token_embd when the file
+    // has no output.weight
+    // - raises EInferError for another architecture, a tensor of another type
+    // or shape, a scale that is not finite, or a tensor not understood
+    constructor CreateFromGguf(const aFileName: TFileName; aBackend: TInferBackend);
     /// unmap the weights
     destructor Destroy; override;
     /// a context sized for this model (KV cache grows on demand)
@@ -181,9 +199,16 @@ type
     /// the backend the model computes with (not owned)
     property Backend: TInferBackend
       read fBackend;
-    /// the type of the layer matrices: idtF32, idtQ8_0 or idtQ4_0
+    /// the type of the layer matrices: idtF32, idtQ8_0 or idtQ4_0 (for a GGUF
+    // file: the type of the first attention matrix)
     property Weights: TInferDType
       read fWeights;
+    /// the weights of every layer, as used - for diagnosis and tests
+    property Layers: TQwen3LayerDynArray
+      read fLayer;
+    /// the language-model head, as used
+    property Head: TInferWeight
+      read fHead;
   end;
 
 
@@ -242,26 +267,31 @@ var
   /// the last model serial handed out (0 = none, an empty context's owner)
   Qwen3ModelSerial: integer;
 
-constructor TQwen3Model.Create(const aFolder: TFileName; aBackend: TInferBackend;
-  aWeights: TInferDType);
+procedure TQwen3Model.Init(aBackend: TInferBackend);
 begin
-  inherited Create;
   fSerial := InterlockedIncrement(Qwen3ModelSerial);
   if aBackend = nil then
     EInferError.RaiseUtf8('%.Create: no backend', [self]);
-  if not (aWeights in [idtF32, idtQ8_0, idtQ4_0]) then
-    EInferError.RaiseUtf8('%.Create: weights as % not supported',
-      [self, INFER_DTYPE_NAME[aWeights]]);
   fBackend := aBackend;
-  fWeights := aWeights;
-  if not fBackend.Supports(ioLinear, aWeights) then
-    EInferError.RaiseUtf8('%: the backend has no % Linear',
-      [self, INFER_DTYPE_NAME[aWeights]]);
   if not fBackend.Supports(ioCausalAttention, idtF32) or
      not fBackend.Supports(ioRmsNorm, idtF32) or
      not fBackend.Supports(ioSwiGlu, idtF32) or
      not fBackend.Supports(ioRope, idtF32) then
     EInferError.RaiseUtf8('%: the backend lacks a decoder operation', [self]);
+end;
+
+constructor TQwen3Model.Create(const aFolder: TFileName; aBackend: TInferBackend;
+  aWeights: TInferDType);
+begin
+  inherited Create;
+  Init(aBackend);
+  if not (aWeights in [idtF32, idtQ8_0, idtQ4_0]) then
+    EInferError.RaiseUtf8('%.Create: weights as % not supported',
+      [self, INFER_DTYPE_NAME[aWeights]]);
+  fWeights := aWeights;
+  if not fBackend.Supports(ioLinear, aWeights) then
+    EInferError.RaiseUtf8('%: the backend has no % Linear',
+      [self, INFER_DTYPE_NAME[aWeights]]);
   LoadConfig(IncludeTrailingPathDelimiter(aFolder) + 'config.json');
   if (aWeights <> idtF32) and
      ((fConfig.Hidden and 31 <> 0) or (fConfig.Intermediate and 31 <> 0) or
@@ -273,9 +303,21 @@ begin
   LoadWeights;
 end;
 
+constructor TQwen3Model.CreateFromGguf(const aFileName: TFileName;
+  aBackend: TInferBackend);
+begin
+  inherited Create;
+  Init(aBackend);
+  fGguf := TGgufFile.Create(aFileName);
+  LoadGgufConfig;
+  LoadWeights;
+  fWeights := fLayer[0].Q.DType;
+end;
+
 destructor TQwen3Model.Destroy;
 begin
   fFile.Free;
+  fGguf.Free;
   inherited Destroy;
 end;
 
@@ -327,6 +369,69 @@ begin
   fConfig.MaxPositions := doc.I['max_position_embeddings'];
   fConfig.RmsEps := doc.D['rms_norm_eps'];
   fConfig.TiedEmbeddings := doc.B['tie_word_embeddings'];
+  CheckConfig(aConfigFile);
+end;
+
+procedure TQwen3Model.LoadGgufConfig;
+var
+  emb: PInferTensor;
+
+  // a positive count, bounded before it becomes a PtrInt: a value beyond 32
+  // bits must not wrap into a valid one in a 32-bit process
+  function Count(const aKey: RawUtf8): PtrInt;
+  var
+    v: Int64;
+  begin
+    v := fGguf.Int(aKey);
+    if (v <= 0) or (v > 1 shl 30) then
+      EInferError.RaiseUtf8('%: % = % out of range', [self, aKey, v]);
+    result := v;
+  end;
+
+begin
+  if fGguf.Str('general.architecture') <> 'qwen3' then
+    EInferError.RaiseUtf8('%: architecture "%" is not qwen3',
+      [self, fGguf.Str('general.architecture')]);
+  // a scaled RoPE or a sliding window would change the arithmetic: refused
+  if fGguf.Has('qwen3.rope.scaling.type') and
+     (fGguf.Str('qwen3.rope.scaling.type') <> 'none') then
+    EInferError.RaiseUtf8('%: rope scaling "%" not supported',
+      [self, fGguf.Str('qwen3.rope.scaling.type')]);
+  if fGguf.Has('qwen3.attention.sliding_window') then
+    EInferError.RaiseUtf8('%: sliding window attention not supported', [self]);
+  emb := fGguf.Tensor('token_embd.weight');
+  if length(emb^.Shape) <> 2 then
+    EInferError.RaiseUtf8('%: token_embd.weight is shaped %',
+      [self, InferShapeText(emb^.Shape)]);
+  if (emb^.Shape[0] <= 0) or (emb^.Shape[0] > 1 shl 22) then
+    EInferError.RaiseUtf8('%: a vocabulary of % tokens', [self, emb^.Shape[0]]);
+  fConfig.VocabSize := emb^.Shape[0];
+  fConfig.Hidden := Count('qwen3.embedding_length');
+  fConfig.Layers := Count('qwen3.block_count');
+  fConfig.Heads := Count('qwen3.attention.head_count');
+  fConfig.KvHeads := Count('qwen3.attention.head_count_kv');
+  fConfig.HeadDim := Count('qwen3.attention.key_length');
+  // RoPE over a part of each head only would be another arithmetic
+  if fGguf.Has('qwen3.rope.dimension_count') and
+     (Count('qwen3.rope.dimension_count') <> fConfig.HeadDim) then
+    EInferError.RaiseUtf8('%: RoPE over % of % dimensions not supported',
+      [self, Count('qwen3.rope.dimension_count'), fConfig.HeadDim]);
+  if fGguf.Has('qwen3.attention.value_length') and
+     (Count('qwen3.attention.value_length') <> fConfig.HeadDim) then
+    EInferError.RaiseUtf8('%: key and value heads of different sizes', [self]);
+  fConfig.Intermediate := Count('qwen3.feed_forward_length');
+  fConfig.MaxPositions := Count('qwen3.context_length');
+  fConfig.RmsEps := fGguf.Float('qwen3.attention.layer_norm_rms_epsilon');
+  fConfig.RopeTheta := fGguf.Float('qwen3.rope.freq_base');
+  // llama.cpp ties the head to the embedding by leaving output.weight out
+  fConfig.TiedEmbeddings := fGguf.FindTensor('output.weight') = nil;
+  CheckConfig(fGguf.FileName);
+end;
+
+procedure TQwen3Model.CheckConfig(const aSource: TFileName);
+var
+  i: PtrInt;
+begin
   // every dimension bounded on its own before any product: a product of
   // unbounded values could wrap around and pass
   if (fConfig.VocabSize <= 0) or (fConfig.VocabSize > 1 shl 22) or
@@ -341,7 +446,7 @@ begin
      (fConfig.MaxPositions <= 0) or (fConfig.MaxPositions > 1 shl 24) or
      not (fConfig.RmsEps > 0) or (fConfig.RmsEps > 1) or
      not (fConfig.RopeTheta > 1) or (fConfig.RopeTheta > 1e12) then
-    EInferError.RaiseUtf8('%: % has an invalid or unsupported shape', [self, aConfigFile]);
+    EInferError.RaiseUtf8('%: % has an invalid or unsupported shape', [self, aSource]);
   // inverse rotary frequencies as the reference forms them in float32:
   // 1 / theta ^ (2i / d), each step rounded to single
   SetLength(fInvFreq, fConfig.HeadDim shr 1);
@@ -350,15 +455,87 @@ begin
       RoundToSingle((2 * i) / fConfig.HeadDim)));
 end;
 
+const
+  /// Hugging Face names and llama.cpp's for the tensors of one layer
+  LAYER_NAMES: array[0..10, 0..1] of RawUtf8 = (
+    ('self_attn.q_proj.weight', 'attn_q.weight'),
+    ('self_attn.k_proj.weight', 'attn_k.weight'),
+    ('self_attn.v_proj.weight', 'attn_v.weight'),
+    ('self_attn.o_proj.weight', 'attn_output.weight'),
+    ('self_attn.q_norm.weight', 'attn_q_norm.weight'),
+    ('self_attn.k_norm.weight', 'attn_k_norm.weight'),
+    ('mlp.gate_proj.weight', 'ffn_gate.weight'),
+    ('mlp.up_proj.weight', 'ffn_up.weight'),
+    ('mlp.down_proj.weight', 'ffn_down.weight'),
+    ('input_layernorm.weight', 'attn_norm.weight'),
+    ('post_attention_layernorm.weight', 'ffn_norm.weight'));
+
+/// llama.cpp's name of a Hugging Face tensor name, '' if there is none
+function GgufName(const aName: RawUtf8): RawUtf8;
+var
+  p, i: PtrInt;
+  layer, rest: RawUtf8;
+begin
+  result := '';
+  if aName = 'model.embed_tokens.weight' then
+    result := 'token_embd.weight'
+  else if aName = 'model.norm.weight' then
+    result := 'output_norm.weight'
+  else if aName = 'lm_head.weight' then
+    result := 'output.weight'
+  else if IdemPChar(pointer(aName), 'MODEL.LAYERS.') then
+  begin
+    rest := copy(aName, 14, maxInt);
+    p := PosEx('.', rest);
+    if p <= 1 then
+      exit;
+    layer := copy(rest, 1, p - 1);
+    rest := copy(rest, p + 1, maxInt);
+    for i := 0 to high(LAYER_NAMES) do
+      if rest = LAYER_NAMES[i, 0] then
+      begin
+        result := 'blk.' + layer + '.' + LAYER_NAMES[i, 1];
+        exit;
+      end;
+  end;
+end;
+
+function TQwen3Model.Find(const aName: RawUtf8): PInferTensor;
+begin
+  if fGguf <> nil then
+  begin
+    result := nil;
+    if GgufName(aName) <> '' then
+      result := fGguf.FindTensor(GgufName(aName));
+  end
+  else
+    result := fFile.Find(aName);
+end;
+
+function TQwen3Model.TensorCount: PtrInt;
+begin
+  if fGguf <> nil then
+    result := length(fGguf.Tensors)
+  else
+    result := length(fFile.Tensors);
+end;
+
 function TQwen3Model.Checked(const aName: RawUtf8;
-  const aDims: array of Int64): PInferTensor;
+  const aDims: array of Int64; aBlocks: boolean): PInferTensor;
 var
   i: PtrInt;
   ok: boolean;
   want: TInt64DynArray;
   t: PInferTensor;
 begin
-  t := fFile.Tensor(aName);
+  t := Find(aName);
+  if t = nil then
+  begin
+    if fGguf = nil then
+      fFile.Tensor(aName); // raises with the file's message
+    EInferError.RaiseUtf8('%: no tensor % (%) in %',
+      [self, GgufName(aName), aName, fGguf.FileName]);
+  end;
   ok := length(t^.Shape) = length(aDims);
   if ok then
     for i := 0 to high(aDims) do
@@ -372,8 +549,12 @@ begin
     EInferError.RaiseUtf8('%: % is shaped %, expected %',
       [self, aName, InferShapeText(t^.Shape), InferShapeText(want)]);
   end;
-  if not (t^.DType in [idtF32, idtBF16]) then
-    EInferError.RaiseUtf8('%: % is %, only F32 and BF16 are supported',
+  // F32 and BF16 from safetensors; a GGUF file adds F16, and Q8_0 and Q4_0
+  // for a matrix (aBlocks)
+  if not ((t^.DType in [idtF32, idtBF16]) or
+          ((fGguf <> nil) and ((t^.DType = idtF16) or
+           (aBlocks and (t^.DType in [idtQ8_0, idtQ4_0]))))) then
+    EInferError.RaiseUtf8('%: % is %, not supported here',
       [self, aName, INFER_DTYPE_NAME[t^.DType]]);
   result := t;
 end;
@@ -386,42 +567,69 @@ var
   src: PWordArray;
   dst: PCardinalArray;
 begin
-  result := nil; // every other type raises in Checked
   t := Checked(aName, aDims);
-  case t^.DType of
-    idtF32:
-      result := t^.Data;
-    idtBF16:
-      begin
-        // BF16 is the upper half of an F32: widening is exact
-        if t^.Count > High(PtrInt) div 4 then
-          EInferError.RaiseUtf8('%: % too large', [self, aName]);
-        n := length(fOwned);
-        SetLength(fOwned, n + 1);
-        SetLength(fOwned[n], t^.Count);
-        src := t^.Data;
-        dst := pointer(fOwned[n]);
-        for i := 0 to t^.Count - 1 do
-          dst^[i] := cardinal(src^[i]) shl 16;
-        result := pointer(fOwned[n]);
-      end;
+  if t^.DType = idtF32 then
+  begin
+    result := t^.Data;
+    exit;
   end;
+  // BF16 is the upper half of an F32, F16 a subset of it: widening is exact
+  if t^.Count > High(PtrInt) div 4 then
+    EInferError.RaiseUtf8('%: % too large', [self, aName]);
+  n := length(fOwned);
+  SetLength(fOwned, n + 1);
+  SetLength(fOwned[n], t^.Count);
+  src := t^.Data;
+  dst := pointer(fOwned[n]);
+  if t^.DType = idtBF16 then
+    for i := 0 to t^.Count - 1 do
+      dst^[i] := cardinal(src^[i]) shl 16
+  else
+    for i := 0 to t^.Count - 1 do
+      dst^[i] := InferHalfToSingleBits(src^[i]);
+  result := pointer(fOwned[n]);
 end;
 
-/// row aRow of an F32 or BF16 matrix of aCols columns, as singles in aDest
+/// row aRow of a [rows, aCols] matrix as stored, as singles in aDest - exact
+// for every type (BF16 and F16 widened, Q8_0 and Q4_0 dequantized)
 procedure WidenRow(t: PInferTensor; aRow, aCols: PtrInt; aDest: PSingleArray);
 var
   i: PtrInt;
   src: PWordArray;
 begin
-  if t^.DType = idtF32 then
-    MoveFast(PSingleArray(t^.Data)^[aRow * aCols], aDest^, aCols * SizeOf(single))
+  case t^.DType of
+    idtBF16:
+      begin
+        src := @PWordArray(t^.Data)^[aRow * aCols];
+        for i := 0 to aCols - 1 do
+          PCardinalArray(aDest)^[i] := cardinal(src^[i]) shl 16;
+      end;
+    idtF16:
+      begin
+        src := @PWordArray(t^.Data)^[aRow * aCols];
+        for i := 0 to aCols - 1 do
+          PCardinalArray(aDest)^[i] := InferHalfToSingleBits(src^[i]);
+      end;
   else
+    InferRowToF32(t^.Data, t^.DType, aRow, aCols, aDest); // F32, Q8_0, Q4_0
+  end;
+end;
+
+/// raise unless every FP16 scale of the aCount blocks is finite
+procedure CheckScales(t: PInferTensor; const aName: RawUtf8; aModel: TObject);
+var
+  b, size: PtrInt;
+  p: PByte;
+begin
+  size := INFER_DTYPE_SIZE[t^.DType];
+  p := t^.Data;
+  for b := 0 to t^.Count div 32 - 1 do
   begin
-    // BF16 is the upper half of an F32: widening is exact
-    src := @PWordArray(t^.Data)^[aRow * aCols];
-    for i := 0 to aCols - 1 do
-      PCardinalArray(aDest)^[i] := cardinal(src^[i]) shl 16;
+    // the scale opens every block (TInferBlockQ8_0 and TInferBlockQ4_0)
+    if PWord(p)^ and $7fff >= $7c00 then
+      EInferError.RaiseUtf8('%: % has a scale that is no finite number in block %',
+        [aModel, aName, b]);
+    inc(p, size);
   end;
 end;
 
@@ -433,6 +641,24 @@ var
   nb, r, n, c: PtrInt;
   d: word;
 begin
+  if fGguf <> nil then
+  begin
+    // a GGUF file decides: blocks in place, F32 in place, F16 / BF16 widened
+    t := Checked(aName, [aRows, aCols], true);
+    case t^.DType of
+      idtQ8_0, idtQ4_0:
+        begin
+          CheckScales(t, aName, self);
+          result := InferWeight(t^.Data, t^.DType);
+        end;
+    else
+      result := InferWeight(Weight(aName, [aRows, aCols]), idtF32);
+    end;
+    if not fBackend.Supports(ioLinear, result.DType) then
+      EInferError.RaiseUtf8('%: the backend has no % Linear for %',
+        [self, INFER_DTYPE_NAME[result.DType], aName]);
+    exit;
+  end;
   if aType = idtF32 then
   begin
     result := InferWeight(Weight(aName, [aRows, aCols]), idtF32);
@@ -465,7 +691,7 @@ begin
         EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
           [self, aName, r, c]);
     if aType = idtQ8_0 then
-      InferQuantizeRowQ8_0(pointer(row), aCols, @fOwnedQ8[n][r * nb])
+      InferQuantizeRowQ8_0Ref(pointer(row), aCols, @fOwnedQ8[n][r * nb])
     else
       InferQuantizeRowQ4_0(pointer(row), aCols, @fOwnedQ4[n][r * nb]);
     // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
@@ -493,7 +719,7 @@ var
   headType: TInferDType;
 begin
   // with Q4_0 the head stays Q8_0, as llama.cpp keeps the output matrix finer
-  // than the layers: it decides every token
+  // than the layers: it decides every token (a GGUF file brings its own)
   headType := fWeights;
   if headType = idtQ4_0 then
     headType := idtQ8_0;
@@ -501,26 +727,30 @@ begin
   f := fConfig.Intermediate;
   qw := fConfig.Heads * fConfig.HeadDim;
   kvw := fConfig.KvHeads * fConfig.HeadDim;
-  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h]);
-  if fWeights = idtF32 then
+  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
+    fGguf <> nil);
+  // read per token: its scales checked here, also when the head is untied
+  if fEmbedSrc^.DType in [idtQ8_0, idtQ4_0] then
+    CheckScales(fEmbedSrc, 'model.embed_tokens.weight', self);
+  if (fGguf = nil) and (fWeights = idtF32) then
     fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
       idtF32);
   fNorm := Weight('model.norm.weight', [h]);
   used := 2;
-  head := fFile.Find('lm_head.weight');
+  head := Find('lm_head.weight');
   if fConfig.TiedEmbeddings then
   begin
     // a tied head may still be stored: only when it is the very same matrix
     if head <> nil then
     begin
-      emb := fFile.Tensor('model.embed_tokens.weight');
+      emb := Find('model.embed_tokens.weight');
       if (head^.DType <> emb^.DType) or (head^.Bytes <> emb^.Bytes) or
          not CompareMem(head^.Data, emb^.Data, head^.Bytes) then
         EInferError.RaiseUtf8('%: tie_word_embeddings but lm_head.weight differs ' +
           'from the embedding', [self]);
       inc(used);
     end;
-    if fWeights = idtF32 then
+    if (fGguf = nil) and (fWeights = idtF32) then
       fHead := fEmbed
     else
       fHead := Matrix('model.embed_tokens.weight', fConfig.VocabSize, h, headType);
@@ -549,9 +779,9 @@ begin
     inc(used, 11);
   end;
   // an unknown tensor means a model we do not understand
-  if used <> length(fFile.Tensors) then
+  if used <> TensorCount then
     EInferError.RaiseUtf8('%: % tensors in the file, % understood',
-      [self, length(fFile.Tensors), used]);
+      [self, TensorCount, used]);
 end;
 
 function TQwen3Model.NewContext: TQwen3Context;

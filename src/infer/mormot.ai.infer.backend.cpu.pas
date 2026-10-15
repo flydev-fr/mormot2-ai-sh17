@@ -70,10 +70,19 @@ procedure InferQuantizeRowQ8_0(x: PSingleArray; aCount: PtrInt;
 procedure InferQuantizeRowQ8_0Pascal(x: PSingleArray; aCount: PtrInt;
   aBlocks: PInferBlockQ8_0Array);
 
+/// quantize aCount (a multiple of 32) weights into aCount div 32 Q8_0 blocks
+// - the bytes of ggml's quantize_row_q8_0_ref, what a GGUF writer stores: as
+// InferQuantizeRowQ8_0, but ties round away from zero (roundf), not to even -
+// weights widened from BF16 have few mantissa bits and do hit ties
+procedure InferQuantizeRowQ8_0Ref(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_0Array);
+
 /// quantize aCount (a multiple of 32) singles into aCount div 32 Q4_0 blocks
 // - the bytes of ggml's quantize_row_q4_0_ref (what a GGUF writer stores): d =
 // m / -8 with m the first value of the largest magnitude (kept as FP16), q =
-// min(15, trunc(x * (1 / d) + 8.5)), every step a single
+// min(15, trunc(x * (1 / d) + 8.5)) with x * (1 / d) + 8.5 rounded to single
+// once, as a fused multiply-add: the compilers contract it so on aarch64 and
+// with -march=native on x86 (a build rounding twice differs in rare bytes)
 // - NaN and infinity are refused (EInferError); a block whose 1 / d would
 // overflow a single stores q = 8 (value 0) - ggml leaves that case undefined
 procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
@@ -528,8 +537,8 @@ begin
     InferQuantizeRowQ8_0Pascal(x, aCount, aBlocks);
 end;
 
-procedure InferQuantizeRowQ8_0Pascal(x: PSingleArray; aCount: PtrInt;
-  aBlocks: PInferBlockQ8_0Array);
+procedure QuantizeQ8_0(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_0Array; aTiesAway: boolean);
 var
   b, j: PtrInt;
   amax, v, d, id, t: single;
@@ -568,20 +577,33 @@ begin
     begin
       // one correctly rounded single product, as the SIMD kernels form it
       t := xb^[j] * id;
-      // nearest, ties to even - spelled out: Round depends on the FPU mode
+      // nearest, ties to even (or away from zero) - spelled out: Round
+      // depends on the FPU mode
       f := Trunc(t);
       v := t - f; // exact: f and t are close singles
       if v > 0.5 then
         inc(f)
       else if v < -0.5 then
         dec(f)
-      else if (v = 0.5) and odd(f) then
+      else if (v = 0.5) and (aTiesAway or odd(f)) then
         inc(f)
-      else if (v = -0.5) and odd(f) then
+      else if (v = -0.5) and (aTiesAway or odd(f)) then
         dec(f);
       aBlocks^[b].qs[j] := f;
     end;
   end;
+end;
+
+procedure InferQuantizeRowQ8_0Pascal(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_0Array);
+begin
+  QuantizeQ8_0(x, aCount, aBlocks, {tiesaway=}false);
+end;
+
+procedure InferQuantizeRowQ8_0Ref(x: PSingleArray; aCount: PtrInt;
+  aBlocks: PInferBlockQ8_0Array);
+begin
+  QuantizeQ8_0(x, aCount, aBlocks, {tiesaway=}true);
 end;
 
 procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
@@ -589,6 +611,7 @@ procedure InferQuantizeRowQ4_0(x: PSingleArray; aCount: PtrInt;
 var
   b, j, q0, q1: PtrInt;
   amax, m, v, d, id, t: single;
+  p: double;
   xb: PSingleArray;
 begin
   for b := 0 to (aCount shr 5) - 1 do
@@ -619,14 +642,17 @@ begin
     id := 1 / d;
     for j := 0 to 15 do
     begin
-      // each step rounded to single, as the C float arithmetic
-      t := xb^[j] * id;
-      t := t + 8.5;
+      // the product of two singles is exact in a double: one rounding to
+      // single after the sum, like the fused multiply-add of the C code
+      p := xb^[j];
+      p := p * id;
+      t := p + 8.5;
       q0 := Trunc(t);
       if q0 > 15 then
         q0 := 15;
-      t := xb^[j + 16] * id;
-      t := t + 8.5;
+      p := xb^[j + 16];
+      p := p * id;
+      t := p + 8.5;
       q1 := Trunc(t);
       if q1 > 15 then
         q1 := 15;

@@ -873,7 +873,8 @@ def q8():
 
 def q4():
     """Q4_0 fixtures from ggml itself (phase 3e): the reference quantizer of a GGUF
-    writer, dequantization, and the Q4_0 x Q8_0 dot product of ggml-cpu"""
+    writer, dequantization, and the Q4_0 x Q8_0 dot product of ggml-cpu; and Q8_0
+    weights from that writer's quantizer (ties away from zero)"""
     print("q4")
     g = Ggml()
     rng = np.random.default_rng(TINY_SEED + 4)
@@ -898,6 +899,17 @@ def q4():
              .reshape(8, 3 * Q4_BLOCK), "quantize_row_q4_0_ref per row")
     blob.add("dequant/y", np.stack([g.dequant_q4(g.quant_q4(r), 96) for r in x]),
              "dequantize_row_q4_0 of those blocks")
+    # Q8_0 weights as a GGUF writer stores them: quantize_row_q8_0_ref rounds ties
+    # away from zero (activations: to even); weights widened from BF16 hit ties
+    w8 = f32(rng.standard_normal((4, 64)))
+    w8[0, :8] = [127, 2.5, -3.5, 0.5, -0.5, 1.5, -1.5, 126.5]  # d = 1: ties
+    w8[1] = (w8[1].astype(np.float32).view(np.uint32) & 0xFFFF0000).view(np.float32)
+    w8[2] = (w8[2].astype(np.float32).view(np.uint32) & 0xFFFF0000).view(np.float32) * 8
+    w8[3, 32:] = 0
+    blob.add("q8ref/x", w8, "row 0 ties at d = 1, rows 1-2 BF16 values")
+    blob.add("q8ref/blocks", np.frombuffer(b"".join(g.quant_ref(r) for r in w8),
+                                           dtype=np.uint8).reshape(4, 2 * Q8_BLOCK),
+             "quantize_row_q8_0_ref per row")
     # Q4_0 linear: weights from the reference quantizer, activations quantized by ggml-cpu
     n_in, n_out = 128, 6
     xs = f32(rng.standard_normal((3, n_in)))

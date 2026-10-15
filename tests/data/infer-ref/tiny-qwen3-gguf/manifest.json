@@ -1,0 +1,42 @@
+{
+ "dataset": "tiny-qwen3-gguf",
+ "environment": {
+  "created_utc": "2026-10-15T19:29:11Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "note": "tiny-qwen3 (and its untied variant) as GGUF: q8_0 and q4_0 matrices from ggml's reference quantizers (token_embd Q8_0 in both), untied-f16 with output.weight in F16; bad-*: another architecture, RoPE scaling, an extra tensor, a missing one, an infinite Q8_0 scale, a transposed shape, RoPE over 16 of 32 dimensions, a NaN scale in the embedding of an untied file",
+ "files": {
+  "bad-arch.gguf": "50d0adb00a7a186212f3028e1f5128bedd6e57dc82d12f38667d0afe0448a542",
+  "bad-embscale.gguf": "113a2c08d41c3d942777965c39e972ce9ba7ce8b552820b2101b5e75e6d9c06b",
+  "bad-extra.gguf": "3c41b6923dbf9da2e94f71cdd0720fe4ed588f24c4baef2f08ce09ec52e89b72",
+  "bad-missing.gguf": "1be5ecc384fc299803e0e4123166c89cb9de589dfd7556779edde39f6187c450",
+  "bad-rope.gguf": "963f1cadd03f17c73c46ea76378c7370180ea2ca9a42010adeb28fbaadf72d0f",
+  "bad-ropedim.gguf": "9ac2fd0a5027ea17e58b7f8ec8b080744a8981f1be1e91d207c7845ed0895d6b",
+  "bad-scale.gguf": "f5d5a8df601a2027c25158af3d63933b368cb89af89db7a30b81118b27df8f86",
+  "bad-shape.gguf": "f9e3a32629cb484bded6802bd8512dd2d2ddc85a63d5648445b8ad73a321d450",
+  "q4_0.gguf": "97a1b2c0a3b30ae59cc2062146a78d1f789c87997ea9cbb67b285069111ee4a7",
+  "q8_0.gguf": "036568de8794efe6c45617b40fcf270aa291ca4ed89145635acdce2d76646766",
+  "untied-f16.gguf": "9339abebbaa79e6afb879a382ea308c4919888dadf0a0caa02e6bad499a66d9e"
+ }
+}

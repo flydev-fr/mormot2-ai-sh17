@@ -1,7 +1,7 @@
 {
  "dataset": "q4",
  "environment": {
-  "created_utc": "2026-10-15T18:05:09Z",
+  "created_utc": "2026-10-15T18:49:35Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
@@ -29,8 +29,8 @@
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 8640,
-  "sha256": "a78d59f7029c199e386cb3c0c22f9bbcd8e8a81d0f786d827cc32663fa806d3e",
+  "bytes": 9936,
+  "sha256": "f3f19b12e7dee512881790609bd66ad3f31137e73a5d94128fdcb5d714152193",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -71,15 +71,39 @@
    "note": "dequantize_row_q4_0 of those blocks"
   },
   {
+   "name": "q8ref/x",
+   "dtype": "f32",
+   "shape": [
+    4,
+    64
+   ],
+   "offset": 6576,
+   "bytes": 1024,
+   "sha256": "7569a37e5606f30d07410e958005cc4d18ff9b8c1d70a02c310c15a1c5be9a03",
+   "note": "row 0 ties at d = 1, rows 1-2 BF16 values"
+  },
+  {
+   "name": "q8ref/blocks",
+   "dtype": "u8",
+   "shape": [
+    4,
+    68
+   ],
+   "offset": 7600,
+   "bytes": 272,
+   "sha256": "f6f905d9e086a062fe605d477a7c1721847e9363745751c7c96b2affc6a21a60",
+   "note": "quantize_row_q8_0_ref per row"
+  },
+  {
    "name": "linear/x",
    "dtype": "f32",
    "shape": [
     3,
     128
    ],
-   "offset": 6576,
+   "offset": 7872,
    "bytes": 1536,
-   "sha256": "378dcbdc12eb2500098eb8db4f0533b826e07bede2c3374494d058b9f355cff6"
+   "sha256": "9baab6edcbd2f3c171f9bb18edebe37a2f841e16987ca9540e9fdd925b2a8e48"
   },
   {
    "name": "linear/weight",
@@ -88,9 +112,9 @@
     6,
     72
    ],
-   "offset": 8112,
+   "offset": 9408,
    "bytes": 432,
-   "sha256": "d01fab7a364eed14806f630da156803245e5db592ebe824cc908f91d8ba1c41d",
+   "sha256": "8d0ee819567481d2a4a7b543d63eeb54beae122e8e96dc95f8163baab5751f1d",
    "note": "[out, in/32 blocks] Q4_0"
   },
   {
@@ -99,9 +123,9 @@
    "shape": [
     6
    ],
-   "offset": 8544,
+   "offset": 9840,
    "bytes": 24,
-   "sha256": "462ee43e1c690b446d2e232f748e32381a52b21ca08e308b32426ad69b0d3807"
+   "sha256": "2bfcf79534535336b55962131f7a0e346d179c0c1fd52e422c9e0318d8f4f725"
   },
   {
    "name": "linear/y",
@@ -110,9 +134,9 @@
     3,
     6
    ],
-   "offset": 8568,
+   "offset": 9864,
    "bytes": 72,
-   "sha256": "bb6457782741693f0b85cc73c61168fdc17897fdfd923afbd84accb488e06b13",
+   "sha256": "225ee2911a87d318b78284b80b171f2eebf28662f9f5712e0db53891a519c78d",
    "note": "ggml_vec_dot_q4_0_q8_0 (float sums) + bias in float64"
   }
  ]

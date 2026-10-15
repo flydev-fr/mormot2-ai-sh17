@@ -24,6 +24,7 @@ uses
   mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.safetensors,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.model.qwen3,
@@ -56,7 +57,9 @@ type
     /// Qwen3-0.6B quantized to aType against the FP32 reference: last logits
     // within aCos / aMaxAbs, greedy equal up to a step the reference was less
     // than aMargin sure of
-    procedure Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs, aMargin: double);
+    // - aGguf: the model from that file instead of quantized at load
+    procedure Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs, aMargin: double;
+      const aGguf: TFileName = '');
   published
     /// the tiny Qwen3 (BF16 weights): every state and all logits
     procedure TinyForwardMatchesReference;
@@ -91,6 +94,11 @@ type
     procedure TinyQ4;
     /// Qwen3-0.6B with Q4_0 layers against the FP32 reference
     procedure Qwen3Q4AgainstReference;
+    /// the tiny Qwen3 from GGUF files: settings, matrices byte for byte like
+    // ours, logits, F16 and an untied head, damaged files refused
+    procedure TinyGguf;
+    /// Qwen's own Q8_0 GGUF of Qwen3-0.6B: every matrix our bytes, the Q8_0 gate
+    procedure Qwen3Gguf;
   end;
 
 
@@ -921,7 +929,7 @@ begin
 end;
 
 procedure TTestInferQwen3.Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs,
-  aMargin: double);
+  aMargin: double; const aGguf: TFileName);
 var
   dir, refdir: TFileName;
   ref: TInferRefSet;
@@ -947,8 +955,11 @@ begin
   model := nil;
   try
     timer.Start;
-    model := TQwen3Model.Create(dir, fFast, aType);
-    AddConsole(FormatString('% model quantized in %', [INFER_DTYPE_NAME[aType],
+    if aGguf <> '' then
+      model := TQwen3Model.CreateFromGguf(aGguf, fFast)
+    else
+      model := TQwen3Model.Create(dir, fFast, aType);
+    AddConsole(FormatString('% model loaded in %', [INFER_DTYPE_NAME[aType],
       timer.Stop]));
     prompts := ref.Manifest^.A['prompts'];
     for i := 0 to prompts^.Count - 1 do
@@ -1028,7 +1039,9 @@ begin
   // 1.36 with NEON, 0.9868 / 2.11 with AVX2; float against exact Q8_0
   // alone: cosine 0.998 to 0.999, up to 0.95 apart on both platforms (likely
   // because a changed rounding flips single int8 activations of the next
-  // layer - not measured inside).
+  // layer - not measured inside). Since the weights round ties away from
+  // zero like a GGUF writer (3e-2): 0.9972 / 1.31 with NEON, 0.9961 / 1.40
+  // with AVX2.
   // Greedy leaves the FP32 tokens only where the reference itself was less
   // than 0.28 sure. A broken quantizer fails all three by far (shifted rows:
   // cosine 0.23, max error 24)
@@ -1037,13 +1050,353 @@ end;
 
 procedure TTestInferQwen3.Qwen3Q4AgainstReference;
 begin
-  // Q4_0 layers, Q8_0 head, measured 2026-10-15: cosine 0.764 (chat_tool) to
-  // 0.959 and max error up to 9.6 with NEON, 0.7636 to 0.956 and up to 9.9 with
-  // AVX2 - 4 bits are too coarse for a 0.6B model:
+  // Q4_0 layers, Q8_0 head, measured 2026-10-15: cosine 0.89 to 0.96 and max
+  // error up to 9.8 on six prompts - 4 bits are too coarse for a 0.6B model:
   // greedy leaves the reference even where it was 1.94 sure (raw_fox, step 1),
-  // and chat_tool answers instead of calling the tool. No greedy condition then;
-  // the bounds still catch a broken quantizer or kernel by far
-  Qwen3Quantized(idtQ4_0, 0.7, 12, 1e9);
+  // and chat_tool answers instead of calling the tool. chat_tool is chaotic
+  // under Q4_0: rounding the product and the sum of the quantizer once instead
+  // of twice changes a few bytes in thousands and moves its cosine from 0.76 to
+  // 0.66 (max error 11). No greedy condition then; bounds a broken quantizer
+  // or kernel misses by far
+  Qwen3Quantized(idtQ4_0, 0.5, 15, 1e9);
+end;
+
+
+/// the matrices of layer aLayer (or the head for -1): weight, rows, columns
+procedure LayerMatrices(aModel: TQwen3Model; aLayer: PtrInt;
+  var aW: array of TInferWeight; var aRows, aCols: array of PtrInt);
+var
+  h, f, qw, kvw: PtrInt;
+  l: ^TQwen3Layer;
+begin
+  h := aModel.Config.Hidden;
+  f := aModel.Config.Intermediate;
+  qw := aModel.Config.Heads * aModel.Config.HeadDim;
+  kvw := aModel.Config.KvHeads * aModel.Config.HeadDim;
+  if aLayer < 0 then
+  begin
+    aW[0] := aModel.Head;
+    aRows[0] := aModel.Config.VocabSize;
+    aCols[0] := h;
+    exit;
+  end;
+  l := @aModel.Layers[aLayer];
+  aW[0] := l^.Q;
+  aRows[0] := qw;
+  aCols[0] := h;
+  aW[1] := l^.K;
+  aRows[1] := kvw;
+  aCols[1] := h;
+  aW[2] := l^.V;
+  aRows[2] := kvw;
+  aCols[2] := h;
+  aW[3] := l^.O;
+  aRows[3] := h;
+  aCols[3] := qw;
+  aW[4] := l^.Gate;
+  aRows[4] := f;
+  aCols[4] := h;
+  aW[5] := l^.Up;
+  aRows[5] := f;
+  aCols[5] := h;
+  aW[6] := l^.Down;
+  aRows[6] := h;
+  aCols[6] := f;
+end;
+
+const
+  MATRIX_NAMES: array[0..6] of RawUtf8 = (
+    'q', 'k', 'v', 'o', 'gate', 'up', 'down');
+
+/// the same type and bytes in every matrix of two models of one shape
+function SameMatrices(a, b: TQwen3Model; out aDetail: RawUtf8): boolean;
+var
+  i, k, n, bytes: PtrInt;
+  wa, wb: array[0..6] of TInferWeight;
+  rows, cols: array[0..6] of PtrInt;
+begin
+  aDetail := '';
+  result := true;
+  for i := -1 to a.Config.Layers - 1 do
+  begin
+    LayerMatrices(a, i, wa, rows, cols);
+    LayerMatrices(b, i, wb, rows, cols);
+    n := 7;
+    if i < 0 then
+      n := 1;
+    for k := 0 to n - 1 do
+    begin
+      bytes := rows[k] * (cols[k] div INFER_DTYPE_BLOCK[wa[k].DType]) *
+        INFER_DTYPE_SIZE[wa[k].DType];
+      if (wa[k].DType <> wb[k].DType) or
+         not CompareMem(wa[k].Data, wb[k].Data, bytes) then
+      begin
+        if i < 0 then
+          aDetail := 'head'
+        else
+          aDetail := FormatUtf8('layer % %', [i, MATRIX_NAMES[k]]);
+        aDetail := FormatUtf8('% (% / %)', [aDetail, INFER_DTYPE_NAME[wa[k].DType],
+          INFER_DTYPE_NAME[wb[k].DType]]);
+        result := false;
+        exit;
+      end;
+    end;
+  end;
+end;
+
+procedure TTestInferQwen3.TinyGguf;
+var
+  dir, gdir: TFileName;
+  ref: TInferRefSet;
+  g, s, e: TQwen3Model;
+  exact: TInferCpuFastBackend;
+  lg, le: TSingleDynArray;
+  ids: PIntegerArray;
+  n, m, k, v: PtrInt;
+  cmp: TInferCompare;
+  detail: RawUtf8;
+  same: boolean;
+
+  function Logits(aModel: TQwen3Model; aCase: PtrInt): TSingleDynArray;
+  var
+    c: TQwen3Context;
+  begin
+    ids := ref.I32(FormatUtf8('case%.ids', [aCase]), n);
+    result := nil;
+    SetLength(result, n * aModel.Config.VocabSize);
+    c := aModel.NewContext;
+    try
+      aModel.Forward(c, ids, n, pointer(result), true);
+    finally
+      c.Free;
+    end;
+  end;
+
+  procedure Refused(const aFile, aWhy: RawUtf8);
+  var
+    raised: boolean;
+  begin
+    raised := false;
+    try
+      TQwen3Model.CreateFromGguf(gdir + Utf8ToString(aFile), fCpu).Free;
+    except
+      on E: EInferError do
+        raised := PosEx(aWhy, StringToUtf8(E.Message)) > 0;
+    end;
+    CheckUtf8(raised, '% refused (%)', [aFile, aWhy]);
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  gdir := FindInferRefDir('tiny-qwen3-gguf');
+  if CheckFailed((dir <> '') and (gdir <> ''), 'tiny-qwen3 and its GGUF found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  exact := TInferCpuFastBackend.Create;
+  exact.Exact := true;
+  g := nil;
+  s := nil;
+  e := nil;
+  try
+    // Q8_0 as llama.cpp writes it: the settings of config.json, the matrices
+    // of our own quantizer byte for byte (both are ggml's reference)
+    g := TQwen3Model.CreateFromGguf(gdir + 'q8_0.gguf', fCpu);
+    s := TQwen3Model.Create(dir, fCpu, idtQ8_0);
+    Check(g.Weights = idtQ8_0, 'Q8_0 file');
+    Check(g.Config.TiedEmbeddings, 'no output.weight: tied');
+    Check((g.Config.VocabSize = s.Config.VocabSize) and
+      (g.Config.Hidden = s.Config.Hidden) and (g.Config.Layers = s.Config.Layers) and
+      (g.Config.Heads = s.Config.Heads) and (g.Config.KvHeads = s.Config.KvHeads) and
+      (g.Config.HeadDim = s.Config.HeadDim) and
+      (g.Config.Intermediate = s.Config.Intermediate) and
+      (g.Config.MaxPositions = s.Config.MaxPositions) and
+      (g.Config.RopeTheta = s.Config.RopeTheta), 'the settings of config.json');
+    same := SameMatrices(g, s, detail); // before the message reads detail
+    CheckUtf8(same, 'Q8_0 matrices like ours: %', [detail]);
+    // the embedding is Q8_0 here too (the safetensors model reads it in BF16):
+    // up to 0.07 from FP32 measured, so 0.1; Exact on all cores = the reference
+    e := TQwen3Model.CreateFromGguf(gdir + 'q8_0.gguf', exact);
+    v := g.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      lg := Logits(g, k);
+      le := Logits(e, k);
+      Check(CompareMem(pointer(lg), pointer(le), n * v * SizeOf(single)),
+        'GGUF: Exact = the reference backend');
+      cmp := InferCompare(pointer(lg), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 0.1, 0.1);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999),
+        'case % GGUF Q8_0 vs FP32: %', [k, InferCompareText(cmp)]);
+    end;
+    FreeAndNil(e);
+    FreeAndNil(g);
+    FreeAndNil(s);
+    // Q4_0 layers with a Q8_0 embedding and head: our Q4_0 model byte for byte
+    g := TQwen3Model.CreateFromGguf(gdir + 'q4_0.gguf', fCpu);
+    s := TQwen3Model.Create(dir, fCpu, idtQ4_0);
+    Check(g.Weights = idtQ4_0, 'Q4_0 file');
+    same := SameMatrices(g, s, detail);
+    CheckUtf8(same, 'Q4_0 matrices like ours: %', [detail]);
+    FreeAndNil(g);
+    FreeAndNil(s);
+    // F16 matrices widened, an untied head from output.weight
+    ref.Free;
+    ref := nil;
+    ref := TInferRefSet.CreateFromFolder(MakePath([dir, 'untied'], true));
+    g := TQwen3Model.CreateFromGguf(gdir + 'untied-f16.gguf', fCpu);
+    Check(g.Weights = idtF32, 'F16 widened to F32');
+    Check(not g.Config.TiedEmbeddings, 'output.weight: untied');
+    lg := Logits(g, 0);
+    cmp := InferCompare(pointer(lg), ref.F32('case0.logits', m), n * g.Config.VocabSize,
+      0.01, 0.01);
+    CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.9999),
+      'untied F16 GGUF vs FP32: %', [InferCompareText(cmp)]);
+    FreeAndNil(g);
+    // damaged files
+    Refused('bad-arch.gguf', 'architecture');
+    Refused('bad-rope.gguf', 'rope scaling');
+    Refused('bad-extra.gguf', 'understood');
+    Refused('bad-missing.gguf', 'no tensor');
+    Refused('bad-scale.gguf', 'no finite number');
+    Refused('bad-shape.gguf', 'shaped');
+    Refused('bad-ropedim.gguf', 'RoPE over');
+    Refused('bad-embscale.gguf', 'no finite number');
+  finally
+    e.Free;
+    s.Free;
+    g.Free;
+    exact.Free;
+    ref.Free;
+  end;
+end;
+
+const
+  HF_MATRICES: array[0..6] of RawUtf8 = (
+    'self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight',
+    'self_attn.o_proj.weight', 'mlp.gate_proj.weight', 'mlp.up_proj.weight',
+    'mlp.down_proj.weight');
+
+/// the lowest cosine between a Q8_0 matrix of aModel and the same weights in
+// aFile (BF16), and the matrix it belongs to
+function SourceCosine(aModel: TQwen3Model; aFile: TSafeTensorsFile;
+  out aWorst: RawUtf8): double;
+var
+  i, k, n, r, c: PtrInt;
+  w: array[0..6] of TInferWeight;
+  rows, cols: array[0..6] of PtrInt;
+  t: PInferTensor;
+  mine: TSingleDynArray;
+  name: RawUtf8;
+  a, b, dot, na, nb, cs: double;
+begin
+  aWorst := '';
+  result := 2;
+  for i := -1 to aModel.Config.Layers - 1 do
+  begin
+    LayerMatrices(aModel, i, w, rows, cols);
+    n := 7;
+    if i < 0 then
+      n := 1;
+    for k := 0 to n - 1 do
+    begin
+      if i < 0 then
+        name := 'model.embed_tokens.weight'
+      else
+        name := FormatUtf8('model.layers.%.%', [i, HF_MATRICES[k]]);
+      if w[k].DType <> idtQ8_0 then
+      begin
+        aWorst := FormatUtf8('% is %', [name, INFER_DTYPE_NAME[w[k].DType]]);
+        result := -1;
+        exit;
+      end;
+      t := aFile.Tensor(name);
+      SetLength(mine, cols[k]);
+      dot := 0;
+      na := 0;
+      nb := 0;
+      for r := 0 to rows[k] - 1 do
+      begin
+        InferRowToF32(w[k].Data, idtQ8_0, r, cols[k], pointer(mine));
+        for c := 0 to cols[k] - 1 do
+        begin
+          a := mine[c];
+          // the BF16 weight, widened exactly into the same buffer
+          PCardinal(@mine[c])^ := cardinal(PWordArray(t^.Data)^[r * cols[k] + c]) shl 16;
+          b := mine[c];
+          dot := dot + a * b;
+          na := na + a * a;
+          nb := nb + b * b;
+        end;
+      end;
+      cs := dot / Sqrt(na * nb);
+      if cs < result then
+      begin
+        result := cs;
+        aWorst := name;
+      end;
+    end;
+  end;
+end;
+
+/// vendor/models/qwen3-0.6b-q8_0.gguf next to the model folder, '' if absent
+function RealGguf(const aModelDir: TFileName): TFileName;
+begin
+  result := ExpandFileName(IncludeTrailingPathDelimiter(aModelDir) + '..' +
+    PathDelim + 'qwen3-0.6b-q8_0.gguf');
+  if not FileExists(result) then
+    result := '';
+end;
+
+procedure TTestInferQwen3.Qwen3Gguf;
+var
+  dir, gguf: TFileName;
+  g: TQwen3Model;
+  st: TSafeTensorsFile;
+  detail: RawUtf8;
+  cs: double;
+  timer: TPrecisionTimer;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  gguf := RealGguf(dir);
+  if gguf = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q8_0.gguf');
+    AddConsole('SKIP Qwen3 GGUF: no vendor/models/qwen3-0.6b-q8_0.gguf ' +
+      '(Qwen/Qwen3-0.6B-GGUF, see docs/native-inference.md)');
+    exit;
+  end;
+  g := nil;
+  st := nil;
+  try
+    timer.Start;
+    g := TQwen3Model.CreateFromGguf(gguf, fFast);
+    AddConsole(FormatString('Qwen3-0.6B GGUF loaded in %', [timer.Stop]));
+    Check(g.Weights = idtQ8_0, 'Q8_0 file');
+    Check(g.Config.TiedEmbeddings and (g.Config.Layers = 28) and
+      (g.Config.HeadDim = 128) and (g.Config.MaxPositions = 40960), 'settings');
+    // Qwen's file holds other weights than the BF16 release of the reference
+    // revision (token_embd alone is the bytes of ggml's quantizer on it; in
+    // the layers, scales differ in most blocks and values by a few percent):
+    // every matrix close to its BF16 weights - one mapped to the wrong tensor
+    // has a cosine near 0
+    st := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(dir) +
+      'model.safetensors');
+    cs := SourceCosine(g, st, detail);
+    AddConsole(FormatString('GGUF matrices against the BF16 weights: lowest ' +
+      'cosine % (%)', [cs, detail]));
+    // measured 2026-10-15: 0.9998 at worst (layer 2 down_proj)
+    CheckUtf8(cs >= 0.999, 'GGUF matrices like the BF16 weights: % %', [cs, detail]);
+  finally
+    st.Free;
+    g.Free;
+  end;
+  // the gate of Q8_0, but quantized from other weights: greedy leaves
+  // raw_fox at a step the reference was 0.71 sure of (measured 2026-10-15),
+  // logits cosine 0.997 and max error 1.24 at worst
+  Qwen3Quantized(idtQ8_0, 0.98, 3, 1, gguf);
 end;
 
 procedure TTestInferQwen3.Qwen3GreedyMatchesReference;

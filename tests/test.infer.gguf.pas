@@ -61,7 +61,8 @@ type
     /// the Q8_0 Linear against ggml_vec_dot_q8_0_q8_0, and dequantization
     procedure LinearQ8LikeGgml;
     /// Q4_0 weights quantize to the bytes of ggml's reference quantizer,
-    // dequantize exactly and give the Q4_0 Linear of ggml-cpu
+    // dequantize exactly and give the Q4_0 Linear of ggml-cpu; Q8_0 weights
+    // quantize like ggml's reference quantizer (ties away from zero)
     procedure Q4LikeGgml;
     /// the tiny GGUF: metadata, tensors, typed access
     procedure ReaderReadsTinyFile;
@@ -462,6 +463,23 @@ begin
         refused := true;
     end;
     Check(refused, 'infinity refused');
+    // Q8_0 weights: the bytes of quantize_row_q8_0_ref - ties away from zero,
+    // where the activation quantizer rounds them to even
+    t := ref.Tensor('q8ref/x');
+    rows := t^.Shape[0];
+    cols := t^.Shape[1];
+    x := ref.F32('q8ref/x', n);
+    blocks := ref.U8('q8ref/blocks', m);
+    SetLength(mine, (cols div 32) * SizeOf(TInferBlockQ8_0));
+    for r := 0 to rows - 1 do
+    begin
+      InferQuantizeRowQ8_0Ref(@x^[r * cols], cols, pointer(mine));
+      CheckUtf8(CompareMem(pointer(mine), @blocks^[r * length(mine)], length(mine)),
+        'weight row % quantized like quantize_row_q8_0_ref', [r]);
+    end;
+    InferQuantizeRowQ8_0(x, cols, pointer(mine));
+    Check(not CompareMem(pointer(mine), blocks, length(mine)),
+      'the activation quantizer rounds the ties of row 0 otherwise');
     // the Linear against ggml_vec_dot_q4_0_q8_0
     t := ref.Tensor('linear/x');
     rows := t^.Shape[0];

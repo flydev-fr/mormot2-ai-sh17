@@ -9,6 +9,8 @@ Targets (all of them when called without arguments):
   qwen3-chat     tests/data/infer-ref/qwen3-chat: the chat template gate
   tiny-qwen3     tests/data/infer-ref/tiny-qwen3: a seeded 2-layer Qwen3 (BF16 weights)
                  with every state, the logits and greedy continuations
+  tiny-qwen3-gguf tests/data/infer-ref/tiny-qwen3-gguf: tiny-qwen3 as GGUF files (Q8_0,
+                 Q4_0 and F16 from ggml's quantizers) and damaged variants
   qwen3          tests/data/infer-ref/qwen3: Qwen3-0.6B in FP32 - states, logits and
                  greedy continuations of a fixed prompt set (the gate of phase 2)
 
@@ -997,11 +999,128 @@ def qwen3(snapshot):
     blob.write(os.path.join(mr.OUT, "qwen3"), manifest)
 
 
+QWEN3_GGUF_LAYER = [
+    ("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"),
+    ("self_attn.v_proj", "attn_v"), ("self_attn.o_proj", "attn_output"),
+    ("self_attn.q_norm", "attn_q_norm"), ("self_attn.k_norm", "attn_k_norm"),
+    ("mlp.gate_proj", "ffn_gate"), ("mlp.up_proj", "ffn_up"),
+    ("mlp.down_proj", "ffn_down"), ("input_layernorm", "attn_norm"),
+    ("post_attention_layernorm", "ffn_norm")]
+
+
+def tiny_qwen3_gguf():
+    """tiny-qwen3 as llama.cpp's converter and quantizer write it (architecture qwen3,
+    tensor names blk.N.*, settings as qwen3.* metadata, a tied head left out), with
+    the matrices quantized by ggml itself - plus damaged variants the loader refuses"""
+    print("tiny-qwen3-gguf")
+    from safetensors.torch import load_file
+    g = mr.Ggml()
+    folder = os.path.join(mr.OUT, "tiny-qwen3-gguf")
+    os.makedirs(folder, exist_ok=True)
+
+    def load(sub):
+        src = os.path.join(mr.OUT, "tiny-qwen3", *sub)
+        cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+        # BF16 in the file: widening to float32 is exact
+        raw = load_file(os.path.join(src, "model.safetensors"))
+        sd = {k: v.float().numpy() for k, v in raw.items()}
+        return cfg, sd
+
+    def metadata(cfg, arch="qwen3"):
+        return [("general.architecture", "str", arch),
+                ("general.name", "str", "tiny-qwen3"),
+                (arch + ".block_count", "u32", cfg["num_hidden_layers"]),
+                (arch + ".context_length", "u32", cfg["max_position_embeddings"]),
+                (arch + ".embedding_length", "u32", cfg["hidden_size"]),
+                (arch + ".feed_forward_length", "u32", cfg["intermediate_size"]),
+                (arch + ".attention.head_count", "u32", cfg["num_attention_heads"]),
+                (arch + ".attention.head_count_kv", "u32", cfg["num_key_value_heads"]),
+                (arch + ".rope.freq_base", "f32", cfg["rope_parameters"]["rope_theta"]),
+                (arch + ".attention.layer_norm_rms_epsilon", "f32", cfg["rms_norm_eps"]),
+                (arch + ".attention.key_length", "u32", cfg["head_dim"]),
+                (arch + ".attention.value_length", "u32", cfg["head_dim"])]
+
+    def tensors(cfg, sd, matrix):
+        """matrix: 'q8', 'q4' or 'f16' for the 2-D weights; norms stay F32"""
+        out = []
+
+        def add(name, a, kind):
+            a = np.ascontiguousarray(a, dtype=np.float32)
+            ne = list(reversed(a.shape))
+            if kind == "f32":
+                out.append((name, 0, ne, a.tobytes()))
+            elif kind == "f16":
+                out.append((name, 1, ne, a.astype(np.float16).tobytes()))
+            elif kind == "q8":
+                out.append((name, 8, ne, b"".join(g.quant_ref(r) for r in a)))
+            else:
+                out.append((name, 2, ne, b"".join(g.quant_q4(r) for r in a)))
+
+        add("token_embd.weight", sd["model.embed_tokens.weight"],
+            "q8" if matrix == "q4" else matrix)
+        add("output_norm.weight", sd["model.norm.weight"], "f32")
+        if "lm_head.weight" in sd:
+            add("output.weight", sd["lm_head.weight"], "q8" if matrix == "q4" else matrix)
+        for i in range(cfg["num_hidden_layers"]):
+            for hf, gg in QWEN3_GGUF_LAYER:
+                a = sd[f"model.layers.{i}.{hf}.weight"]
+                add(f"blk.{i}.{gg}.weight", a, "f32" if a.ndim == 1 else matrix)
+        return out
+
+    cfg, sd = load([])
+    files = {}
+    files["q8_0.gguf"] = (metadata(cfg), tensors(cfg, sd, "q8"))
+    files["q4_0.gguf"] = (metadata(cfg), tensors(cfg, sd, "q4"))
+    ucfg, usd = load(["untied"])
+    files["untied-f16.gguf"] = (metadata(ucfg), tensors(ucfg, usd, "f16"))
+    # damaged: each one fails a different check of the loader
+    kv, ts = metadata(cfg), tensors(cfg, sd, "q8")
+    files["bad-arch.gguf"] = (metadata(cfg, "llama"), ts)
+    files["bad-rope.gguf"] = (kv + [("qwen3.rope.scaling.type", "str", "linear")], ts)
+    files["bad-extra.gguf"] = (kv, ts + [("blk.0.attn_q.bias", 0, [128],
+                                          np.zeros(128, np.float32).tobytes())])
+    files["bad-missing.gguf"] = (kv, [t for t in ts if t[0] != "blk.1.ffn_down.weight"])
+    inf = [list(t) for t in ts]
+    for t in inf:
+        if t[0] == "blk.0.ffn_up.weight":
+            raw = bytearray(t[3])
+            raw[34 * 3:34 * 3 + 2] = b"\x00\x7c"  # the scale of block 3: +Inf
+            t[3] = bytes(raw)
+    files["bad-scale.gguf"] = (kv, [tuple(t) for t in inf])
+    shape = [list(t) for t in ts]
+    for t in shape:
+        if t[0] == "blk.0.attn_q.weight":
+            t[2] = list(reversed(t[2]))  # [in, out] instead of [out, in]: same bytes
+    files["bad-shape.gguf"] = (kv, [tuple(t) for t in shape])
+    files["bad-ropedim.gguf"] = (kv + [("qwen3.rope.dimension_count", "u32", 16)], ts)
+    # an untied Q8_0 file: token_embd only read per token, never a matrix
+    emb = [list(t) for t in tensors(ucfg, usd, "q8")]
+    for t in emb:
+        if t[0] == "token_embd.weight":
+            raw = bytearray(t[3])
+            raw[34 * 5:34 * 5 + 2] = bytes([0x00, 0x7e])  # the scale of block 5: NaN
+            t[3] = bytes(raw)
+    files["bad-embscale.gguf"] = (metadata(ucfg), [tuple(t) for t in emb])
+    for name, (kvs, tens) in files.items():
+        mr.gguf_write(os.path.join(folder, name), kvs, tens)
+    manifest = {"dataset": "tiny-qwen3-gguf", "environment": mr.environment(),
+                "ggml": {"dir": os.path.relpath(mr.GGML_DIR, mr.ROOT), "sha256": g.libs},
+                "note": "tiny-qwen3 (and its untied variant) as GGUF: q8_0 and q4_0 "
+                        "matrices from ggml's reference quantizers (token_embd Q8_0 in "
+                        "both), untied-f16 with output.weight in F16; bad-*: another "
+                        "architecture, RoPE scaling, an extra tensor, a missing one, an "
+                        "infinite Q8_0 scale, a transposed shape, RoPE over 16 of 32 "
+                        "dimensions, a NaN scale in the embedding of an untied file",
+                "files": {n: mr.sha256_file(os.path.join(folder, n)) for n in sorted(files)}}
+    with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1)
+
+
 def main():
     mr.setup_determinism()
     what = set(sys.argv[1:]) or {"qwen3-unicode", "qwen3-tokens", "qwen3-chat",
-                                 "tiny-qwen3", "qwen3"}
-    snapshot = fetch_model() if what - {"tiny-qwen3"} else None
+                                 "tiny-qwen3", "tiny-qwen3-gguf", "qwen3"}
+    snapshot = fetch_model() if what - {"tiny-qwen3", "tiny-qwen3-gguf"} else None
     if "qwen3-unicode" in what:
         unicode_inc(snapshot)
     if "qwen3-tokens" in what:
@@ -1010,6 +1129,8 @@ def main():
         chat(snapshot)
     if "tiny-qwen3" in what:
         tiny_qwen3()
+    if "tiny-qwen3-gguf" in what:
+        tiny_qwen3_gguf()
     if "qwen3" in what:
         qwen3(snapshot)
 
