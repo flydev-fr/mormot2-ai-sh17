@@ -27,6 +27,7 @@ uses
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.sampler,
   test.infer.ref,
   test.infer.bpe;
 

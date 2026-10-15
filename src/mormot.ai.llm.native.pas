@@ -10,8 +10,11 @@
 //   <tool_call> block a TLlmToolCall, the rest the content
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
-// - decoding is greedy for now: Temperature is ignored until the sampler of
-//   phase 3; Images and ResponseFormat are refused (text model, no constrained
+// - sampling (mormot.ai.infer.sampler): the defaults of the model's
+//   generation_config.json, as vLLM takes them; a request overrides them with
+//   Temperature (0 = greedy) and Extra top_p, top_k, min_p and seed - the wire
+//   names of OpenAI and vLLM
+// - Images and ResponseFormat are refused (text model, no constrained
 //   decoding yet) rather than silently dropped
 unit mormot.ai.llm.native;
 
@@ -47,7 +50,8 @@ uses
   mormot.ai.infer.chat,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
-  mormot.ai.infer.model.qwen3;
+  mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.sampler;
 
 const
   /// the answer cap when a request leaves MaxTokens at 0
@@ -162,13 +166,23 @@ function NativeChatPrompt(aTemplate: TQwen3ChatTemplate;
 function ParseQwen3ToolCall(const aBody: RawUtf8;
   out aName, aArguments: RawUtf8): boolean;
 
-/// greedy decoding of aPrompt into aParser, which is finished afterwards
+/// the sampling of a request: aDefaults, overridden by Temperature (when >= 0)
+// and by Extra top_p, top_k, min_p and seed; without a seed a random one
+// - the filters only shape a sampled draw: with greedy defaults (a model
+// without generation_config.json) a request must set a Temperature above 0,
+// top_p alone keeps it greedy - unlike vLLM, which samples at 1 then
+// - raises ELlmClient for a value of the wrong kind or out of range
+function NativeSampling(const aRequest: TLlmChatRequest;
+  const aDefaults: TInferSampling): TInferSampling;
+
+/// decoding of aPrompt into aParser, which is finished afterwards
+// - every token drawn by a TInferSampler of aSampling (greedy at temperature 0)
 // - at most aMaxNew tokens, and never more than the context holds: the last
 // token is not fed back, so a prompt of P tokens leaves MaxPositions - P + 1
 // - raises ELlmClient for an empty prompt, one longer than the context, or
 // aMaxNew <= 0
 procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser);
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling);
 
 type
   /// a local ILlmClient: a Qwen3 model folder run by the native engine
@@ -185,6 +199,7 @@ type
     fConfig: TLlmProviderConfig;
     fMaxTokens: integer;
     fEnableThinking: boolean;
+    fSampling: TInferSampling;
     procedure Generate(const aRequest: TLlmChatRequest; aParser: TQwen3OutputParser);
   public
     /// load tokenizer.json, config.json and model.safetensors of aFolder
@@ -211,6 +226,11 @@ type
     // (default true, the model's own default)
     property EnableThinking: boolean
       read fEnableThinking write fEnableThinking;
+    /// the sampling of a request that does not say otherwise: from the
+    // model's generation_config.json (greedy without one); its Seed is unused,
+    // every request draws its own unless Extra.seed is given
+    property Sampling: TInferSampling
+      read fSampling write fSampling;
     /// the model
     property Model: TQwen3Model
       read fModel;
@@ -649,13 +669,84 @@ begin
 end;
 
 
+{ NativeSampling }
+
+function NativeSampling(const aRequest: TLlmChatRequest;
+  const aDefaults: TInferSampling): TInferSampling;
+var
+  x: PDocVariantData;
+  seen: boolean;
+
+  function Num(const aName: RawUtf8; var aValue: double): boolean;
+  var
+    i: integer;
+  begin
+    result := false;
+    i := x^.GetValueIndex(aName);
+    if (i < 0) or VarIsEmptyOrNull(x^.Values[i]) then
+      exit;
+    // a boolean converts to 0 or 1 in mORMot: refused as no number
+    if (TVarData(x^.Values[i]).VType = varBoolean) or
+       not VariantToDouble(x^.Values[i], aValue) or not InferIsFinite(aValue) then
+      ELlmClient.RaiseUtf8('NativeSampling: % is no number', [aName]);
+    result := true;
+  end;
+
+  function Int(const aName: RawUtf8; var aValue: Int64): boolean;
+  var
+    i: integer;
+  begin
+    result := false;
+    i := x^.GetValueIndex(aName);
+    if (i < 0) or VarIsEmptyOrNull(x^.Values[i]) then
+      exit;
+    if (TVarData(x^.Values[i]).VType = varBoolean) or
+       not VariantToInt64(x^.Values[i], aValue) then
+      ELlmClient.RaiseUtf8('NativeSampling: % is no integer', [aName]);
+    result := true;
+  end;
+
+var
+  d: double;
+  v: Int64;
+begin
+  result := aDefaults;
+  if not InferIsFinite(aRequest.Temperature) then
+    ELlmClient.RaiseUtf8('NativeSampling: Temperature is no number', []);
+  if aRequest.Temperature >= 0 then
+    result.Temperature := aRequest.Temperature;
+  x := _Safe(aRequest.Extra);
+  if Num('top_p', d) then
+    result.TopP := d;
+  if Num('min_p', d) then
+    result.MinP := d;
+  if Int('top_k', v) then
+    if (v < 0) or (v > MaxInt) then
+      ELlmClient.RaiseUtf8('NativeSampling: top_k %', [v])
+    else
+      result.TopK := v;
+  seen := Int('seed', v);
+  if seen then
+    result.Seed := v
+  else
+    result.Seed := Int64(Random64);
+  try
+    TInferSampler.Create(result).Free; // the ranges, once
+  except
+    on E: EInferError do
+      ELlmClient.RaiseUtf8('NativeSampling: %', [E.Message]);
+  end;
+end;
+
+
 { NativeDecode }
 
 procedure NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser);
+  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling);
 var
   logits: TSingleDynArray;
   ctx: TQwen3Context;
+  sampler: TInferSampler;
   n: PtrInt;
   id: integer;
   stopped: boolean;
@@ -671,12 +762,14 @@ begin
   if aMaxNew > aModel.Config.MaxPositions - length(aPrompt) + 1 then
     aMaxNew := aModel.Config.MaxPositions - length(aPrompt) + 1;
   SetLength(logits, aModel.Config.VocabSize);
+  sampler := nil;
   ctx := aModel.NewContext;
   try
+    sampler := TInferSampler.Create(aSampling);
     aModel.Forward(ctx, pointer(aPrompt), length(aPrompt), pointer(logits));
     n := 0;
     repeat
-      id := InferArgMax(pointer(logits), aModel.Config.VocabSize);
+      id := sampler.Next(pointer(logits), aModel.Config.VocabSize);
       inc(n);
       stopped := aParser.Push(id);
       if stopped or (n = aMaxNew) then
@@ -684,6 +777,7 @@ begin
       aModel.Forward(ctx, @id, 1, pointer(logits));
     until false;
   finally
+    sampler.Free;
     ctx.Free;
   end;
   aParser.Finish(not stopped, length(aPrompt));
@@ -710,6 +804,7 @@ begin
   fTokenizer := TBpeTokenizer.Create(dir + 'tokenizer.json');
   fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
   fModel := TQwen3Model.Create(dir, fBackend, aWeights);
+  fSampling := InferSamplingFromConfig(dir + 'generation_config.json');
   // the stop and control tokens: fail at load, not at the first request
   TQwen3OutputParser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
@@ -736,7 +831,7 @@ begin
   if maxNew <= 0 then
     maxNew := fMaxTokens;
   NativeDecode(fModel, NativeChatPrompt(fTemplate, aRequest, fEnableThinking),
-    maxNew, aParser);
+    maxNew, aParser, NativeSampling(aRequest, fSampling));
 end;
 
 function TNativeLlmClient.ChatComplete(

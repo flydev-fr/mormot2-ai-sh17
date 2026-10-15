@@ -34,7 +34,8 @@ uses
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.kernels,
   mormot.ai.infer.tokenizer.bpe,
-  mormot.ai.infer.model.qwen3;
+  mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.sampler;
 
 type
   /// forwards to an inner backend and sums the time of Linear and Add

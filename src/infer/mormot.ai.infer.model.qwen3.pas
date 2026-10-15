@@ -46,7 +46,8 @@ uses
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.safetensors,
   mormot.ai.infer.backend,
-  mormot.ai.infer.backend.cpu;
+  mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.sampler; // InferArgMax
 
 type
   /// decoder hyper-parameters
@@ -163,39 +164,9 @@ type
       read fWeights;
   end;
 
-/// the index of the highest value of aValues[0..aCount-1], the lowest index on
-// ties (like torch.argmax); a NaN is never chosen unless all are NaN
-function InferArgMax(aValues: PSingleArray; aCount: PtrInt): PtrInt;
 
 
 implementation
-
-/// true for a NaN, by its bits: the x87 compare of Delphi Win32 ignores the
-// parity flag and finds NaN = NaN
-function IsNanSingle(const aValue: single): boolean;
-begin
-  result := (PCardinal(@aValue)^ and $7f800000 = $7f800000) and
-            (PCardinal(@aValue)^ and $007fffff <> 0);
-end;
-
-function InferArgMax(aValues: PSingleArray; aCount: PtrInt): PtrInt;
-var
-  i: PtrInt;
-begin
-  // the first value that is no NaN, then strictly greater ones only; all
-  // NaN gives 0
-  result := 0;
-  while (result < aCount) and IsNanSingle(aValues^[result]) do
-    inc(result);
-  if result = aCount then
-  begin
-    result := 0;
-    exit;
-  end;
-  for i := result + 1 to aCount - 1 do
-    if not IsNanSingle(aValues^[i]) and (aValues^[i] > aValues^[result]) then
-      result := i;
-end;
 
 
 /// aValue rounded to the nearest single - a cast of a double is no conversion

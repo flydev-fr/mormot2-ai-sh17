@@ -33,6 +33,7 @@ uses
   mormot.ai.infer.chat,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.sampler,
   test.infer.ref,
   test.infer.bpe;
 
@@ -87,6 +88,12 @@ type
     procedure Qwen3AgentLoop;
     /// the native client on Q8_0 matrices
     procedure Qwen3ChatClientQ8;
+    /// TInferSampler: the distributions of temperature, top-k, top-p, min-p
+    procedure SamplerDraws;
+    /// generation_config.json defaults and the request overrides
+    procedure SamplingSettings;
+    /// the native client samples, reproducibly per seed
+    procedure Qwen3Sampling;
   end;
 
 
@@ -635,7 +642,7 @@ var
     FreeAndNil(p);
     p := TQwen3OutputParser.Create(fTokenizer);
     try
-      NativeDecode(model, prompt, aMaxNew, p);
+      NativeDecode(model, prompt, aMaxNew, p, InferSamplingGreedy);
       result := true;
     except
       on ELlmClient do
@@ -663,7 +670,7 @@ begin
     prompt[3] := 57;
     prompt[4] := 65;
     p := TQwen3OutputParser.Create(fTokenizer);
-    NativeDecode(model, prompt, 7, p);
+    NativeDecode(model, prompt, 7, p, InferSamplingGreedy);
     CheckEqual(p.Response.Content, #3#3#3#3#3#3'1', 'greedy ids of the reference');
     Check(p.Response.FinishReason = lfrLength, 'cut by aMaxNew');
     CheckEqual(p.Response.Usage.CompletionTokens, 7, 'seven tokens');
@@ -680,7 +687,7 @@ begin
     try
       FreeAndNil(p);
       p := TQwen3OutputParser.Create(fTokenizer);
-      NativeDecode(model, nil, 1, p);
+      NativeDecode(model, nil, 1, p, InferSamplingGreedy);
     except
       on ELlmClient do
         raised := true;
@@ -728,6 +735,7 @@ begin
     aRequest.Tools[i].Description := _Safe(t^.Values[i])^.U['description'];
     aRequest.Tools[i].ParametersJson := _Safe(t^.Values[i])^.U['parameters'];
   end;
+  aRequest.Temperature := 0; // the reference decodes greedy
   if p^.GetValueIndex('enable_thinking') >= 0 then
     aRequest.Extra := _ObjFast(['chat_template_kwargs',
       _ObjFast(['enable_thinking', p^.B['enable_thinking']])]);
@@ -863,9 +871,455 @@ begin
   msgs[0] := LlmMessage(lrUser, 'What is the capital of France? Answer in one word.');
   req := LlmChatRequest('', msgs);
   req.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', false])]);
+  req.Temperature := 0;
   r := llm.ChatComplete(req);
   CheckEqual(r.Content, 'Paris', 'Q8_0 answers chat_en like FP32');
   Check(r.FinishReason = lfrStop, 'stop');
+end;
+
+/// draw aDraws tokens from aLogits and count them per index
+function Draws(const aSampling: TInferSampling; const aLogits: array of single;
+  aDraws: integer): TIntegerDynArray;
+var
+  smp: TInferSampler;
+  i: integer;
+begin
+  result := nil; // the caller's array may come in: counts from zero
+  SetLength(result, length(aLogits));
+  smp := TInferSampler.Create(aSampling);
+  try
+    for i := 1 to aDraws do
+      inc(result[smp.Next(@aLogits[0], length(aLogits))]);
+  finally
+    smp.Free;
+  end;
+end;
+
+function Sampling(aTemperature: double; aTopK: integer; aTopP, aMinP: double;
+  aSeed: Int64): TInferSampling;
+begin
+  result.Temperature := aTemperature;
+  result.TopK := aTopK;
+  result.TopP := aTopP;
+  result.MinP := aMinP;
+  result.Seed := aSeed;
+end;
+
+function SingleOfBits(aBits: cardinal): single;
+begin
+  PCardinal(@result)^ := aBits;
+end;
+
+procedure TTestInferLlmNative.SamplerDraws;
+const
+  N = 70000;
+  SEED42: array[0..11] of integer = (2, 1, 1, 1, 0, 2, 1, 2, 1, 2, 1, 2);
+var
+  c: TIntegerDynArray;
+  l: array[0..2] of single;
+  odd4: array[0..3] of single;
+  big: TSingleDynArray;
+  prob: TDoubleDynArray;
+  a, b: TInferSampler;
+  i, t, k: PtrInt;
+  same, allRefused: boolean;
+  m, sum, lo, hi, mid, top20: double;
+  inNucleus, seen: array of boolean;
+  distinct: integer;
+  odd100: TSingleDynArray;
+
+  function Near(aCount: integer; aShare: double): boolean;
+  begin
+    result := Abs(aCount / N - aShare) < 0.01;
+  end;
+
+  function Refused(const aSampling: TInferSampling): boolean;
+  begin
+    result := false;
+    try
+      TInferSampler.Create(aSampling).Free;
+    except
+      on EInferError do
+        result := true;
+    end;
+  end;
+
+begin
+  // softmax of 0, ln 2, ln 4: 1/7, 2/7, 4/7
+  l[0] := 0;
+  l[1] := Ln(2);
+  l[2] := Ln(4);
+  c := Draws(Sampling(1, 0, 1, 0, 1), l, N);
+  Check(Near(c[0], 1 / 7) and Near(c[1], 2 / 7) and Near(c[2], 4 / 7),
+    'temperature 1: the softmax');
+  c := Draws(Sampling(0.5, 0, 1, 0, 2), l, N);
+  Check(Near(c[0], 1 / 21) and Near(c[1], 4 / 21) and Near(c[2], 16 / 21),
+    'temperature 0.5: the logits doubled');
+  c := Draws(Sampling(1, 2, 1, 0, 3), l, N);
+  Check((c[0] = 0) and Near(c[1], 1 / 3) and Near(c[2], 2 / 3), 'top_k 2');
+  c := Draws(Sampling(1, 0, 0.5, 0, 4), l, N);
+  CheckEqual(c[2], N, 'top_p 0.5: the best token reaches it alone');
+  c := Draws(Sampling(1, 0, 0.6, 0, 5), l, N);
+  Check((c[0] = 0) and Near(c[1], 1 / 3) and Near(c[2], 2 / 3), 'top_p 0.6');
+  c := Draws(Sampling(1, 0, 1, 0.4, 6), l, N);
+  Check((c[0] = 0) and Near(c[1], 1 / 3) and Near(c[2], 2 / 3), 'min_p 0.4');
+  c := Draws(Sampling(1, 2, 0.6, 0, 7), l, N);
+  CheckEqual(c[2], N, 'top_p within the top k: 4/6 of their mass reaches 0.6');
+  // top_p against all the mass, not just the candidates: A 0.625, B 0.3125
+  // and 1000 tokens of 0.0000625 each - too small to be candidates at first;
+  // top_p 0.65 needs B as well (0.625 alone is short of it)
+  SetLength(big, 1002);
+  big[0] := 0;
+  big[1] := Ln(0.5);
+  for i := 2 to high(big) do
+    big[i] := Ln(1e-4);
+  c := nil;
+  SetLength(c, length(big));
+  a := TInferSampler.Create(Sampling(1, 0, 0.65, 0, 10));
+  try
+    for i := 1 to N do
+      inc(c[a.Next(pointer(big), length(big))]);
+  finally
+    a.Free;
+  end;
+  Check(Near(c[0], 2 / 3) and Near(c[1], 1 / 3), 'top_p over the whole mass');
+  // top-k keeps the tokens tied with the k-th, as transformers does
+  l[0] := 0;
+  l[1] := 0;
+  l[2] := 0;
+  c := Draws(Sampling(1, 2, 1, 0, 11), l, N);
+  Check(Near(c[0], 1 / 3) and Near(c[1], 1 / 3) and Near(c[2], 1 / 3),
+    'top_k 2 of three equal tokens keeps all three');
+  // top-k by logit: 0 and 1e-20 round to the same probability, top_k 1
+  // still keeps only the higher logit
+  l[0] := 0;
+  l[1] := 1e-20;
+  l[2] := -50;
+  c := Draws(Sampling(1, 1, 1, 0, 15), l, 1000);
+  CheckEqual(c[1], 1000, 'top_k by logit, not by rounded probability');
+  // NaN and -Inf last in a draw without filters
+  odd4[0] := 1;
+  odd4[1] := 1;
+  odd4[2] := SingleOfBits($ff800000);
+  odd4[3] := SingleOfBits($7fc00000);
+  c := Draws(Sampling(1, 0, 1, 0, 16), odd4, N);
+  Check((c[2] = 0) and (c[3] = 0) and Near(c[0], 0.5), 'NaN and -Inf last, unfiltered');
+  // top-p, then min-p (the order of transformers): 0.5 0.3 0.2 with top_p 0.6
+  // keeps the first two, min_p 0.5 then keeps both (0.3 >= 0.25); min-p first
+  // would leave 0.625 for the best, enough for top_p 0.6 alone
+  l[0] := Ln(0.5);
+  l[1] := Ln(0.3);
+  l[2] := Ln(0.2);
+  c := Draws(Sampling(1, 0, 0.6, 0.5, 12), l, N);
+  Check((c[2] = 0) and Near(c[0], 0.625) and Near(c[1], 0.375),
+    'top_p before min_p');
+  // top-k beyond the finite tokens: the threshold falls to 0, -Inf never drawn
+  SetLength(odd100, 100);
+  for i := 0 to high(odd100) do
+    odd100[i] := SingleOfBits($ff800000);
+  odd100[0] := 0;
+  odd100[7] := Ln(2);
+  odd100[50] := Ln(4);
+  c := nil;
+  SetLength(c, 100);
+  a := TInferSampler.Create(Sampling(1, 50, 1, 0, 13));
+  try
+    for i := 1 to N do
+      inc(c[a.Next(pointer(odd100), 100)]);
+  finally
+    a.Free;
+  end;
+  Check((c[0] + c[7] + c[50] = N) and Near(c[0], 1 / 7) and Near(c[50], 4 / 7),
+    'top_k 50 of 3 finite tokens');
+  // a temperature too close to 0 to divide by: greedy
+  c := Draws(Sampling(1e-310, 0, 1, 0, 14), l, 100);
+  CheckEqual(c[0], 100, 'temperature 1e-310: greedy');
+  l[0] := 0;
+  l[1] := Ln(2);
+  l[2] := Ln(4);
+  c := Draws(Sampling(0, 0, 1, 0, 8), l, 100);
+  CheckEqual(c[2], 100, 'temperature 0: greedy');
+  // NaN and -Inf are never drawn
+  odd4[0] := SingleOfBits($7fc00000);
+  odd4[1] := 1;
+  odd4[2] := SingleOfBits($ff800000);
+  odd4[3] := 1;
+  c := Draws(Sampling(1, 0, 1, 0, 9), odd4, N);
+  Check((c[0] = 0) and (c[2] = 0) and Near(c[1], 0.5) and Near(c[3], 0.5),
+    'NaN and -Inf never drawn');
+  // the same seed draws the same tokens, another seed others
+  a := TInferSampler.Create(Sampling(1, 0, 1, 0, 42));
+  b := TInferSampler.Create(Sampling(1, 0, 1, 0, 42));
+  try
+    same := true;
+    for i := 1 to 200 do
+      if a.Next(@l, 3) <> b.Next(@l, 3) then
+        same := false;
+    Check(same, 'the same seed, the same draws');
+  finally
+    a.Free;
+    b.Free;
+  end;
+  // the same draws on every compiler and CPU: splitmix64 from seed 42,
+  // computed independently (Python) - the nearest boundary is 0.017 away
+  a := TInferSampler.Create(Sampling(1, 0, 1, 0, 42));
+  try
+    same := true;
+    for i := 0 to high(SEED42) do
+      if a.Next(@l, 3) <> SEED42[i] then
+        same := false;
+    Check(same, 'seed 42 draws 2 1 1 1 0 2 1 2 1 2 1 2 everywhere');
+  finally
+    a.Free;
+  end;
+  a := TInferSampler.Create(Sampling(1, 0, 1, 0, 42));
+  b := TInferSampler.Create(Sampling(1, 0, 1, 0, 43));
+  try
+    same := true;
+    for i := 1 to 200 do
+      if a.Next(@l, 3) <> b.Next(@l, 3) then
+        same := false;
+    Check(not same, 'another seed, other draws');
+  finally
+    a.Free;
+    b.Free;
+  end;
+  allRefused := Refused(Sampling(1, 0, 0, 0, 0)) and Refused(Sampling(1, 0, 1.5, 0, 0)) and
+    Refused(Sampling(1, 0, 1, 1, 0)) and Refused(Sampling(1, -1, 1, 0, 0)) and
+    Refused(Sampling(1, 0, 1, -0.1, 0));
+  Check(allRefused, 'settings out of range refused');
+  Check(Refused(Sampling(SingleOfBits($7fc00000), 0, 1, 0, 0)), 'NaN temperature');
+  // a vocabulary of real size: every draw inside the nucleus, found here by
+  // bisection on a probability threshold (no sorting, unlike the sampler)
+  SetLength(big, 151936);
+  t := 12345;
+  for i := 0 to high(big) do
+  begin
+    t := (t * 1103515245 + 12345) and $7fffffff;
+    big[i] := (t / $7fffffff) * 12 - 6;
+  end;
+  SetLength(prob, length(big));
+  m := big[InferArgMax(pointer(big), length(big))];
+  sum := 0;
+  for i := 0 to high(big) do
+  begin
+    prob[i] := Exp((big[i] - m) / 0.7);
+    sum := sum + prob[i];
+  end;
+  for i := 0 to high(big) do
+    prob[i] := prob[i] / sum;
+  // the nucleus: every token at or above the largest threshold whose tokens
+  // still sum to 0.9
+  lo := 0;
+  hi := 1;
+  for k := 1 to 80 do
+  begin
+    mid := (lo + hi) / 2;
+    sum := 0;
+    for i := 0 to high(prob) do
+      if prob[i] >= mid then
+        sum := sum + prob[i];
+    if sum >= 0.9 then
+      lo := mid
+    else
+      hi := mid;
+  end;
+  SetLength(inNucleus, length(big));
+  for i := 0 to high(prob) do
+    inNucleus[i] := prob[i] >= lo;
+  // the top 20: the largest threshold with 20 tokens at or above it
+  lo := 0;
+  hi := 1;
+  for k := 1 to 80 do
+  begin
+    mid := (lo + hi) / 2;
+    t := 0;
+    for i := 0 to high(prob) do
+      if prob[i] >= mid then
+        inc(t);
+    if t >= 20 then
+      lo := mid
+    else
+      hi := mid;
+  end;
+  top20 := lo;
+  SetLength(seen, length(big));
+  a := TInferSampler.Create(Sampling(0.7, 0, 0.9, 0, 77));
+  try
+    same := true;
+    distinct := 0;
+    for i := 1 to 100 do
+    begin
+      k := a.Next(pointer(big), length(big));
+      if not inNucleus[k] then
+        same := false;
+      if not seen[k] then
+        inc(distinct);
+      seen[k] := true;
+    end;
+    Check(same, 'every draw inside the top-p nucleus of 151936 tokens');
+    CheckUtf8(distinct > 50, 'and spread over it: % tokens in 100 draws', [distinct]);
+  finally
+    a.Free;
+  end;
+  a := TInferSampler.Create(Sampling(0.7, 20, 1, 0, 78));
+  try
+    same := true;
+    for i := 0 to high(seen) do
+      seen[i] := false;
+    distinct := 0;
+    for i := 1 to 100 do
+    begin
+      k := a.Next(pointer(big), length(big));
+      if prob[k] < top20 then
+        same := false;
+      if not seen[k] then
+        inc(distinct);
+      seen[k] := true;
+    end;
+    Check(same, 'every draw inside the top 20');
+    CheckUtf8(distinct >= 8, 'and spread over them: % tokens', [distinct]);
+  finally
+    a.Free;
+  end;
+end;
+
+procedure TTestInferLlmNative.SamplingSettings;
+var
+  fn: TFileName;
+  s1, s2: TInferSampling;
+  req: TLlmChatRequest;
+  raised: boolean;
+
+  function Bad(const aExtra: RawUtf8): boolean;
+  begin
+    result := false;
+    req.Extra := _JsonFast(aExtra);
+    try
+      NativeSampling(req, InferSamplingGreedy);
+    except
+      on ELlmClient do
+        result := true;
+    end;
+  end;
+
+begin
+  fn := TemporaryFileName;
+  try
+    FileFromString('{"do_sample": true, "temperature": 0.6, "top_k": 20, ' +
+      '"top_p": 0.95}', fn);
+    s1 := InferSamplingFromConfig(fn);
+    Check((Abs(s1.Temperature - 0.6) < 1e-9) and (s1.TopK = 20) and
+      (Abs(s1.TopP - 0.95) < 1e-9) and (s1.MinP = 0), 'the Qwen3 defaults');
+    FileFromString('{"do_sample": false, "temperature": 0.6}', fn);
+    s1 := InferSamplingFromConfig(fn);
+    Check((s1.Temperature = 0) and (s1.TopP = 1), 'do_sample false: greedy');
+    FileFromString('{"do_sample": true, "top_k": "x"}', fn);
+    raised := false;
+    try
+      InferSamplingFromConfig(fn);
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'a value of the wrong kind');
+  finally
+    DeleteFile(fn);
+  end;
+  s1 := InferSamplingFromConfig(fn);
+  Check(s1.Temperature = 0, 'no file: greedy');
+  req := LlmChatRequest('', nil);
+  req.Temperature := 0.3;
+  req.Extra := _JsonFast('{"top_k": 5, "top_p": 0.5, "min_p": 0.1, "seed": 7}');
+  s1 := NativeSampling(req, InferSamplingFromConfig(fn));
+  Check((Abs(s1.Temperature - 0.3) < 1e-9) and (s1.TopK = 5) and
+    (Abs(s1.TopP - 0.5) < 1e-9) and (Abs(s1.MinP - 0.1) < 1e-9) and (s1.Seed = 7),
+    'the request overrides every default');
+  req.Temperature := -1;
+  req.Extra := _JsonFast('{"top_p": null}');
+  s1.Temperature := 0.8;
+  s1.TopP := 0.9;
+  s2 := NativeSampling(req, s1);
+  Check((Abs(s2.Temperature - 0.8) < 1e-9) and (Abs(s2.TopP - 0.9) < 1e-9),
+    'omitted and null keep the defaults');
+  s1 := NativeSampling(req, s2);
+  Check(s1.Seed <> s2.Seed, 'no seed: a random one per request');
+  Check(Bad('{"top_k": "5"}'), 'top_k as a string');
+  Check(Bad('{"top_k": 2.5}'), 'top_k a fraction');
+  Check(Bad('{"top_p": 2}'), 'top_p above 1');
+  Check(Bad('{"top_p": "x"}'), 'top_p no number');
+  Check(Bad('{"min_p": 1}'), 'min_p 1');
+  Check(Bad('{"seed": "s"}'), 'seed no integer');
+  Check(Bad('{"top_k": true}'), 'top_k a boolean');
+  Check(Bad('{"seed": false}'), 'seed a boolean');
+  Check(Bad('{"top_p": true}'), 'top_p a boolean');
+  req.Extra := Null;
+  req.Temperature := SingleOfBits($7fc00000);
+  raised := false;
+  try
+    NativeSampling(req, InferSamplingGreedy);
+  except
+    on ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'a NaN temperature');
+  fn := TemporaryFileName;
+  try
+    FileFromString('{"do_sample": true, "top_k": 0.5}', fn);
+    raised := false;
+    try
+      InferSamplingFromConfig(fn);
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'a fractional top_k in the config');
+    FileFromString('{"do_sample": true, "temperature": true}', fn);
+    raised := false;
+    try
+      InferSamplingFromConfig(fn);
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'a boolean temperature in the config');
+  finally
+    DeleteFile(fn);
+  end;
+end;
+
+procedure TTestInferLlmNative.Qwen3Sampling;
+var
+  dir: TFileName;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  req: TLlmChatRequest;
+  r1, r2, r3: TLlmChatResponse;
+  msgs: TLlmMessageDynArray;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  client := TNativeLlmClient.Create(dir);
+  llm := client;
+  Check((Abs(client.Sampling.Temperature - 0.6) < 1e-6) and
+    (client.Sampling.TopK = 20) and (Abs(client.Sampling.TopP - 0.95) < 1e-6),
+    'the defaults of generation_config.json');
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'Name a color.');
+  req := LlmChatRequest('', msgs);
+  req.MaxTokens := 12;
+  req.Temperature := 1.2;
+  req.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', false]),
+    'seed', 11]);
+  r1 := llm.ChatComplete(req);
+  r2 := llm.ChatComplete(req);
+  Check(r1.Content <> '', 'an answer');
+  CheckEqual(r1.Content, r2.Content, 'the same seed, the same answer');
+  req.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', false]),
+    'seed', 12]);
+  r3 := llm.ChatComplete(req);
+  AddConsole(FormatString('sampled: "%" / "%"', [r1.Content, r3.Content]));
 end;
 
 function TTestInferLlmNative.Weather(const aArgumentsJson: RawUtf8): RawUtf8;
@@ -895,6 +1349,7 @@ begin
   llm := client;
   client.EnableThinking := false;
   client.MaxTokens := 40;
+  client.Sampling := InferSamplingGreedy; // the agent sets no temperature
   toolbox := TLlmCallbackToolbox.Create;
   tools := toolbox;
   tool.Name := 'get_weather';

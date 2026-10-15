@@ -13,8 +13,8 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > and it is the recommended provider of the consuming backend. The Qwen3 decoder passes
 > its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
 > `ILlmClient`: the agent loop calls tools with a model on this machine, at about 24
-> tokens/s in FP32 and 36 in Q8_0 on a laptop. Next: the rest of the speed work
-> (sampling, prompt cache, Q4), then CUDA. Three test suites, about 3800 assertions, green wherever they have run (table below).
+> tokens/s in FP32 and 36 in Q8_0 on a laptop, greedy or sampled. Next: a prompt cache
+> and the rest of the speed work, then CUDA. Three test suites, about 3800 assertions, green wherever they have run (table below).
 
 ## What it does
 
@@ -35,10 +35,10 @@ Number of assertions per suite, every one passing; each row with numbers ran on 
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1835 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 721 | 1882 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 720 | 1825 |
-| Windows x86 | **Delphi 7** | 1253 | 708 | 1065 ⁶ |
+| Windows x64 | Delphi 13 | 1257 | 720 | 1872 |
+| Windows x86 | **Delphi 7** | 1253 | 708 | 1109 ⁶ |
 | macOS aarch64 (M2) | FPC 3.2.4 | 1257 | 647 ⁴ | 1597 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
@@ -342,8 +342,10 @@ driver** behind the same `ILlmClient` seam:
   answer is parsed token by token - a leading `<think>` block becomes `reasoning_content`
   in `Raw` (as vLLM returns it), each `<tool_call>` a `TLlmToolCall`. `ChatComplete` and
   `ChatStream` share one decoding path. Thinking is switched per request through
-  `Extra.chat_template_kwargs.enable_thinking`, as with vLLM. Greedy decoding until the
-  sampler arrives; images and `ResponseFormat` are refused rather than ignored.
+  `Extra.chat_template_kwargs.enable_thinking`, as with vLLM. Sampling follows the model's
+  `generation_config.json` (as vLLM does) unless a request sets `Temperature` (0 = greedy)
+  or `Extra` `top_p`, `top_k`, `min_p`, `seed`; a seed gives the same random stream on
+  every compiler and CPU. Images and `ResponseFormat` are refused rather than ignored.
 
 **Vision:** `TLlmMessage.Images` carries attachments (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`); both wires serialise them (OpenAI `image_url` including base64 `data:` URIs,
@@ -504,7 +506,7 @@ provider or runtime, not only against tests.
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
-| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works, slow** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; FP32 or Q8_0, SIMD and threads (24 / 36 tokens/s decoding on a laptop); greedy only, no prompt cache |
+| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works, slow** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; FP32 or Q8_0, SIMD and threads (24 / 36 tokens/s decoding on a laptop); greedy or sampled (temperature, top-k, top-p, min-p, seed); no prompt cache |
 | Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
@@ -535,8 +537,9 @@ Done:
 
 Next, in this order:
 1. **Quantisation and speed** — done: Q8_0 weights, SIMD and threads for the decoder
-   (decoding 15x faster in FP32, 22x in Q8_0). Next: sampling (temperature, top-k, top-p), a prompt cache, the
-   remaining elementwise work, Q4_0 and K-quants, benchmarks per platform.
+   (decoding 15x faster in FP32, 22x in Q8_0). Sampling is done too (temperature, top-k, top-p, min-p,
+   reproducible per seed). Next: a prompt cache, the remaining elementwise work, Q4_0
+   and K-quants, benchmarks per platform.
 2. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

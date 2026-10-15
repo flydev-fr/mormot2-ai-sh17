@@ -599,8 +599,40 @@ bestehen und die Benchmarks dokumentiert sind.
   falsche KV-Kopf-Zuordnung, F32-Kachel zu kurz, Float-Attention im Exact-Modus,
   Referenzzweig mit einem Schlüssel zu wenig, Q8-Kopf gleich dem Embedding, fehlende
   NaN- und Bereichsprüfung, Bias-Abfrage weg, SIMD-Pfad bei null Eingaben.
-- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Sampler,
-  Prompt-Cache, Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
+**3b, erledigt 2026-10-15: Sampler** (`mormot.ai.infer.sampler`).
+
+- Die Warper von Hugging Face in ihrer Reihenfolge: Temperature, Top-k, Top-p auf
+  dem, was Top-k übrig lässt, Min-p; dann eine Ziehung. Top-k behält wie transformers
+  auch die Tokens, die mit dem k-ten gleichauf liegen. Temperature 0 (und jede unter
+  1e-30) ist exakt das bisherige Greedy (`InferArgMax`, aus dem Modell hierher
+  umgezogen).
+- Exakt ohne das Vokabular zu sortieren: Die Wahrscheinlichkeiten werden über alle
+  Tokens summiert, dann sinkt eine Schwelle, bis alle Tokens, die die Filter behalten,
+  darüber liegen; nur diese werden sortiert.
+- Wiederholbar: ein eigener splitmix64-Generator. Derselbe Seed liefert auf jedem
+  Compiler und jeder CPU denselben Zufallsstrom, also dieselben Tokens, solange die
+  Logits gleich sind (SIMD und `Exp` können eine Ziehung genau auf einer Grenze
+  verschieben). Der Test prüft eine unabhängig in Python berechnete Folge; FPC
+  aarch64 und Delphi 7 ziehen sie gleich. Mit torch identische Ziehungen gibt es
+  nicht (anderer Generator), nur dieselbe Verteilung.
+- NaN, Unendlich und Einstellungen außerhalb des Bereichs werden abgelehnt, über
+  ihre Bits (ein Vergleich mit NaN löst unter FPC `EInvalidOp` aus).
+- Client: Die Vorgaben kommen aus `generation_config.json` des Modells, wie bei vLLM
+  (Qwen3: 0,6 / Top-k 20 / Top-p 0,95; ohne Datei Greedy). Eine Anfrage überschreibt
+  sie mit `Temperature` (0 = Greedy) und `Extra` `top_p`, `top_k`, `min_p`, `seed`,
+  den Feldnamen von OpenAI und vLLM; ohne Seed zieht jede Anfrage einen zufälligen.
+  Die Filter formen nur eine gesampelte Ziehung: Ohne `generation_config.json` sind
+  die Vorgaben Greedy, und eine Anfrage mit nur `top_p` bleibt Greedy (vLLM würde dann
+  mit Temperature 1 sampeln). Boolesche Werte gelten nicht als Zahl.
+- Tests: Verteilungen über 70.000 Ziehungen gegen die exakten Wahrscheinlichkeiten
+  (jeder Filter einzeln und kombiniert, Top-p gegen die ganze Masse), NaN und -Inf,
+  die feste Seed-Folge, ein Vokabular von 151.936 Tokens gegen einen per Bisektion
+  bestimmten Nucleus, `generation_config.json` und die Overrides; mit Qwen3-0.6B:
+  derselbe Seed gibt dieselbe Antwort. Gegenproben (Top-p gegen die Kandidaten, Seed
+  ignoriert, Temperature nicht angewandt, Top-k um eins daneben) schlagen an.
+
+- Offen in Phase 3: Normen, RoPE und SwiGLU parallel und mit SIMD, Prompt-Cache,
+  Q4/K-Quants (GGUF), Benchmarks auf macOS und x86_64.
 
 ### Phase 4 — GPU
 
