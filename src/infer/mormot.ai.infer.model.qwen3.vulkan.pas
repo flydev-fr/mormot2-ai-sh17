@@ -54,7 +54,7 @@ type
     fKeys, fValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
     // device scratch for up to fRows token rows
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp, fCos: TInferVkBuffer;
-    fScores, fLogits: TInferVkBuffer;
+    fScores, fPart, fLogits: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
     procedure FreeScratch;
@@ -78,7 +78,7 @@ type
     fModel: TQwen3Model;
     fBackend: TInferVulkanBackend;
     fVk: TInferVulkan;
-    fNorm, fSwiGlu, fAttention, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
+    fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
@@ -124,7 +124,11 @@ type
   end;
 
   TAttentionPush = record
-    Rows, Heads, HeadDim, KvHeads, Past: cardinal;
+    Rows, Heads, HeadDim, KvHeads, Past, Splits: cardinal;
+  end;
+
+  TMergePush = record
+    Rows, Heads, HeadDim, Splits: cardinal;
   end;
 
   TQkRopePush = record
@@ -138,6 +142,11 @@ const
   CHUNK_MAX = 256;
   /// the attention scores of one chunk at most (heads * rows * context floats)
   SCORES_MAX = 256 shl 20;
+  /// attention.comp cuts the keys of a row into ranges of about SPLIT_KEYS
+  // when there are few (head, row) work groups - decoding one token - at most
+  // SPLIT_GROUPS work groups in all (then attnmerge.comp combines them)
+  SPLIT_KEYS = 64;
+  SPLIT_GROUPS = 1024;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
 procedure NeedDevice(aVk: TInferVulkan; var aBuffer: TInferVkBuffer;
@@ -187,6 +196,7 @@ begin
   fKeys := nil;
   fValues := nil;
   FreeAndNil(fScores);
+  FreeAndNil(fPart);
   FreeAndNil(fLogits);
   FreeAndNil(fOut);
   fCapacity := 0;
@@ -233,7 +243,9 @@ begin
     SizeOf(TNormPush));
   fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2, 4);
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
-    5, SizeOf(TAttentionPush));
+    6, SizeOf(TAttentionPush));
+  fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 2,
+    SizeOf(TMergePush));
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
   fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
     SizeOf(TQkRopePush));
@@ -244,6 +256,7 @@ begin
   fNorm.Name := 'rmsnorm';
   fSwiGlu.Name := 'swiglu';
   fAttention.Name := 'attention';
+  fMerge.Name := 'attnmerge';
   fAdd.Name := 'add';
   fBackend.GpuLock;
   try
@@ -258,6 +271,7 @@ begin
   fAddNorm.Free;
   fQkRope.Free;
   fAdd.Free;
+  fMerge.Free;
   fAttention.Free;
   fSwiGlu.Free;
   fNorm.Free;
@@ -484,12 +498,14 @@ procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows: PtrInt;
+  n, h, f, qw, kvw, half, past, l, outRows, splits, most: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
   norm: TNormPush;
   att: TAttentionPush;
+  merge: TMergePush;
+  part: TInferVkBuffer;
 begin
   c := fModel.Config;
   n := aCount;
@@ -506,6 +522,20 @@ begin
     else
       outRows := 1;
   Prepare(aCtx, past + n, n, outRows);
+  // key ranges per (head, row): one unless there are few work groups
+  splits := (past + n + SPLIT_KEYS - 1) div SPLIT_KEYS;
+  most := SPLIT_GROUPS div (c.Heads * n);
+  if splits > most then
+    splits := most;
+  if splits < 1 then
+    splits := 1;
+  if splits > 1 then
+  begin
+    NeedDevice(fVk, aCtx.fPart, Int64(c.Heads) * n * splits * (c.HeadDim + 2) * 4);
+    part := aCtx.fPart;
+  end
+  else
+    part := aCtx.fScores; // bound, but not accessed by attention.comp
   // the inputs, written into the host-visible buffer before the batch
   p := aCtx.fIn.Mapped;
   fModel.Embed(aIds, n, p);
@@ -528,6 +558,11 @@ begin
     att.HeadDim := c.HeadDim;
     att.KvHeads := c.KvHeads;
     att.Past := past;
+    att.Splits := splits;
+    merge.Rows := n;
+    merge.Heads := c.Heads;
+    merge.HeadDim := c.HeadDim;
+    merge.Splits := splits;
     // the input norm of layer 0; every later one comes with the residual of
     // the layer before (addnorm)
     RecordNorm(aCtx.fX, n, h, fModel.Layers[0].InputNorm, aCtx.fH);
@@ -544,7 +579,9 @@ begin
         Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fCos,
         aCtx.fKeys[l], aCtx.fValues[l]], @qk, c.Heads + c.KvHeads, n);
       fVk.BatchDispatch(fAttention, [aCtx.fQ, aCtx.fKeys[l], aCtx.fValues[l],
-        aCtx.fAttn, aCtx.fScores], @att, c.Heads, n);
+        aCtx.fAttn, aCtx.fScores, part], @att, c.Heads, n, splits);
+      if splits > 1 then
+        fVk.BatchDispatch(fMerge, [part, aCtx.fAttn], @merge, c.Heads, n);
       fBackend.RecordLinear(aCtx.fAttn, n, qw, ly^.O, h, aCtx.fTmp);
       // residual and the feed-forward pre-norm, gate and up side by side,
       // SwiGLU, down

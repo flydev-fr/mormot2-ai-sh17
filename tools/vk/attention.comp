@@ -4,9 +4,14 @@
 //   keys and values of the KV head h / (heads / kvHeads), rows at kvWidth
 // - headDim a multiple of 4 and at most 256 (the query head is kept in shared
 //   memory as vec4, the keys read as vec4)
-// - one work group of 128 per (head, row): the scores go to a scratch buffer
-//   (at most past + rows per head and row), then max, exp and sum, then each
-//   invocation sums one output dimension (headDim <= 128 * k)
+// - one work group of 128 per (head, row, split): the keys of a row are cut
+//   into splits ranges (phase 4e, flash-decoding), so a single decoded token
+//   still fills the device; the scores go to a scratch buffer (at most
+//   past + rows per head and row), then max, exp and sum, then each invocation
+//   sums one output dimension (headDim <= 128 * k)
+// - splits = 1: y is written normalized; splits > 1: each range writes its
+//   unnormalized sums, its maximum and its sum of exponentials to part[], and
+//   attnmerge.comp combines them into y
 #version 450
 
 layout(local_size_x = 128) in;
@@ -16,9 +21,11 @@ layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
 layout(std430, binding = 2) readonly buffer BufV { float vals[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 layout(std430, binding = 4) coherent buffer BufS { float sc[]; };
+// [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
+layout(std430, binding = 5) writeonly buffer BufP { float part[]; };
 
 layout(push_constant) uniform Push {
-  uint rows, heads, headDim, kvHeads, past;
+  uint rows, heads, headDim, kvHeads, past, splits;
 } p;
 
 shared float partial[128];
@@ -29,11 +36,17 @@ void main()
   uint t = gl_LocalInvocationID.x;
   uint h = gl_WorkGroupID.x;
   uint r = gl_WorkGroupID.y;
+  uint s = gl_WorkGroupID.z;
   uint d = p.headDim;
   uint kvw = p.kvHeads * d;
   uint qw = p.heads * d;
   uint g = h / (p.heads / p.kvHeads);
   uint total = p.past + r + 1u;
+  // the keys j0 .. j1 - 1 of this split (an empty range for a late split of
+  // an early row)
+  uint chunk = (total + p.splits - 1u) / p.splits;
+  uint j0 = min(total, s * chunk);
+  uint j1 = min(total, j0 + chunk);
   uint sbase = (h * p.rows + r) * (p.past + p.rows);
   uint qbase = r * qw + h * d;
   float scale = 1.0 / sqrt(float(d));
@@ -44,15 +57,15 @@ void main()
   barrier();
   // scores and their maximum
   float m = -3.402823e38;
-  for (uint j = t; j < total; j += 128u)
+  for (uint j = j0 + t; j < j1; j += 128u)
   {
     uint kb = (j * kvw + g * d) >> 2;
-    float s = 0.0;
+    float sv = 0.0;
     for (uint k = 0u; k < d4; k++)
-      s += dot(qs[k], keys4[kb + k]);
-    s *= scale;
-    sc[sbase + j] = s;
-    m = max(m, s);
+      sv += dot(qs[k], keys4[kb + k]);
+    sv *= scale;
+    sc[sbase + j] = sv;
+    m = max(m, sv);
   }
   partial[t] = m;
   barrier();
@@ -66,7 +79,7 @@ void main()
   barrier();
   // exponentials and their sum
   float sum = 0.0;
-  for (uint j = t; j < total; j += 128u)
+  for (uint j = j0 + t; j < j1; j += 128u)
   {
     float e = exp(sc[sbase + j] - m);
     sc[sbase + j] = e;
@@ -81,13 +94,22 @@ void main()
       partial[t] += partial[t + w];
     barrier();
   }
-  float inv = 1.0 / partial[0];
+  sum = partial[0];
   // the weighted values, one output dimension per invocation
+  uint pbase = ((h * p.rows + r) * p.splits + s) * (d + 2u);
   for (uint k = t; k < d; k += 128u)
   {
     float acc = 0.0;
-    for (uint j = 0u; j < total; j++)
+    for (uint j = j0; j < j1; j++)
       acc += sc[sbase + j] * vals[j * kvw + g * d + k];
-    y[qbase + k] = acc * inv;
+    if (p.splits == 1u)
+      y[qbase + k] = acc / sum;
+    else
+      part[pbase + k] = acc;
+  }
+  if ((p.splits > 1u) && (t == 0u))
+  {
+    part[pbase + d] = m;
+    part[pbase + d + 1u] = sum;
   }
 }
