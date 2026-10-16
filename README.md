@@ -38,7 +38,7 @@ Number of assertions per suite, every one passing; each row with numbers ran bet
 | Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 1751 ⁶ |
 | macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2629 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
@@ -51,8 +51,9 @@ that target.
 ⁴ Run before the load governor tests were added (they bring about 60 assertions).
 ⁵ Run before the Qwen3 tests were added (tokenizer, chat template, decoder and the native
 client: about 540 assertions with the model, about 300 without it).
-⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
-model, the tokenizer and the chat template run.
+⁶ Natively on an i9-14900K (2026-10-16), the Vulkan suite included. The Qwen3-0.6B tests
+skip in a 32-bit process (2.4 GB of FP32 weights); the tiny model, the tokenizer and the
+chat template run.
 ⁷ With all models, NEON dot-product kernels, and the Vulkan suite on the M2 Pro GPU
 through MoltenVK (`LAI_REQUIRE_VULKAN=1`, 2026-10-16). The BGE-M3 corpus gate passed there
 in an earlier run (nDCG@10 0.9004, the same as on the Snapdragon); it is not part of this
