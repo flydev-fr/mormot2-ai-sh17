@@ -1,0 +1,236 @@
+/// native inference engine - the Vulkan backend: Linear on the GPU
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
+// - phase 4b of docs/native-inference.md: TInferVulkanBackend is the fast CPU
+//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q4_K and Q6_K
+//   weights; every other operation, every other weight type and every call
+//   while the device is busy stay on the CPU
+// - weights and biases are uploaded once, on first use, and kept on the
+//   device, keyed by their address, type and size: they must neither change
+//   nor be freed while the backend lives (model weights and biases do not; a
+//   temporary bias would be served stale from its reused address) -
+//   ClearWeights forgets them
+// - activations go up and results come down on every call, and each call
+//   waits for the device: a correctness step, not yet a speed-up for decoding
+//   (that needs the whole forward pass on the device, phase 4d)
+// - arithmetic: the weights dequantized in float, as InferRowToF32 does, times
+//   F32 activations, summed in another order than the CPU - a tolerance
+unit mormot.ai.infer.backend.vulkan;
+
+{
+  *****************************************************************************
+
+    - TInferVulkanBackend: TInferCpuFastBackend with Linear on a Vulkan device
+
+  *****************************************************************************
+}
+
+interface
+
+{$I mormot.defines.inc}
+
+uses
+  sysutils,
+  mormot.core.base,
+  mormot.core.os,
+  mormot.core.unicode,
+  mormot.core.text,
+  mormot.ai.infer.tensor,
+  mormot.ai.infer.backend,
+  mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.vulkan;
+
+type
+  /// the fast CPU backend with Linear on a Vulkan device
+  TInferVulkanBackend = class(TInferCpuFastBackend)
+  protected
+    fVk: TInferVulkan;
+    fLinear: TInferVkPipeline;
+    fGpu: TLightLock;
+    // the weight cache: parallel arrays, searched linearly (a model has a few
+    // hundred matrices)
+    fWeightData: array of pointer;
+    fWeightType: array of TInferDType;
+    fWeightBytes: TInt64DynArray;
+    fWeightBuffer: array of TInferVkBuffer;
+    fWeightCount: PtrInt;
+    fX, fY, fNoBias: TInferVkBuffer;
+    fGpuLinears: Int64;
+    function Weight(aData: pointer; aType: TInferDType;
+      aBytes: Int64): TInferVkBuffer;
+    function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
+  public
+    /// the CPU part as TInferCpuFastBackend.Create, plus the Vulkan device
+    // (TInferVulkan.Create: raises EInferVulkan without one)
+    constructor Create(aThreads: integer = 0); reintroduce;
+    destructor Destroy; override;
+    /// y = x * w^T + bias on the device for F32, Q8_0, Q4_K and Q6_K weights,
+    // on the CPU otherwise (and while another thread uses the device)
+    procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
+      aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
+    /// release every weight kept on the device
+    procedure ClearWeights;
+    /// the device context
+    property Vulkan: TInferVulkan read fVk;
+    /// how many Linear calls ran on the device
+    property GpuLinears: Int64 read fGpuLinears;
+  end;
+
+
+implementation
+
+const
+  /// the dtype push constant of tools/vk/linear.comp
+  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K; 0 = CPU
+  LINEAR_DTYPE: array[TInferDType] of cardinal = (
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4);
+
+type
+  /// the push constants of tools/vk/linear.comp
+  TLinearPush = record
+    Rows, InCount, OutCount, DType, HasBias: cardinal;
+  end;
+
+
+{ TInferVulkanBackend }
+
+constructor TInferVulkanBackend.Create(aThreads: integer);
+begin
+  inherited Create(aThreads);
+  fVk := TInferVulkan.Create;
+  fLinear := TInferVkPipeline.Create(fVk, @SPV_LINEAR, length(SPV_LINEAR), 4,
+    SizeOf(TLinearPush));
+  fNoBias := TInferVkBuffer.Create(fVk, 4, true);
+end;
+
+destructor TInferVulkanBackend.Destroy;
+begin
+  if fVk <> nil then
+  begin
+    ClearWeights;
+    FreeAndNil(fX);
+    FreeAndNil(fY);
+    FreeAndNil(fNoBias);
+    FreeAndNil(fLinear);
+    FreeAndNil(fVk);
+  end;
+  inherited Destroy;
+end;
+
+procedure TInferVulkanBackend.ClearWeights;
+var
+  i: PtrInt;
+begin
+  fGpu.Lock;
+  try
+    for i := 0 to fWeightCount - 1 do
+      FreeAndNil(fWeightBuffer[i]);
+    fWeightCount := 0;
+  finally
+    fGpu.UnLock;
+  end;
+end;
+
+function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;
+  aBytes: Int64): TInferVkBuffer;
+var
+  i: PtrInt;
+begin
+  for i := 0 to fWeightCount - 1 do
+    if (fWeightData[i] = aData) and (fWeightType[i] = aType) and
+       (fWeightBytes[i] = aBytes) then
+    begin
+      result := fWeightBuffer[i];
+      exit;
+    end;
+  result := TInferVkBuffer.Create(fVk, aBytes, true);
+  try
+    fVk.Upload(result, 0, aData, aBytes);
+  except
+    result.Free;
+    raise;
+  end;
+  if fWeightCount = length(fWeightData) then
+  begin
+    i := NextGrow(fWeightCount);
+    SetLength(fWeightData, i);
+    SetLength(fWeightType, i);
+    SetLength(fWeightBytes, i);
+    SetLength(fWeightBuffer, i);
+  end;
+  fWeightData[fWeightCount] := aData;
+  fWeightType[fWeightCount] := aType;
+  fWeightBytes[fWeightCount] := aBytes;
+  fWeightBuffer[fWeightCount] := result;
+  inc(fWeightCount);
+end;
+
+function TInferVulkanBackend.Scratch(var aBuffer: TInferVkBuffer;
+  aBytes: Int64): TInferVkBuffer;
+var
+  grown: Int64;
+begin
+  if (aBuffer = nil) or (aBuffer.Size < aBytes) then
+  begin
+    FreeAndNil(aBuffer);
+    // 25 % more: a growing context does not reallocate on every token - but
+    // never beyond what Run may bind (aBytes itself was checked by Linear)
+    grown := aBytes + aBytes shr 2;
+    if (grown + 3) and not Int64(3) > fVk.MaxStorageRange then // as allocated
+      grown := aBytes;
+    aBuffer := TInferVkBuffer.Create(fVk, grown, true);
+  end;
+  result := aBuffer;
+end;
+
+procedure TInferVulkanBackend.Linear(x: PSingleArray; aRows, aIn: PtrInt;
+  const w: TInferWeight; aOut: PtrInt; bias: PSingleArray; y: PSingleArray);
+var
+  wbytes: Int64;
+  wb, bb, xb, yb: TInferVkBuffer;
+  push: TLinearPush;
+  groups: cardinal;
+begin
+  if (LINEAR_DTYPE[w.DType] = 0) or (aRows < 1) or (aRows > 65535) or
+     (aIn < 1) or (aOut < 1) or (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0) then
+  begin
+    inherited Linear(x, aRows, aIn, w, aOut, bias, y);
+    exit;
+  end;
+  wbytes := Int64(aOut) * (aIn div INFER_DTYPE_BLOCK[w.DType]) *
+    INFER_DTYPE_SIZE[w.DType];
+  // the sizes as allocated: whole 4-byte words (see TInferVkBuffer.Create)
+  if ((wbytes + 3) and not Int64(3) > fVk.MaxStorageRange) or
+     (Int64(aRows) * aIn * 4 > fVk.MaxStorageRange) or
+     (Int64(aRows) * aOut * 4 > fVk.MaxStorageRange) or
+     not fGpu.TryLock then
+  begin
+    inherited Linear(x, aRows, aIn, w, aOut, bias, y);
+    exit;
+  end;
+  try
+    wb := Weight(w.Data, w.DType, wbytes);
+    if bias <> nil then
+      bb := Weight(bias, idtF32, Int64(aOut) * 4)
+    else
+      bb := fNoBias;
+    xb := Scratch(fX, Int64(aRows) * aIn * 4);
+    yb := Scratch(fY, Int64(aRows) * aOut * 4);
+    fVk.Upload(xb, 0, x, Int64(aRows) * aIn * 4);
+    push.Rows := aRows;
+    push.InCount := aIn;
+    push.OutCount := aOut;
+    push.DType := LINEAR_DTYPE[w.DType];
+    push.HasBias := ord(bias <> nil);
+    groups := aOut;
+    if groups > 65535 then
+      groups := 65535; // the shader loops over the outputs
+    fVk.Run(fLinear, [wb, xb, bb, yb], @push, groups, aRows);
+    fVk.Download(yb, 0, y, Int64(aRows) * aOut * 4);
+    inc(fGpuLinears);
+  finally
+    fGpu.UnLock;
+  end;
+end;
+
+end.

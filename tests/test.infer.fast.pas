@@ -87,6 +87,20 @@ type
   end;
 
 
+/// deterministic pseudo-random values in [-aScale, aScale)
+procedure Fill(var aValues: TSingleDynArray; aCount: PtrInt; aSeed: cardinal;
+  aScale: single);
+/// Q8_0 weights [aOut, aIn] with random scales and every int8 value
+function RandomQ8(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// random Q4_0 rows: every nibble, finite scales of both signs
+function RandomQ4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// random K-quant rows (Q4_K, Q6_K): every bit pattern, finite scales
+function RandomK(aType: TInferDType; aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// true when both float arrays hold the same bits
+function SameBits(a, b: PSingleArray; aCount: PtrInt): boolean;
+/// max |a - b| relative to max |b| - a scale-free error of a whole output
+function RelError(a, b: PSingleArray; aCount: PtrInt): double;
+
 implementation
 
 /// deterministic pseudo-random values in [-aScale, aScale)

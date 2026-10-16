@@ -1,0 +1,133 @@
+// LandrixAI - y[r, o] = bias[o] + sum_i w[o, i] * x[r, i] on the device
+// (phase 4b of docs/native-inference.md)
+// - w in its storage type: F32, Q8_0, Q4_K or Q6_K (ggml block layouts, see
+//   mormot.ai.infer.tensor), dequantized per element in float, x in F32 - the
+//   arithmetic of InferRowToF32 followed by an F32 dot product, in another
+//   summation order (a tolerance, not bits)
+// - one work group of 128 per output feature and token row; work groups loop
+//   over the outputs, so no dimension of the dispatch exceeds 65535
+// - correct first: bytes are read one by one from a uint view of the weights
+//   (blocks of 34 or 210 bytes are not 4-byte aligned); speed comes with 4d
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufW { uint w[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
+layout(push_constant) uniform Push {
+  uint rows, nin, nout, dtype, hasBias;
+} p;
+
+shared float partial[128];
+
+uint byteAt(uint a)
+{
+  return (w[a >> 2] >> ((a & 3u) * 8u)) & 255u;
+}
+
+float halfAt(uint a)
+{
+  return unpackHalf2x16(byteAt(a) | (byteAt(a + 1u) << 8)).x;
+}
+
+int int8At(uint a)
+{
+  return bitfieldExtract(int(byteAt(a)), 0, 8);
+}
+
+// the weight of input i in the row that starts at byte rowBase
+float weight(uint rowBase, uint i)
+{
+  if (p.dtype == 1u)
+    return uintBitsToFloat(w[(rowBase >> 2) + i]);
+  if (p.dtype == 2u)
+  {
+    // Q8_0: 34 bytes per 32 values, value = d * qs[j]
+    uint base = rowBase + (i >> 5) * 34u;
+    return halfAt(base) * float(int8At(base + 2u + (i & 31u)));
+  }
+  if (p.dtype == 3u)
+  {
+    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K)
+    uint base = rowBase + (i >> 8) * 144u;
+    uint k = i & 255u;
+    uint j = k >> 5;
+    uint sc, m;
+    if (j < 4u)
+    {
+      sc = byteAt(base + 4u + j) & 63u;
+      m = byteAt(base + 8u + j) & 63u;
+    }
+    else
+    {
+      sc = (byteAt(base + 8u + j) & 15u) | ((byteAt(base + j) >> 6) << 4);
+      m = (byteAt(base + 8u + j) >> 4) | ((byteAt(base + 4u + j) >> 6) << 4);
+    }
+    uint q = byteAt(base + 16u + 32u * (j >> 1) + (k & 31u));
+    if ((j & 1u) != 0u)
+      q = q >> 4;
+    else
+      q = q & 15u;
+    float d1 = halfAt(base) * float(sc);
+    float m1 = halfAt(base + 2u) * float(m);
+    return d1 * float(q) - m1;
+  }
+  // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d (Q6KValue)
+  uint base = rowBase + (i >> 8) * 210u;
+  uint k = i & 255u;
+  uint n = k >> 7;
+  uint ii = k & 127u;
+  uint l = ii & 31u;
+  uint quarter = ii >> 5;
+  uint h = (byteAt(base + 128u + 32u * n + l) >> (2u * quarter)) & 3u;
+  uint ql = byteAt(base + 64u * n + l + ((quarter & 1u) != 0u ? 32u : 0u));
+  if (quarter >= 2u)
+    ql = ql >> 4;
+  else
+    ql = ql & 15u;
+  int q = int(ql | (h << 4)) - 32;
+  float t = halfAt(base + 208u) * float(int8At(base + 192u + (k >> 4)));
+  return t * float(q);
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint r = gl_WorkGroupID.y;
+  // bytes of one weight row
+  uint rowBytes;
+  if (p.dtype == 1u)
+    rowBytes = p.nin * 4u;
+  else if (p.dtype == 2u)
+    rowBytes = (p.nin >> 5) * 34u;
+  else if (p.dtype == 3u)
+    rowBytes = (p.nin >> 8) * 144u;
+  else
+    rowBytes = (p.nin >> 8) * 210u;
+  for (uint o = gl_WorkGroupID.x; o < p.nout; o += gl_NumWorkGroups.x)
+  {
+    float s = 0.0;
+    for (uint i = t; i < p.nin; i += 128u)
+      s += weight(o * rowBytes, i) * x[r * p.nin + i];
+    partial[t] = s;
+    barrier();
+    for (uint half_ = 64u; half_ > 0u; half_ >>= 1)
+    {
+      if (t < half_)
+        partial[t] += partial[t + half_];
+      barrier();
+    }
+    if (t == 0u)
+    {
+      float b = 0.0;
+      if (p.hasBias != 0u)
+        b = bias[o];
+      y[r * p.nout + o] = partial[0] + b;
+    }
+    barrier(); // partial[] is reused for the next output
+  }
+}

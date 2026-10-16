@@ -919,6 +919,23 @@ Delphi 13 (Win64) und Delphi 7 (Win32). Quellversionen in `UPSTREAM_BASE`.
 - `LAI_VULKAN_DEVICE=<Index>` wählt ein Gerät, `LAI_REQUIRE_VULKAN=1` macht das SKIP
   ohne Gerät zum Fehler.
 
+**4b erledigt (2026-10-16):** `TInferVulkanBackend` (`src/infer/mormot.ai.infer.backend.vulkan.pas`)
+ist das schnelle CPU-Backend mit `Linear` auf dem Gerät für F32, Q8_0, Q4_K und Q6_K
+(`tools/vk/linear.comp`: entpackt je Element wie `InferRowToF32`, rechnet in float gegen
+F32-Aktivierungen). Gewichte und Bias werden beim ersten Aufruf hochgeladen und bleiben
+auf dem Gerät (Schlüssel: Adresse, Typ, Größe), Aktivierungen gehen je Aufruf hin und
+zurück; ohne Shader-Typ, über dem Gerätelimit oder bei belegtem Gerät rechnet die CPU.
+Gerätespeicher mit Staging-Puffer (diskrete GPU) bzw. direkt gemappt (integrierte GPU,
+lavapipe). Test: relativer Fehler ≤ 1e-5 gegen die Referenz-F32 der entpackten Gewichte,
+auch > 65535 Ausgaben, Cache bitgleich; grün auf lavapipe und RTX 5090 (Delphi 13, Delphi 7).
+
+- Falle: Puffergrößen auf ganze 4-Byte-Wörter runden - der Shader liest Bytes über eine
+  `uint`-Sicht, und das letzte Wort von 210-Byte-Q6_K-Blöcken lag sonst außerhalb (der
+  Treiber liefert dort 0).
+- Falle (Testdaten): zufällige Bytes als FP16-Skalen enthalten signalisierende NaNs; x87
+  (Delphi 7) wirft darauf `EInvalidOp` - Testgewichte immer mit endlichen Skalen erzeugen.
+- Noch kein Tempogewinn: jeder Aufruf wartet auf das Gerät. Das kommt mit 4c/4d.
+
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 
