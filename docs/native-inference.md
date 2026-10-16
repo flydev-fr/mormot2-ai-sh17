@@ -1075,9 +1075,17 @@ GPU 2,47 ms, Host-Aufzeichnung 0,27 ms, `InferArgMax` über 151936 Logits 0,27 m
 | vorher | 305 | 322 | 290 |
 | jetzt | 360 | 375 | 329 Tok/s |
 
-- Offen: Fusionen (Gate/Up/SwiGLU, Q/K/V), `addnorm` mit Subgroups (8 µs je Dispatch, 55 je
-  Token), Argmax auf der GPU (spart 94 µs und das Lesen von 600 KB). Danach `TNativeLlmClient`
-  über die GPU.
+- Gemessen und verworfen (2026-10-16): Fusionen von Gate/Up/SwiGLU (ein `linear8`-Dispatch im
+  GLU-Modus, Gewichte hintereinander in einem Puffer) und von Q/K/V (ein Dispatch, `qkrope` und
+  `attention` mit Zeilenabstand). Ergebnis: Decode 360/382/332 statt 360/375/329, also im
+  Rauschen, Prefill etwa 1,5 % langsamer. Grund: SwiGLU fällt weg (−7,4 ms auf 64 Tokens), aber
+  der fusionierte Kern wird um ungefähr dasselbe langsamer. Die erste Fassung, in der jede Lane
+  beide Zeilen rechnete, halbierte zudem die Parallelität. Q/K/V liefen ohnehin ohne Barriere
+  nebeneinander. Die Annahme „feste Kosten je Dispatch“ trägt also nicht: Die Zeit steckt in der
+  Laufzeit der Kerne, die beim Dekodieren an der Latenz hängen.
+- Offen: Linear beim Dekodieren mit mehr Parallelität je Matrix-Vektor-Produkt (rund 10 µs je
+  Gruppe), `addnorm` mit Subgroups (8 µs, 55 je Token), Argmax auf der GPU (spart 94 µs und das
+  Lesen von 600 KB). Danach `TNativeLlmClient` über die GPU.
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
