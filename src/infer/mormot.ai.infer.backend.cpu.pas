@@ -792,6 +792,46 @@ begin
   end;
 end;
 
+/// DotK of one Q4_K weight row against the two activation rows x and
+// x + aXStride (bytes), the ints of both from aKernel (TInferKSums2): each
+// result in the arithmetic of DotK, so bit-identical to two DotK calls
+procedure DotQ4K2(w, x: pointer; aXStride, aBlocks: PtrInt; aKernel: TInferKSums2;
+  out aA, aB: double);
+var
+  sums: array[0..2047] of integer; // 512 blocks at a time: no heap
+  n, b: PtrInt;
+  wq: PInferBlockQ4_K;
+  xa, xb: PInferBlockQ8_K;
+  dx: double;
+begin
+  aA := 0;
+  aB := 0;
+  xa := x;
+  while aBlocks > 0 do
+  begin
+    n := aBlocks;
+    if n > 512 then
+      n := 512;
+    aKernel(w, xa, n, @sums, aXStride);
+    wq := w;
+    xb := pointer(PAnsiChar(xa) + aXStride);
+    for b := 0 to n - 1 do
+    begin
+      dx := xa^.d;
+      aA := aA + (INFER_HALF[wq^.d] * dx) * sums[b * 4] -
+        (INFER_HALF[wq^.dmin] * dx) * sums[b * 4 + 1];
+      dx := xb^.d;
+      aB := aB + (INFER_HALF[wq^.d] * dx) * sums[b * 4 + 2] -
+        (INFER_HALF[wq^.dmin] * dx) * sums[b * 4 + 3];
+      inc(wq);
+      inc(xa);
+      inc(xb);
+    end;
+    w := PAnsiChar(w) + n * SizeOf(TInferBlockQ4_K);
+    dec(aBlocks, n);
+  end;
+end;
+
 function InferDotQ4K(w: PInferBlockQ4_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
 begin
   result := DotK(idtQ4_K, w, x, aBlocks, InferQ4KSumsPascal);
@@ -1429,7 +1469,7 @@ end;
 procedure LinearTileWork(const aJob: TInferLinearJob; aTile: PtrInt);
 var
   o, oEnd, r, i, nb, k, stride: PtrInt;
-  acc, a, dw: double;
+  acc, acc2, a, dw: double;
   accs: single;
   acc8: array[0..7] of double;
   out8: array[0..7] of single;
@@ -1513,21 +1553,37 @@ begin
   oEnd := MinPtrInt((aTile + 1) * TILE, aJob.OutCount) - 1;
   if aJob.W.DType in [idtQ4_K, idtQ6_K] then
   begin
-    // K-quants: per output and row
+    // K-quants: per output and row - Q4_K two rows at a time where the CPU
+    // has a kernel for it (the weights unpacked once for both)
     nb := aJob.Blocks;
     for o := aTile * TILE to oEnd do
-      for r := 0 to aJob.Rows - 1 do
+    begin
+      r := 0;
+      while r < aJob.Rows do
       begin
         // the integer sums of this CPU's kernel, then the arithmetic of the
         // reference: Exact and the float path are bit-identical to it
         if aJob.W.DType = idtQ4_K then
-          acc := DotK(idtQ4_K, @PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
-            @aJob.Xk^[r * nb], nb, InferQ4KSums)
+          if Assigned(InferQ4KSums2) and (r + 1 < aJob.Rows) then
+          begin
+            DotQ4K2(@PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
+              @aJob.Xk^[r * nb], nb * SizeOf(TInferBlockQ8_K), nb, InferQ4KSums2,
+              acc, acc2);
+            aJob.Y^[r * aJob.OutCount + o] := Bias(o) + acc;
+            aJob.Y^[(r + 1) * aJob.OutCount + o] := Bias(o) + acc2;
+            inc(r, 2);
+            continue;
+          end
+          else
+            acc := DotK(idtQ4_K, @PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
+              @aJob.Xk^[r * nb], nb, InferQ4KSums)
         else
           acc := DotK(idtQ6_K, @PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ6_K)],
             @aJob.Xk^[r * nb], nb, InferQ6KSums);
         aJob.Y^[r * aJob.OutCount + o] := Bias(o) + acc;
+        inc(r);
       end;
+    end;
   end
   else if aJob.W.DType <> idtF32 then
   begin

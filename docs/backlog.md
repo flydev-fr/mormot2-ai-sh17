@@ -50,6 +50,17 @@ nichts, die Pascal-Skalenrechnung pro Zeile dafür viel.
    (Reihenfolge der Double-Operationen!), damit `Exact` bitgleich bleibt.
 5. Danach dasselbe für Q6_K (Gruppen zu 16, `scales` als int8).
 
+**Erledigt (2026-10-16): Schritte 1, 2 und 4 für Q4_K.**
+- *Kernel:* `TInferKSums2`, `InferQ4KSums2Pascal`, `Q4KSums2NeonDot` (Opcodes aus
+  `q4k2.s` mit GNU as 2.42, Quelltext als Kommentar je `.long`).
+- *Rechnung:* `DotQ4K2` und die Paarung in `LinearTileWork`.
+- *Test:* `LinearKMatchesReference` prüft Kernel = Pascal, auch über 513 Blöcke in zwei
+  Zeilen. Die Gegenprobe (vertauschte Ausgaben) lässt 16 Assertions scheitern.
+- *Messung:* Q4_K_M-Prefill bei 200 Tokens auf dem Snapdragon 275 → 299 Tokens/s, auf dem
+  M2 Pro 271 → 294.
+- *Offen:* Schritt 3 (AVX2, braucht wegen der Register xmm6..xmm15 aus dem
+  Sicherungsbereich) und Schritt 5 (Q6_K).
+
 **Fertig, wenn:** `TTestInferFast.LinearKMatchesReference` (bitgleich, auch 513 Blöcke)
 mit einer Form „gerade/ungerade Zeilenzahl" grün; neuer Test Kernel = Pascal; Gegenproben
 schlagen an; `demos/infer/llm-bench vendor/models/qwen3-0.6b-q4_k_m.gguf 200 32` im

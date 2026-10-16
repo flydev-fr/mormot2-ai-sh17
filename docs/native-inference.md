@@ -872,6 +872,15 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
 
 - Offen in Phase 3, als agentenfertige Einträge in [backlog.md](backlog.md): K-Quant-Prefill
   (B1, ein Versuch ohne eigenen Kernel war langsamer), Q4_0-Kernel (B2).
+- *B1, erster Teil (2026-10-16):* `TInferKSums2` und `Q4KSums2NeonDot`.
+  - Eine Q4_K-Gewichtszeile läuft gegen zwei Q8_K-Tokenzeilen. Nibbles, Skalen und Minima
+    werden pro Block einmal ausgepackt, die SDOTs laufen gegen beide Zeilen.
+  - `LinearTileWork` nimmt die Tokenzeilen paarweise.
+  - `DotQ4K2` rechnet jedes Ergebnis in der Double-Arithmetik von `DotK`, `Exact` bleibt
+    bitgleich.
+  - Qwen3-0.6B Q4_K_M, Prefill bei 200 Tokens: Snapdragon X 275 → 299 Tokens/s (drei
+    A/B-Paare), M2 Pro 271 → 294.
+  - Offen: AVX2 und Q6_K.
 
 ### Phase 4 — GPU: Vulkan zuerst, CUDA danach
 
