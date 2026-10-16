@@ -45,7 +45,8 @@ type
   TInferVulkanBackend = class(TInferCpuFastBackend)
   protected
     fVk: TInferVulkan;
-    fLinear, fLinear8: TInferVkPipeline;
+    fLinear, fLinear8, fLinear8Sg: TInferVkPipeline;
+    fUseSubgroups: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -61,7 +62,8 @@ type
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
     // the shader and work groups of a Linear: linear8.comp (4 features and 8
-    // rows per work group) when the inputs allow it, else linear.comp
+    // rows per work group, its subgroup build when UseSubgroups) when the
+    // inputs allow it, else linear.comp
     function LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
       out aX, aY: cardinal): TInferVkPipeline;
   public
@@ -92,6 +94,13 @@ type
       aBarrier: boolean = true);
     /// the device context
     property Vulkan: TInferVulkan read fVk;
+    /// true when the device runs the subgroup build of linear8.comp: Vulkan
+    // 1.1, subgroups of at least 32 invocations (a power of two) with basic,
+    // arithmetic and clustered operations in compute shaders
+    function SubgroupLinear: boolean;
+    /// use the subgroup build when SubgroupLinear (the default) - false: the
+    // shared-memory build, for comparisons
+    property UseSubgroups: boolean read fUseSubgroups write fUseSubgroups;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
@@ -126,6 +135,20 @@ begin
   fLinear8 := TInferVkPipeline.Create(fVk, @SPV_LINEAR8, length(SPV_LINEAR8), 4,
     SizeOf(TLinearPush));
   fLinear8.Name := 'linear';
+  if (fVk.ApiVersion >= VK_API_VERSION_1_1) and
+     (fVk.SubgroupStages and VK_SHADER_STAGE_COMPUTE_BIT <> 0) and
+     (fVk.SubgroupOperations and (VK_SUBGROUP_FEATURE_BASIC_BIT or
+       VK_SUBGROUP_FEATURE_ARITHMETIC_BIT or VK_SUBGROUP_FEATURE_CLUSTERED_BIT) =
+       VK_SUBGROUP_FEATURE_BASIC_BIT or VK_SUBGROUP_FEATURE_ARITHMETIC_BIT or
+       VK_SUBGROUP_FEATURE_CLUSTERED_BIT) and
+     (fVk.SubgroupSize >= 32) and (fVk.SubgroupSize <= 128) and
+     (fVk.SubgroupSize and (fVk.SubgroupSize - 1) = 0) then
+  begin
+    fLinear8Sg := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_SG,
+      length(SPV_LINEAR8_SG), 4, SizeOf(TLinearPush));
+    fLinear8Sg.Name := 'linear';
+    fUseSubgroups := true;
+  end;
   fNoBias := TInferVkBuffer.Create(fVk, 4, true);
 end;
 
@@ -137,6 +160,7 @@ begin
     FreeAndNil(fX);
     FreeAndNil(fY);
     FreeAndNil(fNoBias);
+    FreeAndNil(fLinear8Sg);
     FreeAndNil(fLinear8);
     FreeAndNil(fLinear);
     FreeAndNil(fVk);
@@ -181,6 +205,11 @@ begin
     (aIn mod INFER_DTYPE_BLOCK[aType] = 0);
 end;
 
+function TInferVulkanBackend.SubgroupLinear: boolean;
+begin
+  result := fLinear8Sg <> nil;
+end;
+
 function TInferVulkanBackend.LinearShape(aType: TInferDType; aIn, aRows,
   aOut: PtrInt; out aX, aY: cardinal): TInferVkPipeline;
 var
@@ -189,7 +218,10 @@ begin
   if (aType <> idtF32) or (aIn and 7 = 0) then
   begin
     // 8 weights per step: every block type qualifies, F32 when aIn allows
-    result := fLinear8;
+    if fUseSubgroups and (fLinear8Sg <> nil) then
+      result := fLinear8Sg
+    else
+      result := fLinear8;
     n := (aOut + 3) shr 2;
     aY := (aRows + 7) shr 3;
   end

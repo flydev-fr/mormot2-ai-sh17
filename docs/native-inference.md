@@ -891,6 +891,17 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
   Compiler wird nur zum Erzeugen gebraucht, nicht zur Laufzeit und nicht für den Build.
 - **Tests:** lavapipe unter WSL (Korrektheit ohne GPU, läuft in jeder FPC-Suite mit), RTX
   5090 auf dem RTX-Rechner (Leistung); ohne Vulkan-Loader überspringen die Tests.
+- **Apple-GPU (M2, auf der Roadmap seit 2026-10-16):** Apple bietet nativ nur Metal, kein
+  Vulkan.
+  - *Erster Schritt:* dasselbe Vulkan-Backend über MoltenVK (Vulkan auf Metal, Apache-2.0),
+    Backlog B8. Dafür muss die Instanz `VK_KHR_portability_enumeration` anfordern und das
+    Gerät `VK_KHR_portability_subset` aktivieren. Der Loader kommt wie unter Windows und Linux
+    vom System (Vulkan SDK oder Homebrew), nicht aus dem Repo.
+  - *Prüfen:* Subgroup-Größe auf Apple-GPUs (32) und die Leistung gegen den NEON-Pfad der
+    CPU. Durch den gemeinsamen Speicher (Unified Memory) entfällt das Hochladen über PCIe.
+  - *Zweiter Schritt, nur wenn MoltenVK spürbar bremst:* ein eigenes Metal-Backend. Das wäre
+    ein Objective-C-Laufzeit-Aufruf über `objc_msgSend` (kein Xcode-Projekt, keine
+    mitgelieferte Bibliothek), mit Shadern in MSL statt GLSL.
 
 Stufen:
 
@@ -1015,10 +1026,32 @@ RTX 5090 (Treiber 616.64, Windows 11), `llm-bench … vulkan`, naive Shader:
 \* mit Split-K gemessen. Q4_K_M: Prefill 1000 8345, Decode 1000 299 Tok/s. Decode schwankt
 zwischen Läufen um etwa ±5 %.
 
-- Offen in 4e: Beim Prefill dominieren jetzt die Linear-Kerne (64 % bei 4000 Tokens):
-  Matrix-Kacheln mit Shared Memory, Subgroup-Reduktionen (Vulkan 1.1). Beim Dekodieren sind
-  Linear, addnorm und die festen Kosten je Dispatch der größte Teil. Danach
-  `TNativeLlmClient` über die GPU.
+
+**4e, dritter Teil (2026-10-16):** Subgroup-Reduktionen in `linear8.comp`.
+
+- Die Instanz fordert Vulkan 1.1 an, wenn der Loader es meldet
+  (`vkEnumerateInstanceVersion`); Gerät und `vkGetPhysicalDeviceProperties2` müssen mitziehen,
+  sonst bleibt es bei 1.0. Mit 1.1 werden die Subgroup-Eigenschaften abgefragt
+  (`TInferVulkan.SubgroupSize`/`SubgroupOperations`/`SubgroupStages`).
+- `linear8.comp` wird zweimal gebaut. Die zweite Fassung (`-DSUBGROUP`, SPIR-V 1.3,
+  `SPV_LINEAR8_SG`) summiert die 32 Teilsummen je Ausgabe mit `subgroupClusteredAdd` statt über
+  Shared Memory mit 5 Barrieren. Sie wird nur genommen bei Subgroups von 32 bis 128 (Zweierpotenz)
+  mit Basic-, Arithmetic- und Clustered-Operationen im Compute-Shader. lavapipe hat kleinere
+  Subgroups und nimmt die alte Fassung; `LinearMatchesReference` prüft auf Geräten mit Subgroups
+  beide (`TInferVulkanBackend.UseSubgroups`). Gegenprobe (Cluster 16 statt 32) auf der RTX: 46
+  Fehlschläge.
+- Falle (Codex): Vulkan garantiert keinen Zusammenhang zwischen `gl_LocalInvocationID` und der
+  Lane in einer Subgroup. Der Subgroup-Pfad leitet Lane und Ausgabe deshalb aus `gl_SubgroupID`
+  und `gl_SubgroupInvocationID` ab, und zwar nur bei voll besetzten Subgroups von mindestens 32.
+  Sonst summiert auch diese Fassung über Shared Memory, ebenso auf Geräten, die zur Laufzeit
+  kleinere Subgroups nutzen, als sie melden.
+- Gewinn nur beim Prefill: RTX 5090, Q8_0, Prefill 200/1000/4000 Tokens 9087/8818/6777 →
+  9839/9412/7112 Tok/s (+5 bis +8 %). Das Dekodieren bleibt bei rund 320 Tok/s.
+- Beim Dekodieren liegen je Token rund 290 Dispatches bei etwa 2,5 ms GPU-Zeit, also knapp
+  9 µs je Dispatch. Die Untergrenze liegt bei etwa 4 µs (`swiglu`, `qkrope`). Die Bandbreite wäre
+  für 0,6B in Q8_0 nach rund 0,4 ms erschöpft. Weiter kommt man nur mit weniger Dispatches
+  (Fusionen: Gate/Up/SwiGLU, Q/K/V in einem Dispatch) und weniger Host-Arbeit je Token
+  (Argmax auf der GPU statt 600 KB Logits lesen); offen. Danach `TNativeLlmClient` über die GPU.
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.

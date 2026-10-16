@@ -134,7 +134,9 @@ Nutzers, keine Umsetzung vorab.
 
 ## B8 — Vulkan auf macOS (MoltenVK)
 
-**Ziel:** `TInferVulkan` auch auf dem Mac (M2 Pro), über MoltenVK.
+**Ziel:** `TInferVulkan` auch auf dem Mac (M2 Pro), über MoltenVK. Roadmap: Phase 4 in
+`docs/native-inference.md` („Apple-GPU“); ein natives Metal-Backend folgt nur, wenn MoltenVK
+spürbar bremst.
 
 **Ausgangslage:** `src/infer/mormot.ai.infer.vulkan.pas` fordert die Instanz-Erweiterung
 `VK_KHR_portability_enumeration` nicht an und setzt nicht

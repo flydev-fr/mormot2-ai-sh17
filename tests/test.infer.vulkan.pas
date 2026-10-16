@@ -265,7 +265,7 @@ var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
   fast: TInferCpuFastBackend;
-  t, i, o, rows, nin, nout: PtrInt;
+  s, t, i, o, rows, nin, nout: PtrInt;
   kind: TInferDType;
   x, bias, wf, wd, y1, y2, y3: TSingleDynArray;
   wq: RawByteString;
@@ -280,58 +280,68 @@ begin
   ref := TInferCpuBackend.Create;
   fast := TInferCpuFastBackend.Create;
   try
-    for t := 0 to high(TYPES) do
+    // both builds of linear8.comp where the device has subgroups
+    if gpu.SubgroupLinear then
+      AddConsole('Vulkan subgroups: % invocations', [gpu.Vulkan.SubgroupSize])
+    else
+      AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
+    for s := ord(not gpu.SubgroupLinear) to 1 do
     begin
-      kind := TYPES[t];
-      for i := 0 to high(SHAPES) do
+      gpu.UseSubgroups := s = 0;
+      for t := 0 to high(TYPES) do
       begin
-        rows := SHAPES[i, 0];
-        nin := SHAPES[i, 1];
-        nout := SHAPES[i, 2];
-        Fill(x, rows * nin, 11 + i, 3);
-        Fill(bias, nout, 21 + i, 1);
-        b := nil;
-        if not odd(i) then
-          b := pointer(bias);
-        case kind of
-          idtF32:
+        kind := TYPES[t];
+        for i := 0 to high(SHAPES) do
+        begin
+          rows := SHAPES[i, 0];
+          nin := SHAPES[i, 1];
+          nout := SHAPES[i, 2];
+          Fill(x, rows * nin, 11 + i, 3);
+          Fill(bias, nout, 21 + i, 1);
+          b := nil;
+          if not odd(i) then
+            b := pointer(bias);
+          case kind of
+            idtF32:
+              begin
+                Fill(wf, nout * nin, 31 + i, 0.1);
+                data := pointer(wf);
+              end;
+            idtQ8_0:
+              begin
+                wq := RandomQ8(nout, nin, 41 + i);
+                data := pointer(wq);
+              end;
+          else
             begin
-              Fill(wf, nout * nin, 31 + i, 0.1);
-              data := pointer(wf);
-            end;
-          idtQ8_0:
-            begin
-              wq := RandomQ8(nout, nin, 41 + i);
+              wq := RandomK(kind, nout, nin, 51 + i + 10 * t);
               data := pointer(wq);
             end;
-        else
-          begin
-            wq := RandomK(kind, nout, nin, 51 + i + 10 * t);
-            data := pointer(wq);
           end;
+          SetLength(wd, nout * nin);
+          for o := 0 to nout - 1 do
+            InferRowToF32(data, kind, o, nin, @wd[o * nin]);
+          SetLength(y1, rows * nout);
+          SetLength(y2, rows * nout);
+          ref.Linear(pointer(x), rows, nin, InferWeight(pointer(wd), idtF32), nout,
+            b, pointer(y1));
+          calls := gpu.GpuLinears;
+          gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,
+            pointer(y2));
+          CheckUtf8(gpu.GpuLinears = calls + 1, '% on the device', [INFER_DTYPE_NAME[kind]]);
+          e := RelError(pointer(y2), pointer(y1), rows * nout);
+          CheckUtf8(e <= 1e-5, '% % x % x %: relative error %',
+            [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
+          // again, from the weight cache: the same bits
+          SetLength(y3, rows * nout);
+          gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,
+            pointer(y3));
+          CheckUtf8(SameBits(pointer(y2), pointer(y3), rows * nout),
+            '% cached weights', [INFER_DTYPE_NAME[kind]]);
         end;
-        SetLength(wd, nout * nin);
-        for o := 0 to nout - 1 do
-          InferRowToF32(data, kind, o, nin, @wd[o * nin]);
-        SetLength(y1, rows * nout);
-        SetLength(y2, rows * nout);
-        ref.Linear(pointer(x), rows, nin, InferWeight(pointer(wd), idtF32), nout,
-          b, pointer(y1));
-        calls := gpu.GpuLinears;
-        gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,
-          pointer(y2));
-        CheckUtf8(gpu.GpuLinears = calls + 1, '% on the device', [INFER_DTYPE_NAME[kind]]);
-        e := RelError(pointer(y2), pointer(y1), rows * nout);
-        CheckUtf8(e <= 1e-5, '% % x % x %: relative error %',
-          [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
-        // again, from the weight cache: the same bits
-        SetLength(y3, rows * nout);
-        gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,
-          pointer(y3));
-        CheckUtf8(SameBits(pointer(y2), pointer(y3), rows * nout),
-          '% cached weights', [INFER_DTYPE_NAME[kind]]);
       end;
     end;
+    gpu.UseSubgroups := gpu.SubgroupLinear;
     // F32 with inputs no multiple of 8: linear.comp instead of linear8.comp
     Fill(x, 3 * 36, 61, 2);
     Fill(wf, 5 * 36, 62, 0.5);

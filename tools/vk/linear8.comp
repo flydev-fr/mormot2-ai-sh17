@@ -9,7 +9,22 @@
 //   token rows, so prefill reuses every dequantized weight ROWS times
 // - needs nin to be a multiple of 8 (F32) / 32 (Q8_0) / 256 (K-quants): the
 //   backend falls back to linear.comp otherwise
+// - built twice (tools/vk/build-shaders.sh): as is for Vulkan 1.0, the 32
+//   partial sums of a feature added in shared memory; with -DSUBGROUP for
+//   Vulkan 1.1 (SPV_LINEAR8_SG), added by subgroupClusteredAdd without a
+//   barrier - only for subgroups of at least 32 invocations with clustered
+//   arithmetic in compute shaders (TInferVulkanBackend checks)
+// - Vulkan relates no local invocation id to a subgroup lane: the subgroup
+//   path takes lane and feature from gl_SubgroupID / gl_SubgroupInvocationID
+//   (a cluster is 32 consecutive subgroup invocations), and only with full
+//   subgroups of at least 32 (a device that runs smaller or partial ones
+//   than it reports sums in shared memory also in this build; both values
+//   are the same for the whole work group)
 #version 450
+#ifdef SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
 
 #define ROWS 8
 
@@ -145,6 +160,15 @@ void main()
   uint t = gl_LocalInvocationID.x;
   uint lane = t & 31u;
   uint group = t >> 5;
+  bool sg = false;
+#ifdef SUBGROUP
+  if ((gl_SubgroupSize >= 32u) && (gl_NumSubgroups * gl_SubgroupSize == 128u))
+  {
+    sg = true;
+    lane = gl_SubgroupInvocationID & 31u;
+    group = gl_SubgroupID * (gl_SubgroupSize >> 5) + (gl_SubgroupInvocationID >> 5);
+  }
+#endif
   uint r0 = gl_WorkGroupID.y * ROWS;
   uint nr = min(uint(ROWS), p.rows - r0);
   uint rowBytes;
@@ -176,25 +200,44 @@ void main()
                     wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
         }
       }
-    for (uint r = 0u; r < uint(ROWS); r++)
-      partial[r * 128u + t] = acc[r];
-    barrier();
-    // 32 partial sums per feature and row
-    for (uint h = 16u; h > 0u; h >>= 1)
+#ifdef SUBGROUP
+    if (sg)
     {
-      if (lane < h)
-        for (uint r = 0u; r < nr; r++)
-          partial[r * 128u + t] += partial[r * 128u + t + h];
-      barrier();
-    }
-    if ((lane == 0u) && (o < p.nout))
-    {
+      // 32 partial sums per feature and row: one cluster of 32 invocations
+      // (nr is the same for the whole work group: uniform control flow)
       float b = 0.0;
-      if (p.hasBias != 0u)
+      if ((p.hasBias != 0u) && (o < p.nout))
         b = bias[o];
       for (uint r = 0u; r < nr; r++)
-        y[(r0 + r) * p.nout + o] = partial[r * 128u + t] + b;
+      {
+        float v = subgroupClusteredAdd(acc[r], 32u);
+        if ((lane == 0u) && (o < p.nout))
+          y[(r0 + r) * p.nout + o] = v + b;
+      }
     }
-    barrier(); // partial[] is reused for the next features
+    else
+#endif
+    {
+      for (uint r = 0u; r < uint(ROWS); r++)
+        partial[r * 128u + t] = acc[r];
+      barrier();
+      // 32 partial sums per feature and row
+      for (uint h = 16u; h > 0u; h >>= 1)
+      {
+        if (lane < h)
+          for (uint r = 0u; r < nr; r++)
+            partial[r * 128u + t] += partial[r * 128u + t + h];
+        barrier();
+      }
+      if ((lane == 0u) && (o < p.nout))
+      {
+        float b = 0.0;
+        if (p.hasBias != 0u)
+          b = bias[o];
+        for (uint r = 0u; r < nr; r++)
+          y[(r0 + r) * p.nout + o] = partial[r * 128u + t] + b;
+      }
+      barrier(); // partial[] is reused for the next features
+    }
   }
 }

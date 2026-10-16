@@ -75,6 +75,25 @@ type
     apiVersion: cardinal;
   end;
 
+  /// VkPhysicalDeviceSubgroupProperties (Vulkan 1.1), chained to
+  // TVkPhysicalDeviceProperties2
+  TVkPhysicalDeviceSubgroupProperties = record
+    sType: integer;
+    pNext: pointer;
+    subgroupSize: cardinal;
+    supportedStages: TVkFlags;
+    supportedOperations: TVkFlags;
+    quadOperationsInAllStages: cardinal;
+  end;
+
+  /// VkPhysicalDeviceProperties2 (Vulkan 1.1): properties is a
+  // VkPhysicalDeviceProperties (824 bytes), read by offset as in Open
+  TVkPhysicalDeviceProperties2 = record
+    sType: integer;
+    pNext: pointer;
+    properties: array[0..1023] of byte;
+  end;
+
   TVkInstanceCreateInfo = record
     sType: integer;
     pNext: pointer;
@@ -322,6 +341,9 @@ type
 const
   VK_SUCCESS = 0;
   VK_API_VERSION_1_0 = 1 shl 22;
+  VK_API_VERSION_1_1 = (1 shl 22) or (1 shl 12);
+  /// the major and minor bits of a version (no variant, no patch)
+  VK_API_VERSION_MASK = $1ffff000;
 
   VK_STRUCTURE_TYPE_APPLICATION_INFO = 0;
   VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1;
@@ -337,6 +359,8 @@ const
   VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO = 29;
   VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30;
   VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO = 32;
+  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001;
+  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000;
   VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO = 33;
   VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO = 34;
   VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET = 35;
@@ -362,6 +386,9 @@ const
   VK_SHARING_MODE_EXCLUSIVE = 0;
   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
   VK_SHADER_STAGE_COMPUTE_BIT = $20;
+  VK_SUBGROUP_FEATURE_BASIC_BIT = $1;
+  VK_SUBGROUP_FEATURE_ARITHMETIC_BIT = $4;
+  VK_SUBGROUP_FEATURE_CLUSTERED_BIT = $40;
   VK_PIPELINE_BIND_POINT_COMPUTE = 1;
   VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 2;
   VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
@@ -447,6 +474,11 @@ type
       aDevices: pointer): TVkResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     GetPhysicalDeviceProperties: procedure(aPhysical: TVkDispatch; aProps: pointer);
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    // Vulkan 1.1 - nil with an older loader / device
+    EnumerateInstanceVersion: function(var aVersion: cardinal): TVkResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GetPhysicalDeviceProperties2: procedure(aPhysical: TVkDispatch; aProps: pointer);
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     GetPhysicalDeviceQueueFamilyProperties: procedure(aPhysical: TVkDispatch;
       var aCount: cardinal; aProps: pointer);
@@ -610,6 +642,7 @@ type
     fDeviceName: RawUtf8;
     fDeviceType, fVendorId: integer;
     fMaxStorageRange, fMaxInvocations: cardinal;
+    fApiVersion, fSubgroupSize, fSubgroupStages, fSubgroupOperations: cardinal;
     // a Run whose work may still be pending on the device (its wait failed):
     // the command buffer and descriptor sets must not be touched any more
     fBroken: boolean;
@@ -710,6 +743,13 @@ type
     property MaxStorageRange: cardinal read fMaxStorageRange;
     /// VkPhysicalDeviceLimits.maxComputeWorkGroupInvocations (at least 128)
     property MaxInvocations: cardinal read fMaxInvocations;
+    /// the Vulkan version in use: VK_API_VERSION_1_1 when the loader and the
+    // device have it (SPIR-V 1.3 shaders, subgroup operations), else 1.0
+    property ApiVersion: cardinal read fApiVersion;
+    /// VkPhysicalDeviceSubgroupProperties - 0 with Vulkan 1.0
+    property SubgroupSize: cardinal read fSubgroupSize;
+    property SubgroupStages: cardinal read fSubgroupStages;
+    property SubgroupOperations: cardinal read fSubgroupOperations;
     /// true: every batch writes a GPU timestamp after each operation and sums
     // the time per pipeline name (needs timestamp support on the queue)
     property Profile: boolean read fProfile write fProfile;
@@ -887,6 +927,9 @@ var
   count, i, j, families: cardinal;
   phys: array of TVkDispatch;
   props: array[0..1023] of byte; // VkPhysicalDeviceProperties: 824 bytes
+  props2: TVkPhysicalDeviceProperties2;
+  sub: TVkPhysicalDeviceSubgroupProperties;
+  version: cardinal;
   fam: array of TVkQueueFamilyProperties;
   best, bestRank, rank, wanted, family: integer;
   priority: single;
@@ -903,11 +946,21 @@ begin
   if not Assigned(fApi.GetInstanceProcAddr) then
     raise EInferVulkan.Create('Vulkan: no vkGetInstanceProcAddr in the loader');
   Load(fApi.CreateInstance, 'vkCreateInstance', false); // fInstance = nil: global
+  // Vulkan 1.1 when the loader has it (a 1.0 loader refuses a higher
+  // apiVersion): subgroup properties and SPIR-V 1.3 shaders
+  PPointer(@@fApi.EnumerateInstanceVersion)^ :=
+    fApi.GetInstanceProcAddr(nil, 'vkEnumerateInstanceVersion');
+  fApiVersion := VK_API_VERSION_1_0;
+  version := 0;
+  if Assigned(fApi.EnumerateInstanceVersion) and
+     (fApi.EnumerateInstanceVersion(version) = VK_SUCCESS) and
+     (version and VK_API_VERSION_MASK >= VK_API_VERSION_1_1) then
+    fApiVersion := VK_API_VERSION_1_1;
   FillCharFast(app, SizeOf(app), 0);
   app.sType := VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app.pApplicationName := 'mormot.ai.infer';
   app.pEngineName := 'mormot.ai.infer';
-  app.apiVersion := VK_API_VERSION_1_0;
+  app.apiVersion := fApiVersion;
   FillCharFast(info, SizeOf(info), 0);
   info.sType := VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   info.pApplicationInfo := @app;
@@ -987,6 +1040,28 @@ begin
   // nanoseconds per tick; behind minMemoryMapAlignment, a size_t: the offset
   // differs between 32 and 64 bits (vulkan_core.h)
   fTimestampPeriod := PSingle(@props[296 + {$ifdef CPU64} 424 {$else} 416 {$endif}])^;
+  // the device's version caps what the instance may use on it
+  if PCardinal(@props[0])^ and VK_API_VERSION_MASK < VK_API_VERSION_1_1 then
+    fApiVersion := VK_API_VERSION_1_0;
+  if fApiVersion >= VK_API_VERSION_1_1 then
+  begin
+    PPointer(@@fApi.GetPhysicalDeviceProperties2)^ :=
+      fApi.GetInstanceProcAddr(fInstance, 'vkGetPhysicalDeviceProperties2');
+    if Assigned(fApi.GetPhysicalDeviceProperties2) then
+    begin
+      FillCharFast(sub, SizeOf(sub), 0);
+      sub.sType := VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+      FillCharFast(props2, SizeOf(props2), 0);
+      props2.sType := VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      props2.pNext := @sub;
+      fApi.GetPhysicalDeviceProperties2(fPhysical, @props2);
+      fSubgroupSize := sub.subgroupSize;
+      fSubgroupStages := sub.supportedStages;
+      fSubgroupOperations := sub.supportedOperations;
+    end
+    else
+      fApiVersion := VK_API_VERSION_1_0;
+  end;
   fApi.GetPhysicalDeviceMemoryProperties(fPhysical, @fMemory);
   // the device with one compute queue
   priority := 1;
