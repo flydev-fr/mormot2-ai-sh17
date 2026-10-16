@@ -41,6 +41,8 @@ type
     procedure CleanUp; override;
     /// false (and SKIP or a failure) without a device
     function HasDevice: boolean;
+    /// AttentionRangesMatchCpu for the tiny model in tests/data/infer-ref/aName
+    procedure CheckAttentionRanges(const aName: RawUtf8);
   published
     /// y = a + b on the device: the bits of the CPU sum (an IEEE add is
     // correctly rounded on both), over a count no multiple of the work group,
@@ -66,7 +68,8 @@ type
     procedure TinyQwen3MatchesCpu;
     /// the tiny Qwen3 with the attention keys in one range per row (several
     // tiles of 128 keys, the online softmax rescaled) and in ranges of one
-    // key (many ranges merged), against the CPU
+    // key (many ranges merged), against the CPU - also with a head dimension
+    // of 256 (tiny-qwen3-hd256: the second accumulator of attention.comp)
     procedure AttentionRangesMatchCpu;
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
@@ -519,6 +522,12 @@ begin
 end;
 
 procedure TTestInferVulkan.AttentionRangesMatchCpu;
+begin
+  CheckAttentionRanges('tiny-qwen3');
+  CheckAttentionRanges('tiny-qwen3-hd256');
+end;
+
+procedure TTestInferVulkan.CheckAttentionRanges(const aName: RawUtf8);
 const
   PROMPT = 400; // two chunks; a row sees up to 400 keys: 4 tiles
 var
@@ -539,8 +548,8 @@ var
 begin
   if not HasDevice then
     exit;
-  dir := FindInferRefDir('tiny-qwen3');
-  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+  dir := FindInferRefDir(aName);
+  if CheckFailed(dir <> '', Utf8ToString(aName + ' found')) then
     exit;
   SetLength(ids, PROMPT);
   seed := 11;
@@ -573,8 +582,8 @@ begin
       c2.Reset;
       vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
       e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-      CheckUtf8(e <= 1e-4, 'SplitKeys=% UseFlash=% prompt: relative error %',
-        [k and 1, vk.UseFlash, e]);
+      CheckUtf8(e <= 1e-4, '% SplitKeys=% UseFlash=% prompt: relative error %',
+        [aName, k and 1, vk.UseFlash, e]);
     end;
     vk.UseFlash := flash;
     // decoding past the prompt, one range and many ranges in turn
@@ -585,8 +594,8 @@ begin
       model.Forward(c1, @id, 1, pointer(l1));
       vk.Forward(c2, @id, 1, pointer(l2));
       e := RelError(pointer(l2), pointer(l1), v);
-      CheckUtf8(e <= 1e-4, 'SplitKeys=% decode step %: relative error %',
-        [i and 1, i, e]);
+      CheckUtf8(e <= 1e-4, '% SplitKeys=% decode step %: relative error %',
+        [aName, i and 1, i, e]);
     end;
   finally
     c2.Free;

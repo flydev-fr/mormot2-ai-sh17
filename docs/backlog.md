@@ -176,20 +176,18 @@ der CPU, oder belegt ist, dass MoltenVK die Grenze setzt.
 
 ---
 
-## B9 — Vulkan-Attention: Test für Kopfdimensionen über 128
+## B9 — Vulkan-Attention: Test für Kopfdimensionen über 128 (erledigt 2026-10-16)
 
-**Ziel:** Der Zweig für die Dimensionen `t + 128` in `tools/vk/attention.comp` (`acc1`,
-Kopfdimension 129 bis 256) läuft in einem Test.
+Der Zweig für die Dimensionen `t + 128` in `tools/vk/attention.comp` (`acc1`, Kopfdimension
+129 bis 256) läuft jetzt in `AttentionRangesMatchCpu`, mit `tests/data/infer-ref/tiny-qwen3-hd256`:
+- Das Modell ist ein Tiny-Qwen3 mit 2 Köpfen zu 256 über 1 KV-Kopf.
+- Embedding, Normen und MLP stammen aus `tiny-qwen3`.
+- Die Attention-Gewichte sind geseedet. Sie kommen aus `tools/infer-ref/make_tiny_headdim.py`,
+  das nur numpy braucht, kein torch: Der Test vergleicht das Gerät mit dem CPU-Backend.
 
-**Ausgangslage:** Das Tiny-Modell hat die Kopfdimension 32, Qwen3-0.6B hat 128. Der Zweig ist
-gebaut und von Claude und Codex gelesen, aber nie ausgeführt worden. Modelle mit der
-Kopfdimension 256 (etwa Gemma) würden ihn brauchen.
-
-**Vorgehen:** ein Tiny-Qwen3 mit `head_dim` 256 (oder 160) erzeugen wie `tests/data/infer-ref/tiny-qwen3`
-und durch `AttentionRangesMatchCpu` schicken. Gegenprobe: `acc1` nicht neu skalieren, der
-Test muss scheitern.
-
-**Fertig, wenn:** der Test grün ist und die Gegenprobe greift.
+Prompt und Decode sind mit und ohne Splits grün. Die Gegenprobe (`acc1` nicht neu skaliert)
+lässt 6 Assertions scheitern. `flash.comp` nimmt nur Kopfdimensionen bis 128; hier läuft
+deshalb `attention.comp`.
 
 ---
 

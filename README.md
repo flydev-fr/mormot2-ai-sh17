@@ -39,7 +39,7 @@ Number of assertions per suite, every one passing; each row with numbers ran bet
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
 | Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2620 ⁷ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2629 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 

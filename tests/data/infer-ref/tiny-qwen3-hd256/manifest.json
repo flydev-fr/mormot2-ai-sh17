@@ -1,0 +1,13 @@
+{
+ "dataset": "tiny-qwen3-hd256",
+ "note": "tiny-qwen3 with 2 heads of 256 over 1 KV head (seeded numpy attention weights, BF16): the device against the CPU backend, no reference outputs",
+ "safetensors_sha256": "152b55bedb81d8be3283486466aaedd74ae47ab5dd75e6247dffcb45d2e21c91",
+ "environment": {
+  "created_utc": "2026-10-16T15:02:13Z",
+  "platform": "Windows ARM64",
+  "python": "3.14.7",
+  "numpy": "2.5.3",
+  "seed": 256,
+  "generator": "tools/infer-ref/make_tiny_headdim.py"
+ }
+}
