@@ -306,7 +306,7 @@ begin
       AddConsole('Vulkan subgroups: % invocations', [gpu.Vulkan.SubgroupSize])
     else
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
-    // and matvec8.comp for one row of Q8_0 weights, gemm8.comp or
+    // and matvec8.comp for one row of Q8_0 / K-quants, gemm8.comp or
     // linear8.comp for many rows
     matvec := gpu.UseMatvec;
     gemm := gpu.UseGemm;

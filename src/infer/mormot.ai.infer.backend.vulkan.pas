@@ -45,7 +45,10 @@ type
   TInferVulkanBackend = class(TInferCpuFastBackend)
   protected
     fVk: TInferVulkan;
-    fLinear, fLinear8, fLinear8Sg, fMatvec8, fMatvec8Sg, fGemm8: TInferVkPipeline;
+    fLinear, fLinear8, fLinear8Sg, fGemm8: TInferVkPipeline;
+    // matvec8.comp per LINEAR_DTYPE (2 Q8_0, 3 Q4_K, 4 Q6_K), plain and with
+    // subgroup reductions
+    fMatvec, fMatvecSg: array[2..4] of TInferVkPipeline;
     fUseSubgroups, fUseMatvec, fUseGemm: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
@@ -62,7 +65,8 @@ type
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
     // the shader and work groups of a Linear: matvec8.comp for one row of
-    // Q8_0 weights when UseMatvec (4 features per work group), else
+    // Q8_0, Q4_K or Q6_K weights when UseMatvec (4 features per work
+    // group), else
     // linear8.comp (4 features and 8 rows per work group) when the inputs
     // allow it, else linear.comp - the subgroup builds when UseSubgroups
     function LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
@@ -102,10 +106,11 @@ type
     /// use the subgroup build when SubgroupLinear (the default) - false: the
     // shared-memory build, for comparisons
     property UseSubgroups: boolean read fUseSubgroups write fUseSubgroups;
-    /// one row of Q8_0 weights (decoding) through matvec8.comp instead of
-    // linear8.comp - by default on an Apple GPU (VendorId $106B) only: there
-    // Qwen3-0.6B Q8_0 decodes at 91 instead of 66 tokens/s, while an RTX 5090
-    // decodes 5 % slower with it (backlog B8)
+    /// one row of Q8_0, Q4_K or Q6_K weights (decoding) through matvec8.comp
+    // instead of linear8.comp - by default on an Apple GPU (VendorId $106B)
+    // only: there Qwen3-0.6B decodes at 98 instead of 66 tokens/s (Q8_0) and
+    // at 84 instead of 56 (Q4_K_M), while an RTX 5090 decodes 5 % slower with
+    // it (backlog B8)
     property UseMatvec: boolean read fUseMatvec write fUseMatvec;
     /// many rows (prefill) through the tiled gemm8.comp instead of linear8.comp
     // - by default where the device runs work groups of 256 invocations
@@ -138,6 +143,8 @@ type
 { TInferVulkanBackend }
 
 constructor TInferVulkanBackend.Create(aThreads: integer);
+var
+  i: PtrInt;
 begin
   inherited Create(aThreads);
   fVk := TInferVulkan.Create;
@@ -147,9 +154,14 @@ begin
   fLinear8 := TInferVkPipeline.Create(fVk, @SPV_LINEAR8, length(SPV_LINEAR8), 4,
     SizeOf(TLinearPush));
   fLinear8.Name := 'linear';
-  fMatvec8 := TInferVkPipeline.Create(fVk, @SPV_MATVEC8, length(SPV_MATVEC8), 4,
-    SizeOf(TLinearPush));
-  fMatvec8.Name := 'linear';
+  fMatvec[2] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q8,
+    length(SPV_MATVEC8_Q8), 4, SizeOf(TLinearPush));
+  fMatvec[3] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q4K,
+    length(SPV_MATVEC8_Q4K), 4, SizeOf(TLinearPush));
+  fMatvec[4] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q6K,
+    length(SPV_MATVEC8_Q6K), 4, SizeOf(TLinearPush));
+  for i := low(fMatvec) to high(fMatvec) do
+    fMatvec[i].Name := 'linear';
   // 256 invocations per work group: more than Vulkan guarantees (128)
   if (fVk.MaxInvocations >= 256) and (fVk.MaxGroupSizeX >= 256) then
   begin
@@ -170,9 +182,14 @@ begin
     fLinear8Sg := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_SG,
       length(SPV_LINEAR8_SG), 4, SizeOf(TLinearPush));
     fLinear8Sg.Name := 'linear';
-    fMatvec8Sg := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_SG,
-      length(SPV_MATVEC8_SG), 4, SizeOf(TLinearPush));
-    fMatvec8Sg.Name := 'linear';
+    fMatvecSg[2] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q8_SG,
+      length(SPV_MATVEC8_Q8_SG), 4, SizeOf(TLinearPush));
+    fMatvecSg[3] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q4K_SG,
+      length(SPV_MATVEC8_Q4K_SG), 4, SizeOf(TLinearPush));
+    fMatvecSg[4] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q6K_SG,
+      length(SPV_MATVEC8_Q6K_SG), 4, SizeOf(TLinearPush));
+    for i := low(fMatvecSg) to high(fMatvecSg) do
+      fMatvecSg[i].Name := 'linear';
     fUseSubgroups := true;
   end;
   fUseMatvec := fVk.VendorId = $106B; // Apple
@@ -180,6 +197,8 @@ begin
 end;
 
 destructor TInferVulkanBackend.Destroy;
+var
+  i: PtrInt;
 begin
   if fVk <> nil then
   begin
@@ -188,8 +207,11 @@ begin
     FreeAndNil(fY);
     FreeAndNil(fNoBias);
     FreeAndNil(fGemm8);
-    FreeAndNil(fMatvec8Sg);
-    FreeAndNil(fMatvec8);
+    for i := low(fMatvec) to high(fMatvec) do
+    begin
+      FreeAndNil(fMatvecSg[i]);
+      FreeAndNil(fMatvec[i]);
+    end;
     FreeAndNil(fLinear8Sg);
     FreeAndNil(fLinear8);
     FreeAndNil(fLinear);
@@ -245,12 +267,12 @@ function TInferVulkanBackend.LinearShape(aType: TInferDType; aIn, aRows,
 var
   n: PtrInt;
 begin
-  if fUseMatvec and (aType = idtQ8_0) and (aRows = 1) then
+  if fUseMatvec and (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and (aRows = 1) then
   begin
-    if fUseSubgroups and (fMatvec8Sg <> nil) then
-      result := fMatvec8Sg
+    if fUseSubgroups and (fMatvecSg[LINEAR_DTYPE[aType]] <> nil) then
+      result := fMatvecSg[LINEAR_DTYPE[aType]]
     else
-      result := fMatvec8;
+      result := fMatvec[LINEAR_DTYPE[aType]];
     n := (aOut + 3) shr 2; // one feature per 32 invocations
     aY := 1;
   end

@@ -966,6 +966,27 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
       voreingestellt.
     - `LinearMatchesReference` prüft auf jedem Gerät beide Kernel. Die Gegenprobe (Skala aus
       der falschen Worthälfte) lässt den Test scheitern.
+  - *`matvec8.comp` für K-Quants (2026-10-16):*
+    - *Einheit:* Jede Invocation nimmt Einheiten aus 32 Gewichten: bei Q8_0 einen Block, bei
+      Q4_K einen Unterblock, bei Q6_K ein Viertel einer Hälfte unter zwei Skalen.
+    - *Lesen:* Die Skalen liest sie einmal je Einheit, die Quants als ganze Wörter.
+      Q8_0- und Q6_K-Blöcke sind nur 2-Byte-ausgerichtet. Liegt ein Wert auf 2 mod 4,
+      setzt `word2` ihn verzweigungsfrei aus zwei Wörtern zusammen.
+    - *Verzweigung:* Mit einer echten Verzweigung dekodierte Q8_0 nur 46 Tokens/s, weil
+      Nachbar-Invocations abwechselnd beide Fälle nehmen.
+    - *Eigener Build je Typ:* Der Shader wird pro Gewichtstyp übersetzt (`-DDTYPE`), sechs
+      Varianten mit den Subgroup-Builds. Ein Shader für alle drei Typen kostete Register;
+      Q8_0 dekodierte damit 88 statt 98 Tokens/s.
+    - *Qwen3-0.6B auf dem M2 Pro, Decode bei 200 Tokens Kontext (Tokens/s):*
+
+      | Format | vorher | jetzt | CPU (NEON) |
+      |---|---|---|---|
+      | Q8_0 | 90,2 | 98,3 | 73 |
+      | Q4_K_M | 56 (`linear8`) | 83,6 | 75 |
+
+      Bei 1000 Tokens dekodiert Q8_0 mit 73,0 statt 68,2.
+    - *Gegenproben:* Q4_K ohne die oberen Bits des Minimums, Q6_K mit falscher zweiter
+      Skala und `word2` ohne Verschiebung lassen den Test scheitern.
   - *Prefill-Kernel `gemm8.comp` (2026-10-16):* ein gekachelter Kernel ab 16 Tokenzeilen
     (`GEMM_ROWS`), für alle Gewichtstypen von `linear8`.
     - *Kachel:* Eine Workgroup aus 256 Invocations rechnet 64 Zeilen × 64 Ausgaben.

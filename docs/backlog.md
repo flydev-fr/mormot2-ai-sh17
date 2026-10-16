@@ -156,9 +156,9 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
   - Der Prefill-Linear erreicht rund 400 GFLOPS von 6,8 TFLOPS.
 
 **Vorgehen:**
-1. **Decode-Matvec, erledigt 2026-10-16:** `matvec8.comp` auf Apple-GPUs. Der Decode steigt
-   bei 200 Tokens von 65,8 auf 90,2 Tokens/s, die CPU schafft 73. Offen bleiben die
-   K-Quants (Q4_K_M) im Decode: Sie laufen weiter über `linear8`.
+1. **Decode-Matvec, erledigt 2026-10-16:** `matvec8.comp` auf Apple-GPUs, für Q8_0, Q4_K und
+   Q6_K, je Typ ein eigener Build. Der Decode bei 200 Tokens steigt bei Q8_0 von 65,8 auf
+   98,3 Tokens/s, bei Q4_K_M von 56 auf 83,6. Die CPU schafft 73 bzw. 75.
 2. **Prefill-GEMM, erledigt 2026-10-16:** `gemm8.comp` auf allen Geräten. Der Prefill steigt
    bei 200 Tokens auf dem M2 Pro von 303 auf 1125 Tokens/s, auf der RTX 5090 von 10 000
    auf 13 600.

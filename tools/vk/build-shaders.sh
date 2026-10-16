@@ -13,6 +13,8 @@ trap 'rm -rf "$TMP"' EXIT
 ARGS=()
 for f in *.comp; do
   n=${f%.comp}
+  # matvec8.comp: only the per-type builds below
+  [ "$n" = matvec8 ] && continue
   # Vulkan 1.0 SPIR-V: every driver takes it; -Os keeps the constants small
   "$GLSLANG" -V --target-env vulkan1.0 -Os -o "$TMP/$n.spv" "$f" > "$TMP/$n.log" ||
     { cat "$TMP/$n.log"; exit 1; }
@@ -21,7 +23,14 @@ done
 # variants: linear8.comp with subgroup reductions, for Vulkan 1.1 devices
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/linear8_sg.spv" linear8.comp   > "$TMP/linear8_sg.log" || { cat "$TMP/linear8_sg.log"; exit 1; }
 ARGS+=("SPV_LINEAR8_SG=$TMP/linear8_sg.spv")
-"$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/matvec8_sg.spv" matvec8.comp   > "$TMP/matvec8_sg.log" || { cat "$TMP/matvec8_sg.log"; exit 1; }
-ARGS+=("SPV_MATVEC8_SG=$TMP/matvec8_sg.spv")
+# matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K), with and without
+# subgroup reductions
+for t in 2:Q8 3:Q4K 4:Q6K; do
+  d=${t%%:*}
+  n=${t#*:}
+  "$GLSLANG" -V --target-env vulkan1.0 -Os -DDTYPE=${d}u -o "$TMP/mv_$n.spv" matvec8.comp > "$TMP/mv_$n.log" || { cat "$TMP/mv_$n.log"; exit 1; }
+  "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -DDTYPE=${d}u -o "$TMP/mv_${n}_sg.spv" matvec8.comp > "$TMP/mv_${n}_sg.log" || { cat "$TMP/mv_${n}_sg.log"; exit 1; }
+  ARGS+=("SPV_MATVEC8_$n=$TMP/mv_$n.spv" "SPV_MATVEC8_${n}_SG=$TMP/mv_${n}_sg.spv")
+done
 python3 spv2pas.py "$OUT" "${ARGS[@]}"
 echo "written: $OUT (${#ARGS[@]} shaders)"

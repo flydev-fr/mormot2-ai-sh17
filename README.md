@@ -578,7 +578,7 @@ Next, in this order:
    flash attention still about 330 tokens/s at 4000 tokens of context; `TNativeLlmClient`
    decodes there with `client.Device := TQwen3Vulkan.Create(client.Model, gpu)`. On a Mac
    the same backend runs through MoltenVK (Homebrew `molten-vk` and `vulkan-loader`); on
-   the M2 Pro it beats the NEON CPU path (prefill 1254 against 563, decode 90 against
+   the M2 Pro it beats the NEON CPU path (prefill 1254 against 563, decode 98 against
    73 tokens/s at 200 tokens of context). Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
