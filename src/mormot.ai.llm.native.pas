@@ -210,6 +210,7 @@ type
   TNativePromptCache = class
   protected
     fSafe: TLightLock;
+    fModel: TQwen3Model;
     fIdle: TQwen3ContextDynArray; // the least recently used first
     fSlots: integer;
     fRequests, fHits, fReused: Int64;
@@ -233,6 +234,14 @@ type
     procedure Release(aContext: TQwen3Context; aReused: PtrInt);
     /// forget every cached sequence
     procedure Clear;
+    /// remove the idle contexts and return them, to be freed by the caller
+    // (e.g. outside a lock of its own: freeing a large cache takes a while)
+    function Take: TQwen3ContextDynArray;
+    /// where Acquire makes a new context: Model.NewContext (on Model.Device
+    // when it has one), a TQwen3Context when nil (not owned)
+    // - set before the first Acquire, and Clear when Model.Device changes
+    property Model: TQwen3Model
+      read fModel write fModel;
     /// how many idle contexts are kept
     property Slots: integer
       read fSlots write SetSlots;
@@ -260,12 +269,16 @@ type
     fTokenizer: TBpeTokenizer;
     fTemplate: TQwen3ChatTemplate;
     fModel: TQwen3Model;
+    fDevice: TQwen3Device;
+    fSafe: TLightLock; // fActive, and Device against Generate
+    fActive: integer;  // requests running
     fCache: TNativePromptCache;
     fConfig: TLlmProviderConfig;
     fMaxTokens: integer;
     fEnableThinking: boolean;
     fSampling: TInferSampling;
     procedure Generate(const aRequest: TLlmChatRequest; aParser: TQwen3OutputParser);
+    procedure SetDevice(aDevice: TQwen3Device);
   public
     /// load tokenizer.json, config.json and model.safetensors of aFolder
     // - aModelName: the name in Config and in every response, the folder name
@@ -310,6 +323,15 @@ type
     /// the model
     property Model: TQwen3Model
       read fModel;
+    /// where the model computes: nil (the default) on the backend of Create,
+    // else a TQwen3Device of Model - e.g. TQwen3Vulkan.Create(Model, gpu)
+    // decodes on a GPU - owned: freed with the client or when replaced
+    // - raises ELlmClient while a request runs or for a device of another
+    // model (aDevice is then not taken over); the prompt cache is cleared
+    // - a context taken with Cache.Acquire outside of a request must be given
+    // back before: the old device is freed here
+    property Device: TQwen3Device
+      read fDevice write SetDevice;
     /// the chat template, and through it the tokenizer
     property Template: TQwen3ChatTemplate
       read fTemplate;
@@ -914,15 +936,20 @@ var
   i: PtrInt;
   drop: TQwen3ContextDynArray;
 begin
+  drop := Take;
+  for i := 0 to high(drop) do
+    drop[i].Free;
+end;
+
+function TNativePromptCache.Take: TQwen3ContextDynArray;
+begin
   fSafe.Lock;
   try
-    drop := fIdle;
+    result := fIdle;
     fIdle := nil;
   finally
     fSafe.UnLock;
   end;
-  for i := 0 to high(drop) do
-    drop[i].Free;
 end;
 
 function TNativePromptCache.Acquire(const aPrompt: TIntegerDynArray): TQwen3Context;
@@ -957,7 +984,10 @@ begin
     fSafe.UnLock;
   end;
   if result = nil then
-    result := TQwen3Context.Create;
+    if fModel <> nil then
+      result := fModel.NewContext
+    else
+      result := TQwen3Context.Create;
 end;
 
 procedure TNativePromptCache.Release(aContext: TQwen3Context; aReused: PtrInt);
@@ -976,7 +1006,8 @@ begin
       inc(fHits);
       inc(fReused, aReused);
     end;
-    if fSlots = 0 then
+    // no slot, or a context of another device than the model's now
+    if (fSlots = 0) or ((fModel <> nil) and (aContext.Device <> fModel.Device)) then
       drop := aContext
     else
     begin
@@ -1045,6 +1076,7 @@ begin
   fModel := TQwen3Model.Create(dir, fBackend, aWeights);
   fSampling := InferSamplingFromConfig(dir + 'generation_config.json');
   fCache := TNativePromptCache.Create;
+  fCache.Model := fModel;
   // the stop and control tokens: fail at load, not at the first request
   TQwen3OutputParser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
@@ -1072,6 +1104,7 @@ begin
   fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
   fSampling := InferSamplingGreedy;
   fCache := TNativePromptCache.Create;
+  fCache.Model := fModel;
   // the stop and control tokens: fail at load, not at the first request
   TQwen3OutputParser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
@@ -1081,7 +1114,10 @@ end;
 
 destructor TNativeLlmClient.Destroy;
 begin
-  fCache.Free;
+  fCache.Free; // device contexts first, then their device
+  if fModel <> nil then
+    fModel.Device := nil;
+  fDevice.Free;
   fModel.Free;
   fTemplate.Free;
   fTokenizer.Free;
@@ -1103,14 +1139,24 @@ begin
     maxNew := fMaxTokens;
   prompt := NativeChatPrompt(fTemplate, aRequest, fEnableThinking);
   sampling := NativeSampling(aRequest, fSampling);
-  ctx := fCache.Acquire(prompt);
+  // Device stays as it is while this request runs (SetDevice refuses)
+  fSafe.Lock;
+  inc(fActive);
+  fSafe.UnLock;
   try
-    reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx);
-  except
-    ctx.Free; // a failed request leaves nothing in the cache
-    raise;
+    ctx := fCache.Acquire(prompt);
+    try
+      reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx);
+    except
+      ctx.Free; // a failed request leaves nothing in the cache
+      raise;
+    end;
+    fCache.Release(ctx, reused);
+  finally
+    fSafe.Lock;
+    dec(fActive);
+    fSafe.UnLock;
   end;
-  fCache.Release(ctx, reused);
 end;
 
 function TNativeLlmClient.ChatComplete(
@@ -1139,6 +1185,42 @@ begin
   finally
     parser.Free;
   end;
+end;
+
+procedure TNativeLlmClient.SetDevice(aDevice: TQwen3Device);
+var
+  old: TQwen3Device;
+  drop: TQwen3ContextDynArray;
+  i: PtrInt;
+begin
+  if (aDevice <> nil) and (aDevice.Model <> fModel) then
+    ELlmClient.RaiseUtf8('%.Device: % computes another model', [self, aDevice]);
+  old := nil;
+  drop := nil;
+  fSafe.Lock;
+  try
+    // the same instance again (two callers, say): nothing to free
+    if aDevice <> fDevice then
+    begin
+      // a running request holds a context of the old device (or the CPU)
+      if fActive > 0 then
+        ELlmClient.RaiseUtf8('%.Device: % requests are running', [self, fActive]);
+      // first the device of new contexts: a context of the old one given
+      // back from now on is dropped by Release (Model.Device differs)
+      fModel.Device := aDevice;
+      // the cached contexts belong to the old device (or the CPU): out of
+      // the cache here, freed below - not under this spin lock
+      drop := fCache.Take;
+      old := fDevice;
+      fDevice := aDevice;
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  // the contexts first, then their device
+  for i := 0 to high(drop) do
+    drop[i].Free;
+  old.Free;
 end;
 
 function TNativeLlmClient.Config: TLlmProviderConfig;

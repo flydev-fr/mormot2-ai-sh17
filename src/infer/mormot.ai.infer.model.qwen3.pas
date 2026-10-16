@@ -83,6 +83,8 @@ type
   TOnQwen3State = procedure(const aName: RawUtf8; aValues: PSingleArray;
     aRows, aCols: PtrInt) of object;
 
+  TQwen3Device = class;
+
   /// the KV cache and scratch buffers of one sequence
   // - one per concurrent sequence; may be reused for another sequence after
   // Reset, and for another model of the same shape
@@ -91,6 +93,7 @@ type
   // cache of position i depends on the tokens 0..i only
   TQwen3Context = class
   protected
+    fDevice: TQwen3Device; // nil: the keys and values are in the arrays below
     fLength, fCapacity: PtrInt;
     fKvWidth, fLayers: PtrInt;
     fOwner: integer; // serial of the model whose keys and values are cached
@@ -114,12 +117,17 @@ type
     /// the token cached at aPosition (0 .. Length - 1)
     property Id[aPosition: PtrInt]: integer
       read GetId;
+    /// the device that keeps the keys and values of this context (a context
+    // of TQwen3Device.NewDeviceContext), nil for one of TQwen3Model
+    property Device: TQwen3Device
+      read fDevice;
   end;
 
   /// a Qwen3 causal language model over a safetensors or a GGUF file
   TQwen3Model = class
   protected
     fSerial: integer; // unique per instance: an address may be reused after Free
+    fDevice: TQwen3Device;
     fConfig: TQwen3Config;
     fFile: TSafeTensorsFile; // Create: a Hugging Face folder
     fGguf: TGgufFile; // CreateFromGguf: one llama.cpp file
@@ -149,6 +157,7 @@ type
     procedure Grow(aCtx: TQwen3Context; aTokens, aNew: PtrInt);
     procedure RopeFactors(aCtx: TQwen3Context; aRows, aFirstPos: PtrInt);
     procedure Attention(aCtx: TQwen3Context; aLayer, aRows: PtrInt);
+    procedure SetDevice(aDevice: TQwen3Device);
   public
     /// load <aFolder>config.json and <aFolder>model.safetensors
     // - raises EInferError when a setting is unsupported or a weight is missing
@@ -168,7 +177,8 @@ type
     constructor CreateFromGguf(const aFileName: TFileName; aBackend: TInferBackend);
     /// unmap the weights
     destructor Destroy; override;
-    /// a context sized for this model (KV cache grows on demand)
+    /// a context sized for this model (KV cache grows on demand) - on Device
+    // when one is set
     function NewContext: TQwen3Context;
     /// append aCount tokens to the sequence of aCtx and compute them
     // - their positions are aCtx.Length .. aCtx.Length + aCount - 1; their ids,
@@ -223,6 +233,33 @@ type
     // the tokenizer too
     property Gguf: TGgufFile
       read fGguf;
+    /// where NewContext puts new contexts: nil (the default) computes with
+    // Backend, a TQwen3Device of this model on that device (not owned)
+    // - Forward, Reuse and Greedy follow the context: one of a device is
+    // computed there whatever Device is now
+    property Device: TQwen3Device
+      read fDevice write SetDevice;
+  end;
+
+  /// computes a TQwen3Model elsewhere - on a GPU (TQwen3Vulkan): its contexts
+  // keep their keys and values there, and TQwen3Model.Forward, Reuse and
+  // Greedy hand them over (a TNativeLlmClient decodes on it through
+  // TQwen3Model.Device)
+  TQwen3Device = class
+  protected
+    fModel: TQwen3Model;
+  public
+    /// a new, empty context on this device (owned by the caller)
+    function NewDeviceContext: TQwen3Context; virtual; abstract;
+    /// TQwen3Model.Forward for a context of this device (no states)
+    procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
+      aLogits: PSingleArray; aAllLogits: boolean = false); virtual; abstract;
+    /// TQwen3Model.Reuse for a context of this device
+    function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
+      aCount: PtrInt): PtrInt; virtual; abstract;
+    /// the model it computes (not owned)
+    property Model: TQwen3Model
+      read fModel;
   end;
 
 
@@ -810,7 +847,17 @@ end;
 
 function TQwen3Model.NewContext: TQwen3Context;
 begin
-  result := TQwen3Context.Create;
+  if fDevice <> nil then
+    result := fDevice.NewDeviceContext
+  else
+    result := TQwen3Context.Create;
+end;
+
+procedure TQwen3Model.SetDevice(aDevice: TQwen3Device);
+begin
+  if (aDevice <> nil) and (aDevice.fModel <> self) then
+    EInferError.RaiseUtf8('%.Device: % computes another model', [self, aDevice]);
+  fDevice := aDevice;
 end;
 
 procedure Need(var aBuffer: TSingleDynArray; aCount: PtrInt); overload;
@@ -941,6 +988,17 @@ var
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
+  if aCtx.fDevice <> nil then
+  begin
+    // the keys and values are on a device: computed there
+    if aCtx.fDevice.fModel <> self then
+      EInferError.RaiseUtf8('%.Forward: a context of % for another model',
+        [self, aCtx.fDevice]);
+    if Assigned(aOnState) then
+      EInferError.RaiseUtf8('%.Forward: no states from %', [self, aCtx.fDevice]);
+    aCtx.fDevice.Forward(aCtx, aIds, aCount, aLogits, aAllLogits);
+    exit;
+  end;
   if aCount <= 0 then
     EInferError.RaiseUtf8('%.Forward: no tokens', [self]);
   past := aCtx.fLength;
@@ -1025,6 +1083,14 @@ function TQwen3Model.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Reuse: no context', [self]);
+  if aCtx.fDevice <> nil then
+  begin
+    if aCtx.fDevice.fModel <> self then
+      EInferError.RaiseUtf8('%.Reuse: a context of % for another model',
+        [self, aCtx.fDevice]);
+    result := aCtx.fDevice.Reuse(aCtx, aIds, aCount);
+    exit;
+  end;
   result := 0;
   if (aCtx.fOwner = fSerial) and (aCount > 0) then
     result := aCtx.Common(aIds, aCount - 1);

@@ -24,6 +24,9 @@ uses
   mormot.ai.infer.backend.vulkan,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.qwen3.vulkan,
+  mormot.ai.llm.types,
+  mormot.ai.llm,
+  mormot.ai.llm.native,
   test.infer.ref,
   test.infer.fast,
   test.infer.bpe,
@@ -70,6 +73,11 @@ type
     // compared at every step - skipped on a CPU implementation (lavapipe:
     // minutes), and without the model files
     procedure Qwen3GgufMatchesCpu;
+    /// TNativeLlmClient on the device (Device := TQwen3Vulkan): the greedy
+    // answer of Qwen3-0.6B Q8_0 as without it, the next turn from the prompt
+    // cache on the device, back to the backend with Device := nil - skipped
+    // as Qwen3GgufMatchesCpu
+    procedure NativeClientOnDevice;
   end;
 
 
@@ -652,6 +660,95 @@ begin
       cpu.Free;
       gpu.Free;
     end;
+  end;
+end;
+
+procedure TTestInferVulkan.NativeClientOnDevice;
+var
+  dir, gguf: TFileName;
+  gpu: TInferVulkanBackend;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  msgs: TLlmMessageDynArray;
+  first, req: TLlmChatRequest;
+  r1, r2, r3: TLlmChatResponse;
+  hits, calls: Int64;
+  ctx: TQwen3Context;
+begin
+  if not HasDevice then
+    exit;
+  if fVk.DeviceType = VK_PHYSICAL_DEVICE_TYPE_CPU then
+  begin
+    AddConsole('SKIP the native client on the device: % is a CPU implementation',
+      [fVk.DeviceName]);
+    exit;
+  end;
+  {$ifdef CPU32}
+  AddConsole('SKIP the native client on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindQwen3Folder('model.safetensors');
+  gguf := '';
+  if dir <> '' then
+    gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+      'qwen3-0.6b-q8_0.gguf');
+  if (gguf = '') or not FileExists(gguf) then
+  begin
+    Check(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q8_0.gguf');
+    AddConsole('SKIP the native client on the device: no vendor/models/' +
+      'qwen3-0.6b-q8_0.gguf');
+    exit;
+  end;
+  gpu := TInferVulkanBackend.Create;
+  try
+    client := TNativeLlmClient.CreateFromGguf(gguf, '', gpu);
+    llm := client; // the interface frees the client, and with it its Device
+    client.EnableThinking := false;
+    client.MaxTokens := 24;
+    SetLength(msgs, 1);
+    msgs[0] := LlmMessage(lrUser, 'Name three colors.');
+    first := LlmChatRequest('', msgs);
+    // on the backend (the model's own forward pass: TInferVulkanBackend.Linear
+    // per matrix), then on the device (one batch per chunk, no Linear call)
+    calls := gpu.GpuLinears;
+    r1 := llm.ChatComplete(first);
+    Check(gpu.GpuLinears > calls, 'the backend computed the first answer');
+    client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+    Check(client.Model.Device = client.Device, 'the model computes on the device');
+    ctx := client.Model.NewContext;
+    try
+      Check((ctx is TQwen3VkContext) and (ctx.Device = client.Device),
+        'a new context is on the device');
+    finally
+      ctx.Free;
+    end;
+    calls := gpu.GpuLinears;
+    r2 := llm.ChatComplete(first);
+    Check(gpu.GpuLinears = calls, 'the device computed the answer, not the backend');
+    Check(r2.Content <> '', 'an answer on the device');
+    CheckUtf8(r2.Content = r1.Content, 'the device "%" as the backend "%"',
+      [r2.Content, r1.Content]);
+    // the next turn starts with the cached prompt: computed from there
+    hits := client.Cache.Hits;
+    SetLength(msgs, 3);
+    msgs[1] := LlmMessage(lrAssistant, r2.Content);
+    msgs[2] := LlmMessage(lrUser, 'One more, please.');
+    req := LlmChatRequest('', msgs);
+    r3 := llm.ChatComplete(req);
+    Check(r3.Content <> '', 'the next turn on the device');
+    Check(client.Cache.Hits = hits + 1, 'the next turn reused the device cache');
+    AddConsole('native client on %: "%" / "%"', [fVk.DeviceName, r2.Content,
+      r3.Content]);
+    // back on the backend: the device and its contexts go
+    client.Device := nil;
+    Check(client.Model.Device = nil, 'no device any more');
+    r1 := llm.ChatComplete(first);
+    CheckUtf8(r1.Content = r2.Content, 'the backend again: "%"', [r1.Content]);
+    llm := nil; // before the backend it computes with
+  finally
+    llm := nil;
+    gpu.Free;
   end;
 end;
 

@@ -36,8 +36,7 @@ uses
   mormot.ai.infer.backend,
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
-  mormot.ai.infer.model.qwen3,
-  mormot.ai.infer.sampler; // InferArgMax
+  mormot.ai.infer.model.qwen3;
 
 type
   TQwen3Vulkan = class;
@@ -46,14 +45,15 @@ type
   TInferVkBufferDynArray = array of TInferVkBuffer;
 
   /// one sequence: its token ids and its KV cache on the device
-  TQwen3VkContext = class
+  // - a TQwen3Context of TQwen3Vulkan: Length, Common, Truncate, Reset and the
+  // ids at every position as there (Capacity: of the device cache); the CPU
+  // arrays stay empty
+  TQwen3VkContext = class(TQwen3Context)
   protected
-    fOwner: TQwen3Vulkan;
-    fLength, fCapacity, fRows: PtrInt;
-    fIds: TIntegerDynArray;
-    fKeys, fValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
+    fRows: PtrInt;
+    fDevKeys, fDevValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
     // device scratch for up to fRows token rows
-    fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp, fCos: TInferVkBuffer;
+    fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp, fDevCos: TInferVkBuffer;
     fPart, fLogits: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
@@ -61,21 +61,13 @@ type
     procedure FreeCache;
   public
     destructor Destroy; override;
-    /// forget the cached tokens - the buffers stay allocated
-    procedure Reset;
-    /// keep the first aLength cached tokens (0 <= aLength <= Length)
-    procedure Truncate(aLength: PtrInt);
-    /// how many of the first tokens of aIds[0..aCount-1] the cache holds
-    function Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
-    /// tokens in the KV cache = position of the next token
-    property Length: PtrInt
-      read fLength;
   end;
 
   /// the forward pass of a TQwen3Model on the device of a TInferVulkanBackend
-  TQwen3Vulkan = class
+  // - a TQwen3Device: Model.Device := this instance makes Model.NewContext
+  // (and so a TNativeLlmClient) decode here
+  TQwen3Vulkan = class(TQwen3Device)
   protected
-    fModel: TQwen3Model;
     fBackend: TInferVulkanBackend;
     fVk: TInferVulkan;
     fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
@@ -99,18 +91,19 @@ type
     destructor Destroy; override;
     /// a context for this model on this device (owned by the caller)
     function NewContext: TQwen3VkContext;
-    /// TQwen3Model.Forward on the device: append aCount tokens to aCtx and
-    // compute them; aLogits: nil, the last token's [VocabSize] or, when
-    // aAllLogits, [aCount, VocabSize]
-    procedure Forward(aCtx: TQwen3VkContext; aIds: PIntegerArray; aCount: PtrInt;
-      aLogits: PSingleArray; aAllLogits: boolean = false);
+    /// NewContext, for TQwen3Model.NewContext
+    function NewDeviceContext: TQwen3Context; override;
+    /// TQwen3Model.Forward on the device: append aCount tokens to aCtx (a
+    // context of this instance) and compute them; aLogits: nil, the last
+    // token's [VocabSize] or, when aAllLogits, [aCount, VocabSize]
+    procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
+      aLogits: PSingleArray; aAllLogits: boolean = false); override;
     /// keep the cached tokens of aCtx that start aIds, at most aCount - 1
-    function Reuse(aCtx: TQwen3VkContext; aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+    function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
+      aCount: PtrInt): PtrInt; override;
     /// TQwen3Model.Greedy on the device
-    function Greedy(aCtx: TQwen3VkContext; const aPrompt: array of integer;
+    function Greedy(aCtx: TQwen3Context; const aPrompt: array of integer;
       aMaxNew: PtrInt; const aStop: array of integer): TIntegerDynArray;
-    property Model: TQwen3Model
-      read fModel;
     property Backend: TInferVulkanBackend
       read fBackend;
     /// the attention cuts the keys of a row into ranges of about this many
@@ -177,16 +170,16 @@ end;
 
 procedure TQwen3VkContext.FreeScratch;
 begin
-  FreeAndNil(fX);
-  FreeAndNil(fH);
-  FreeAndNil(fQ);
-  FreeAndNil(fK);
-  FreeAndNil(fV);
-  FreeAndNil(fAttn);
-  FreeAndNil(fTmp);
-  FreeAndNil(fGate);
-  FreeAndNil(fUp);
-  FreeAndNil(fCos);
+  FreeAndNil(fDevX);
+  FreeAndNil(fDevH);
+  FreeAndNil(fDevQ);
+  FreeAndNil(fDevK);
+  FreeAndNil(fDevV);
+  FreeAndNil(fDevAttn);
+  FreeAndNil(fDevTmp);
+  FreeAndNil(fDevGate);
+  FreeAndNil(fDevUp);
+  FreeAndNil(fDevCos);
   FreeAndNil(fIn);
   fRows := 0;
 end;
@@ -195,38 +188,17 @@ procedure TQwen3VkContext.FreeCache;
 var
   i: PtrInt;
 begin
-  for i := 0 to high(fKeys) do
+  for i := 0 to high(fDevKeys) do
   begin
-    FreeAndNil(fKeys[i]);
-    FreeAndNil(fValues[i]);
+    FreeAndNil(fDevKeys[i]);
+    FreeAndNil(fDevValues[i]);
   end;
-  fKeys := nil;
-  fValues := nil;
+  fDevKeys := nil;
+  fDevValues := nil;
   FreeAndNil(fPart);
   FreeAndNil(fLogits);
   FreeAndNil(fOut);
   fCapacity := 0;
-end;
-
-procedure TQwen3VkContext.Reset;
-begin
-  fLength := 0;
-end;
-
-procedure TQwen3VkContext.Truncate(aLength: PtrInt);
-begin
-  if (aLength < 0) or (aLength > fLength) then
-    EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
-  fLength := aLength;
-end;
-
-function TQwen3VkContext.Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
-begin
-  result := 0;
-  if aCount > fLength then
-    aCount := fLength;
-  while (result < aCount) and (fIds[result] = aIds^[result]) do
-    inc(result);
 end;
 
 
@@ -275,6 +247,9 @@ end;
 
 destructor TQwen3Vulkan.Destroy;
 begin
+  // the model no longer hands out contexts of this device
+  if (fModel <> nil) and (fModel.Device = self) then
+    fModel.Device := nil;
   fAddNorm.Free;
   fQkRope.Free;
   fAdd.Free;
@@ -342,7 +317,12 @@ end;
 function TQwen3Vulkan.NewContext: TQwen3VkContext;
 begin
   result := TQwen3VkContext.Create;
-  result.fOwner := self;
+  result.fDevice := self;
+end;
+
+function TQwen3Vulkan.NewDeviceContext: TQwen3Context;
+begin
+  result := NewContext;
 end;
 
 function TQwen3Vulkan.ChunkRows(aCount: PtrInt; aAllLogits: boolean): PtrInt;
@@ -413,8 +393,8 @@ begin
         try
           for l := 0 to c.Layers - 1 do
           begin
-            fVk.BatchCopy(aCtx.fKeys[l], 0, keys[l], 0, Int64(aCtx.fLength) * kvw * 4);
-            fVk.BatchCopy(aCtx.fValues[l], 0, values[l], 0,
+            fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0, Int64(aCtx.fLength) * kvw * 4);
+            fVk.BatchCopy(aCtx.fDevValues[l], 0, values[l], 0,
               Int64(aCtx.fLength) * kvw * 4);
           end;
         except
@@ -431,13 +411,13 @@ begin
       end;
       raise;
     end;
-    for l := 0 to high(aCtx.fKeys) do
+    for l := 0 to high(aCtx.fDevKeys) do
     begin
-      aCtx.fKeys[l].Free;
-      aCtx.fValues[l].Free;
+      aCtx.fDevKeys[l].Free;
+      aCtx.fDevValues[l].Free;
     end;
-    aCtx.fKeys := keys;
-    aCtx.fValues := values;
+    aCtx.fDevKeys := keys;
+    aCtx.fDevValues := values;
     SetLength(aCtx.fIds, cap);
     aCtx.fCapacity := cap;
   end;
@@ -445,16 +425,16 @@ begin
   if aRows > aCtx.fRows then
   begin
     aCtx.FreeScratch;
-    NeedDevice(fVk, aCtx.fX, Int64(aRows) * c.Hidden * 4);
-    NeedDevice(fVk, aCtx.fH, Int64(aRows) * c.Hidden * 4);
-    NeedDevice(fVk, aCtx.fTmp, Int64(aRows) * c.Hidden * 4);
-    NeedDevice(fVk, aCtx.fQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fVk, aCtx.fAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fVk, aCtx.fK, Int64(aRows) * kvw * 4);
-    NeedDevice(fVk, aCtx.fV, Int64(aRows) * kvw * 4);
-    NeedDevice(fVk, aCtx.fGate, Int64(aRows) * c.Intermediate * 4);
-    NeedDevice(fVk, aCtx.fUp, Int64(aRows) * c.Intermediate * 4);
-    NeedDevice(fVk, aCtx.fCos, Int64(aRows) * half * 2 * 4); // cos, then sin
+    NeedDevice(fVk, aCtx.fDevX, Int64(aRows) * c.Hidden * 4);
+    NeedDevice(fVk, aCtx.fDevH, Int64(aRows) * c.Hidden * 4);
+    NeedDevice(fVk, aCtx.fDevTmp, Int64(aRows) * c.Hidden * 4);
+    NeedDevice(fVk, aCtx.fDevQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
+    NeedDevice(fVk, aCtx.fDevAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
+    NeedDevice(fVk, aCtx.fDevK, Int64(aRows) * kvw * 4);
+    NeedDevice(fVk, aCtx.fDevV, Int64(aRows) * kvw * 4);
+    NeedDevice(fVk, aCtx.fDevGate, Int64(aRows) * c.Intermediate * 4);
+    NeedDevice(fVk, aCtx.fDevUp, Int64(aRows) * c.Intermediate * 4);
+    NeedDevice(fVk, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     // host-visible: embeddings, then cos, then sin
     aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
     aCtx.fRows := aRows;
@@ -540,15 +520,15 @@ begin
     part := aCtx.fPart;
   end
   else
-    part := aCtx.fAttn; // bound, but not accessed by attention.comp
+    part := aCtx.fDevAttn; // bound, but not accessed by attention.comp
   // the inputs, written into the host-visible buffer before the batch
   p := aCtx.fIn.Mapped;
   fModel.Embed(aIds, n, p);
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
   fVk.BatchBegin;
   try
-    fVk.BatchCopy(aCtx.fIn, 0, aCtx.fX, 0, Int64(n) * h * 4);
-    fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fCos, 0, Int64(n) * half * 2 * 4);
+    fVk.BatchCopy(aCtx.fIn, 0, aCtx.fDevX, 0, Int64(n) * h * 4);
+    fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fDevCos, 0, Int64(n) * half * 2 * 4);
     qk.Rows := n;
     qk.Heads := c.Heads;
     qk.KvHeads := c.KvHeads;
@@ -572,38 +552,38 @@ begin
     merge.Splits := splits;
     // the input norm of layer 0; every later one comes with the residual of
     // the layer before (addnorm)
-    RecordNorm(aCtx.fX, n, h, fModel.Layers[0].InputNorm, aCtx.fH);
+    RecordNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
     for l := 0 to c.Layers - 1 do
     begin
       ly := @fModel.Layers[l];
       // attention block: the three projections side by side (no barrier
-      // between them: they only read fH), then per head the norms, rotary
+      // between them: they only read fDevH), then per head the norms, rotary
       // positions and the store of k and v into the cache
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Q, qw, aCtx.fQ, false);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.K, kvw, aCtx.fK, false);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.V, kvw, aCtx.fV);
-      fVk.BatchDispatch(fQkRope, [aCtx.fQ, aCtx.fK, aCtx.fV,
-        Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fCos,
-        aCtx.fKeys[l], aCtx.fValues[l]], @qk, c.Heads + c.KvHeads, n);
-      fVk.BatchDispatch(fAttention, [aCtx.fQ, aCtx.fKeys[l], aCtx.fValues[l],
-        aCtx.fAttn, part], @att, c.Heads div hb, blocks, splits);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
+      fVk.BatchDispatch(fQkRope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV,
+        Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fDevCos,
+        aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.KvHeads, n);
+      fVk.BatchDispatch(fAttention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
+        aCtx.fDevAttn, part], @att, c.Heads div hb, blocks, splits);
       if splits > 1 then
-        fVk.BatchDispatch(fMerge, [part, aCtx.fAttn], @merge, c.Heads, n);
-      fBackend.RecordLinear(aCtx.fAttn, n, qw, ly^.O, h, aCtx.fTmp);
+        fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn], @merge, c.Heads, n);
+      fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
       // residual and the feed-forward pre-norm, gate and up side by side,
       // SwiGLU, down
-      fVk.BatchDispatch(fAddNorm, [aCtx.fX, aCtx.fTmp, Vector(ly^.PostNorm, h),
-        aCtx.fH], @norm, n);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Gate, f, aCtx.fGate, false);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Up, f, aCtx.fUp);
-      RecordElementwise(fSwiGlu, [aCtx.fGate, aCtx.fUp], n * f);
-      fBackend.RecordLinear(aCtx.fGate, n, f, ly^.Down, h, aCtx.fTmp);
+      fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
+        aCtx.fDevH], @norm, n);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
+      RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], n * f);
+      fBackend.RecordLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
       // the residual, and the input norm of the next layer
       if l < c.Layers - 1 then
-        fVk.BatchDispatch(fAddNorm, [aCtx.fX, aCtx.fTmp,
-          Vector(fModel.Layers[l + 1].InputNorm, h), aCtx.fH], @norm, n)
+        fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp,
+          Vector(fModel.Layers[l + 1].InputNorm, h), aCtx.fDevH], @norm, n)
       else
-        RecordElementwise(fAdd, [aCtx.fX, aCtx.fTmp, aCtx.fX], n * h);
+        RecordElementwise(fAdd, [aCtx.fDevX, aCtx.fDevTmp, aCtx.fDevX], n * h);
       // the device starts on the first layer, then gets every fourth while
       // the host records the rest (BatchFlush: at most 7 per batch)
       if (l = 0) or (l and 3 = 3) then
@@ -614,12 +594,12 @@ begin
       if outRows = 1 then
       begin
         // the last row only: to the start of the scratch, its norm, the head
-        fVk.BatchCopy(aCtx.fX, Int64(n - 1) * h * 4, aCtx.fTmp, 0, Int64(h) * 4);
-        RecordNorm(aCtx.fTmp, 1, h, fModel.FinalNorm, aCtx.fH);
+        fVk.BatchCopy(aCtx.fDevX, Int64(n - 1) * h * 4, aCtx.fDevTmp, 0, Int64(h) * 4);
+        RecordNorm(aCtx.fDevTmp, 1, h, fModel.FinalNorm, aCtx.fDevH);
       end
       else
-        RecordNorm(aCtx.fX, n, h, fModel.FinalNorm, aCtx.fH);
-      fBackend.RecordLinear(aCtx.fH, outRows, h, fModel.Head, c.VocabSize,
+        RecordNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
+      fBackend.RecordLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
         aCtx.fLogits);
       fVk.BatchCopy(aCtx.fLogits, 0, aCtx.fOut, 0,
         Int64(outRows) * c.VocabSize * 4);
@@ -635,19 +615,21 @@ begin
   aCtx.fLength := past + n;
 end;
 
-procedure TQwen3Vulkan.Forward(aCtx: TQwen3VkContext; aIds: PIntegerArray;
+procedure TQwen3Vulkan.Forward(aCtx: TQwen3Context; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   i, n, done, vocab: PtrInt;
   last: boolean;
+  ctx: TQwen3VkContext;
 begin
-  if (aCtx = nil) or (aCtx.fOwner <> self) then
+  if (aCtx = nil) or (aCtx.Device <> self) then
     EInferError.RaiseUtf8('%.Forward: no context of this instance', [self]);
+  ctx := TQwen3VkContext(aCtx); // only NewContext gives this device
   if aCount <= 0 then
     EInferError.RaiseUtf8('%.Forward: no tokens', [self]);
-  if aCount > fModel.Config.MaxPositions - aCtx.fLength then
+  if aCount > fModel.Config.MaxPositions - ctx.fLength then
     EInferError.RaiseUtf8('%.Forward: % + % tokens exceed the % positions',
-      [self, aCtx.fLength, aCount, fModel.Config.MaxPositions]);
+      [self, ctx.fLength, aCount, fModel.Config.MaxPositions]);
   vocab := fModel.Config.VocabSize;
   for i := 0 to aCount - 1 do
     if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
@@ -664,11 +646,11 @@ begin
       n := ChunkRows(aCount - done, aAllLogits and (aLogits <> nil));
       last := done + n = aCount;
       if aAllLogits and (aLogits <> nil) then
-        Chunk(aCtx, @aIds^[done], n, @aLogits^[done * vocab], true)
+        Chunk(ctx, @aIds^[done], n, @aLogits^[done * vocab], true)
       else if last then
-        Chunk(aCtx, @aIds^[done], n, aLogits, false)
+        Chunk(ctx, @aIds^[done], n, aLogits, false)
       else
-        Chunk(aCtx, @aIds^[done], n, nil, false);
+        Chunk(ctx, @aIds^[done], n, nil, false);
       inc(done, n);
     end;
   finally
@@ -676,10 +658,10 @@ begin
   end;
 end;
 
-function TQwen3Vulkan.Reuse(aCtx: TQwen3VkContext; aIds: PIntegerArray;
+function TQwen3Vulkan.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
   aCount: PtrInt): PtrInt;
 begin
-  if (aCtx = nil) or (aCtx.fOwner <> self) then
+  if (aCtx = nil) or (aCtx.Device <> self) then
     EInferError.RaiseUtf8('%.Reuse: no context of this instance', [self]);
   result := 0;
   if aCount > 0 then
@@ -687,42 +669,13 @@ begin
   aCtx.Truncate(result);
 end;
 
-function TQwen3Vulkan.Greedy(aCtx: TQwen3VkContext; const aPrompt: array of integer;
+function TQwen3Vulkan.Greedy(aCtx: TQwen3Context; const aPrompt: array of integer;
   aMaxNew: PtrInt; const aStop: array of integer): TIntegerDynArray;
-var
-  logits: TSingleDynArray;
-  n, i, next: PtrInt;
-  id: integer;
-  stop: boolean;
 begin
-  result := nil;
-  if length(aPrompt) = 0 then
-    EInferError.RaiseUtf8('%.Greedy: empty prompt', [self]);
-  if aMaxNew <= 0 then
-    EInferError.RaiseUtf8('%.Greedy: % new tokens', [self, aMaxNew]);
-  SetLength(logits, fModel.Config.VocabSize);
-  Forward(aCtx, @aPrompt[0], length(aPrompt), pointer(logits));
-  SetLength(result, aMaxNew);
-  n := 0;
-  repeat
-    next := InferArgMax(pointer(logits), fModel.Config.VocabSize);
-    result[n] := next;
-    inc(n);
-    stop := n = aMaxNew;
-    for i := 0 to high(aStop) do
-      if aStop[i] = next then
-        stop := true;
-    // as TQwen3Model.Greedy: every returned token enters the cache, so a
-    // conversation can go on; only a full context leaves the last one out
-    if aCtx.Length >= fModel.Config.MaxPositions then
-      break;
-    id := next;
-    if stop then
-      Forward(aCtx, @id, 1, nil)
-    else
-      Forward(aCtx, @id, 1, pointer(logits));
-  until stop;
-  SetLength(result, n);
+  if (aCtx = nil) or (aCtx.Device <> self) then
+    EInferError.RaiseUtf8('%.Greedy: no context of this instance', [self]);
+  // the model hands a context of this device to Forward here
+  result := fModel.Greedy(aCtx, aPrompt, aMaxNew, aStop);
 end;
 
 end.

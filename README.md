@@ -370,6 +370,8 @@ driver** behind the same `ILlmClient` seam:
   `generation_config.json` (as vLLM does) unless a request sets `Temperature` (0 = greedy)
   or `Extra` `top_p`, `top_k`, `min_p`, `seed`; a seed gives the same random stream on
   every compiler and CPU. Images and `ResponseFormat` are refused rather than ignored.
+  On a GPU: `client.Device := TQwen3Vulkan.Create(client.Model, gpu)` (Vulkan, with a
+  `TInferVulkanBackend` as the client's backend) - the same answers, the KV cache on the card.
 
 **Vision:** `TLlmMessage.Images` carries attachments (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`); both wires serialise them (OpenAI `image_url` including base64 `data:` URIs,
@@ -572,8 +574,8 @@ Next, in this order:
    decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md).
 2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
    at about 9800 and decodes at about 360 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
-   flash attention still about 330 tokens/s at 4000 tokens of context; the native client
-   comes next. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
+   flash attention still about 330 tokens/s at 4000 tokens of context; `TNativeLlmClient`
+   decodes there with `client.Device := TQwen3Vulkan.Create(client.Model, gpu)`. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

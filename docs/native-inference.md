@@ -1085,7 +1085,36 @@ GPU 2,47 ms, Host-Aufzeichnung 0,27 ms, `InferArgMax` über 151936 Logits 0,27 m
   Laufzeit der Kerne, die beim Dekodieren an der Latenz hängen.
 - Offen: Linear beim Dekodieren mit mehr Parallelität je Matrix-Vektor-Produkt (rund 10 µs je
   Gruppe), `addnorm` mit Subgroups (8 µs, 55 je Token), Argmax auf der GPU (spart 94 µs und das
-  Lesen von 600 KB). Danach `TNativeLlmClient` über die GPU.
+  Lesen von 600 KB).
+
+**`TNativeLlmClient` auf der GPU (2026-10-16):**
+
+```pascal
+gpu := TInferVulkanBackend.Create;
+client := TNativeLlmClient.CreateFromGguf('qwen3-0.6b-q8_0.gguf', '', gpu);
+client.Device := TQwen3Vulkan.Create(client.Model, gpu); // gehört dann dem Client
+llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
+```
+
+- Der Client bleibt frei von Vulkan, denn die Brücke liegt im Modell. Die abstrakte Klasse
+  `TQwen3Device` (in `mormot.ai.infer.model.qwen3`) rechnet ein `TQwen3Model` anderswo.
+  `TQwen3Model.Device` legt fest, wo `NewContext` neue Kontexte anlegt. `Forward`, `Reuse` und
+  `Greedy` folgen dem Kontext: Ein Kontext eines Geräts wird dort gerechnet.
+- `TQwen3Vulkan` ist ein `TQwen3Device`, `TQwen3VkContext` ein `TQwen3Context`. Länge, Token-IDs,
+  `Common` und `Truncate` stammen aus der Basis, deshalb läuft der Prompt-Cache des Clients
+  unverändert, mit dem KV-Cache auf der Karte.
+- `TNativeLlmClient.Device`: Das Gerät gehört dem Client. Der Wechsel leert den Prompt-Cache
+  und wird abgewiesen, solange Anfragen laufen (Zähler unter Lock; Claude- und Codex-Review).
+  `Release` verwirft Kontexte eines anderen Geräts. `TQwen3Vulkan.Destroy` setzt
+  `Model.Device` zurück. Die alten Kontexte und das alte Gerät werden außerhalb des Spinlocks
+  freigegeben (`TNativePromptCache.Take`), und derselbe Wechsel zweimal gibt nichts frei
+  (Codex-Nachreview).
+- Test `NativeClientOnDevice` (RTX 5090, Qwen3-0.6B Q8_0, greedy):
+  - Antwort auf der GPU und auf dem Backend wortgleich.
+  - Die GPU-Antwort entsteht ohne einen Backend-`Linear`-Aufruf (`GpuLinears` bleibt gleich).
+  - Der nächste Gesprächsschritt kommt aus dem Prompt-Cache auf dem Gerät.
+  - `Device := nil` führt zurück aufs Backend.
+  - Gegenprobe: Mit reinen CPU-Kontexten scheitert der Test.
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
