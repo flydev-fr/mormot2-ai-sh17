@@ -653,6 +653,13 @@ type
     fBatchPool: TVkHandle;
     fBatchSets: integer;
     fBatching: boolean;
+    // the command buffers of a batch: fCmd is fCmds[fCmdIndex]; BatchFlush
+    // submits the current one without a fence (fFlushed) and goes on in the next
+    fCmds: array of TVkDispatch;
+    fCmdIndex: integer;
+    fFlushed: boolean;
+    // fCmd is between vkBeginCommandBuffer and vkEndCommandBuffer
+    fRecording: boolean;
     // profiling: a timestamp after every operation of a batch, summed per name
     fProfile, fProfiling: boolean;
     fTimestampBits: cardinal;
@@ -729,6 +736,12 @@ type
     /// record a copy of aBytes from aSrc at aSrcOffset to aDst at aDstOffset
     procedure BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
       aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
+    /// submit what the batch recorded so far, without waiting, and go on
+    // recording: the device works while the host records the rest (one forward
+    // pass of a decoded token: the device would otherwise idle while all of it
+    // is recorded) - the next operation still sees every write before; a
+    // no-op once the batch has used all its command buffers (8)
+    procedure BatchFlush;
     /// submit the batch and wait: its writes are then visible to the host
     procedure BatchSubmit;
     /// leave a batch without submitting it (after an exception while recording)
@@ -772,6 +785,10 @@ const
 
 
 implementation
+
+const
+  /// the command buffers of a batch: BatchFlush submits up to VK_BATCH_CMDS - 1
+  VK_BATCH_CMDS = 8;
 
 var
   // TInferVulkan.Available: 0 = not tried yet, 1 = yes, 2 = no
@@ -1134,9 +1151,14 @@ begin
   cinfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   cinfo.commandPool := fCmdPool;
   cinfo.level := VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cinfo.commandBufferCount := 1;
-  CheckNew(fApi.AllocateCommandBuffers(fDevice, @cinfo, @fCmd), fCmd,
-    'vkAllocateCommandBuffers');
+  cinfo.commandBufferCount := VK_BATCH_CMDS;
+  SetLength(fCmds, VK_BATCH_CMDS);
+  if fApi.AllocateCommandBuffers(fDevice, @cinfo, pointer(fCmds)) <> VK_SUCCESS then
+  begin
+    fCmds := nil; // undefined after a failure: nothing to free one by one
+    raise EInferVulkan.Create('Vulkan: vkAllocateCommandBuffers failed');
+  end;
+  fCmd := fCmds[0];
   FillCharFast(finfo, SizeOf(finfo), 0);
   finfo.sType := VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   CheckNew(fApi.CreateFence(fDevice, @finfo, nil, fFence), fFence, 'vkCreateFence');
@@ -1273,6 +1295,7 @@ begin
   begin_.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   begin_.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   Check(fApi.BeginCommandBuffer(fCmd, @begin_), 'vkBeginCommandBuffer');
+  fRecording := true;
   // a fence orders execution, not memory: the device writes of the previous
   // submission (a copy, a shader) become visible to this one here
   FillCharFast(barrier, SizeOf(barrier), 0);
@@ -1297,6 +1320,7 @@ begin
   barrier.dstAccessMask := VK_ACCESS_HOST_READ_BIT;
   fApi.CmdPipelineBarrier(fCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, @barrier, 0, nil, 0, nil);
+  fRecording := false; // ended, or invalid after a failure: no second end
   Check(fApi.EndCommandBuffer(fCmd), 'vkEndCommandBuffer');
   FillCharFast(submit, SizeOf(submit), 0);
   submit.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1482,6 +1506,9 @@ begin
       'vkCreateQueryPool');
   end;
   QueryPerformanceMicroSeconds(fRecordStart);
+  fCmdIndex := 0;
+  fCmd := fCmds[0];
+  fFlushed := false;
   CmdBegin;
   fBatching := true;
   fQueries := 0;
@@ -1672,12 +1699,55 @@ begin
   fpu := DriverFpuEnter;
   try
     QueryPerformanceMicroSeconds(t1);
-    CmdSubmit;
+    try
+      CmdSubmit;
+    except
+      // flushed command buffers may still run without a fence to wait for
+      if fFlushed then
+        fBroken := true;
+      raise;
+    end;
+    fFlushed := false;
     QueryPerformanceMicroSeconds(t2);
     inc(fRecordUs, t1 - fRecordStart);
     inc(fWaitUs, t2 - t1);
     inc(fBatches);
     Collect;
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.BatchFlush;
+var
+  fpu: TDriverFpu;
+  submit: TVkSubmitInfo;
+begin
+  if not fBatching then
+    raise EInferVulkan.Create('Vulkan.BatchFlush: no BatchBegin');
+  if fCmdIndex >= VK_BATCH_CMDS - 1 then
+    exit; // the last command buffer takes the rest of the batch
+  fpu := DriverFpuEnter;
+  try
+    fRecording := false; // ended, or invalid after a failure: no second end
+    Check(fApi.EndCommandBuffer(fCmd), 'vkEndCommandBuffer');
+    FillCharFast(submit, SizeOf(submit), 0);
+    submit.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount := 1;
+    submit.pCommandBuffers := @fCmd;
+    // no fence: the one of BatchSubmit covers every earlier submission of
+    // the queue too; the barrier CmdBegin records first orders the next
+    // command buffer after this one (submission order)
+    if fApi.QueueSubmit(fQueue, 1, @submit, 0) <> VK_SUCCESS then
+    begin
+      fBroken := true; // earlier flushes may run: nothing may be reused
+      fBatching := false;
+      raise EInferVulkan.Create('Vulkan.BatchFlush: vkQueueSubmit failed');
+    end;
+    fFlushed := true;
+    inc(fCmdIndex);
+    fCmd := fCmds[fCmdIndex];
+    CmdBegin;
   finally
     DriverFpuLeave(fpu);
   end;
@@ -1692,8 +1762,15 @@ begin
   fBatching := false;
   fpu := DriverFpuEnter;
   try
-    // nothing was submitted: end the recording, the next CmdBegin resets it
-    fApi.EndCommandBuffer(fCmd);
+    // end the recording, the next CmdBegin resets it
+    if fRecording then
+      fApi.EndCommandBuffer(fCmd);
+    fRecording := false;
+    // flushed command buffers may still run: wait before their descriptor
+    // sets and command buffers are reused
+    if fFlushed and (fApi.DeviceWaitIdle(fDevice) <> VK_SUCCESS) then
+      fBroken := true;
+    fFlushed := false;
   finally
     DriverFpuLeave(fpu);
   end;

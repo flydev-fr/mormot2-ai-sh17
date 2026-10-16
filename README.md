@@ -571,8 +571,8 @@ Next, in this order:
    and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
    decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md).
 2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
-   at about 9800 and decodes at about 320 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
-   flash attention still about 290 tokens/s at 4000 tokens of context; the native client
+   at about 9800 and decodes at about 360 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
+   flash attention still about 330 tokens/s at 4000 tokens of context; the native client
    comes next. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,

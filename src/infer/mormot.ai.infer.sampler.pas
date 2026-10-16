@@ -119,20 +119,39 @@ end;
 function InferArgMax(aValues: PSingleArray; aCount: PtrInt): PtrInt;
 var
   i: PtrInt;
+  b: cardinal;
+  k, best: integer;
+  p: PCardinalArray;
 begin
   // the first value that is no NaN, then strictly greater ones only; all
   // NaN gives 0
-  result := 0;
-  while (result < aCount) and IsNanBits(PCardinalArray(aValues)^[result]) do
-    inc(result);
-  if result = aCount then
+  // - compared as integers, no float compare (a vocabulary of 150000 logits
+  // per decoded token): the bits of a float, the lower 31 flipped when it is
+  // negative, order as the float does; -0 (then -1) is taken as +0, a NaN
+  // (exponent all ones, mantissa not 0) skipped; -Inf maps above low(integer)
+  // - the flip without a branch: about half the logits are negative, a
+  // branch on the sign is mispredicted every other value (5x slower); the
+  // mask is a product, 0 or $7fffffff - a subtraction (0 - sign) is done in
+  // Int64 by FPC on 64-bit targets, and its shr 1 would keep the sign bit
+  result := -1;
+  best := low(integer);
+  p := pointer(aValues);
+  for i := 0 to aCount - 1 do
   begin
-    result := 0;
-    exit;
-  end;
-  for i := result + 1 to aCount - 1 do
-    if not IsNanBits(PCardinalArray(aValues)^[i]) and (aValues^[i] > aValues^[result]) then
+    b := p^[i];
+    if b and $7fffffff > $7f800000 then
+      continue; // NaN
+    k := integer(b xor ((b shr 31) * $7fffffff));
+    if k = -1 then
+      k := 0; // -0
+    if k > best then
+    begin
+      best := k;
       result := i;
+    end;
+  end;
+  if result < 0 then
+    result := 0;
 end;
 
 function InferSamplingGreedy: TInferSampling;

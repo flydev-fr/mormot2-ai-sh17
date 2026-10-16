@@ -604,6 +604,10 @@ begin
           Vector(fModel.Layers[l + 1].InputNorm, h), aCtx.fH], @norm, n)
       else
         RecordElementwise(fAdd, [aCtx.fX, aCtx.fTmp, aCtx.fX], n * h);
+      // the device starts on the first layer, then gets every fourth while
+      // the host records the rest (BatchFlush: at most 7 per batch)
+      if (l = 0) or (l and 3 = 3) then
+        fVk.BatchFlush;
     end;
     if outRows > 0 then
     begin

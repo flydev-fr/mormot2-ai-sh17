@@ -1050,8 +1050,34 @@ zwischen Läufen um etwa ±5 %.
 - Beim Dekodieren liegen je Token rund 290 Dispatches bei etwa 2,5 ms GPU-Zeit, also knapp
   9 µs je Dispatch. Die Untergrenze liegt bei etwa 4 µs (`swiglu`, `qkrope`). Die Bandbreite wäre
   für 0,6B in Q8_0 nach rund 0,4 ms erschöpft. Weiter kommt man nur mit weniger Dispatches
-  (Fusionen: Gate/Up/SwiGLU, Q/K/V in einem Dispatch) und weniger Host-Arbeit je Token
-  (Argmax auf der GPU statt 600 KB Logits lesen); offen. Danach `TNativeLlmClient` über die GPU.
+  (Fusionen: Gate/Up/SwiGLU, Q/K/V in einem Dispatch) und weniger Host-Arbeit je Token.
+
+**Dekodieren, erster Teil (2026-10-16):** Gemessen je Token (Q8_0, 200 Tokens Kontext):
+GPU 2,47 ms, Host-Aufzeichnung 0,27 ms, `InferArgMax` über 151936 Logits 0,27 ms.
+
+- `InferArgMax` vergleicht die Float-Bits als Ganzzahlen, ohne Sprung nach dem Vorzeichen.
+  Logits sind etwa zur Hälfte negativ, die Sprungvorhersage lag also jeden zweiten Wert daneben.
+  Ergebnis: 265 → 94 µs. Vertrag unverändert (erster Nicht-NaN-Wert, dann nur echt größere,
+  -0 = +0). Davon profitiert auch der CPU-Pfad.
+  - Falle 1 (Claude-Review): `cardinal(0) - x` rechnet FPC auf 64 Bit in Int64; die Maske ist
+    deshalb ein Produkt `(b shr 31) * $7fffffff`. Gegenprobe: 24 Fehlschläge.
+  - Falle 2 (Codex): Der Test darf zufällige Bitmuster nicht über ein `single`-Ergebnis
+    erzeugen, denn eine signalisierende NaN löst im x87 von Delphi Win32 eine Ausnahme aus.
+- `TInferVulkan.BatchFlush`: ein Ring aus 8 Command-Buffern. Ein fertiges Stück geht ohne
+  Fence an die Queue, während der Host weiter aufzeichnet. Die Barriere am Anfang des nächsten
+  Buffers und die Fence am Schluss decken alle früheren Einreichungen ab (Submission Order).
+  `TQwen3Vulkan` schickt nach Schicht 0 und dann nach jeder vierten. Für Fehlerpfade gilt:
+  Abbruch wartet auf das Gerät, ein gescheitertes Submit gibt den Kontext auf, `fRecording`
+  verhindert ein doppeltes `vkEndCommandBuffer` (Codex).
+
+| RTX 5090, Q8_0, Decode | 200 | 1000 | 4000 Tokens Kontext |
+|---|---|---|---|
+| vorher | 305 | 322 | 290 |
+| jetzt | 360 | 375 | 329 Tok/s |
+
+- Offen: Fusionen (Gate/Up/SwiGLU, Q/K/V), `addnorm` mit Subgroups (8 µs je Dispatch, 55 je
+  Token), Argmax auf der GPU (spart 94 µs und das Lesen von 600 KB). Danach `TNativeLlmClient`
+  über die GPU.
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.

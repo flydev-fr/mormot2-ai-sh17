@@ -41,6 +41,7 @@ type
     fNames: TRawUtf8DynArray;
     fStates: array of TSingleDynArray;
     procedure Setup; override;
+    procedure CheckArgMaxRandom;
     procedure CleanUp; override;
     /// TOnQwen3State: copy every state, the model reuses its buffers
     procedure KeepState(const aName: RawUtf8; aValues: PSingleArray;
@@ -78,7 +79,7 @@ type
     procedure TinyPromptReuse;
     /// a model with its own lm_head (tie_word_embeddings false)
     procedure TinyUntiedHead;
-    /// InferArgMax: ties, NaN
+    /// InferArgMax: ties, NaN, signs, -0, denormals, random bit patterns
     procedure ArgMaxTiesAndNan;
     /// Qwen3-0.6B: states of two prompts, last logits of all
     procedure Qwen3ForwardMatchesReference;
@@ -790,6 +791,59 @@ begin
   v[1] := SingleBits($ff800000); // -Inf
   v[2] := SingleBits($7fc00000);
   CheckEqual(InferArgMax(@v, 3), 1, '-Inf beats a NaN');
+  v[0] := -3;
+  v[1] := -0.5;
+  v[2] := -2;
+  v[3] := SingleBits($ff800000);
+  CheckEqual(InferArgMax(@v, 4), 1, 'negative values');
+  v[0] := SingleBits($80000000); // -0
+  v[1] := 0;
+  v[2] := SingleBits($80000001); // the negative value closest to 0
+  CheckEqual(InferArgMax(@v, 3), 0, '-0 = +0: the first');
+  v[0] := SingleBits($80000001);
+  v[1] := SingleBits($00000001); // the positive value closest to 0
+  v[2] := SingleBits($80000000);
+  CheckEqual(InferArgMax(@v, 3), 1, 'denormals');
+  CheckArgMaxRandom;
+end;
+
+procedure TTestInferQwen3.CheckArgMaxRandom;
+var
+  v: array[0..999] of single;
+  b, seed: cardinal;
+  i, n, round, expected: PtrInt;
+  ok: boolean;
+begin
+  // random bit patterns (every exponent, both signs, infinities, denormals,
+  // NaN now and then) against a plain float comparison over the non-NaN ones
+  seed := 12345;
+  ok := true;
+  for round := 1 to 200 do
+  begin
+    n := round * 5; // 5 .. 1000
+    for i := 0 to n - 1 do
+    begin
+      seed := seed * 1103515245 + 12345;
+      b := seed;
+      seed := seed * 1103515245 + 12345;
+      b := (b shl 16) xor (seed shr 8);
+      if round mod 3 = 0 then
+        b := b and $c07fffff; // exponents near 0: many close values
+      // the bits as they are: a signaling NaN returned as a single would
+      // trap in the x87 of Delphi Win32
+      PCardinal(@v[i])^ := b;
+    end;
+    expected := -1;
+    for i := 0 to n - 1 do
+      if PCardinal(@v[i])^ and $7fffffff <= $7f800000 then // no NaN
+        if (expected < 0) or (v[i] > v[expected]) then
+          expected := i;
+    if expected < 0 then
+      expected := 0;
+    if InferArgMax(@v, n) <> expected then
+      ok := false;
+  end;
+  Check(ok, 'random values as a float comparison');
 end;
 
 function TTestInferQwen3.RealModel: TFileName;
