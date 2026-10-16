@@ -1,0 +1,152 @@
+// LandrixAI - y[o] = bias[o] + sum_i w[o, i] * x[i] for Q8_0 weights and one
+// token row: the decode form of linear8.comp (backlog B8)
+// - same bindings and push constants as linear.comp; only rows = 1 and
+//   dtype = 2 (Q8_0) reach it (TInferVulkanBackend.LinearShape)
+// - a work group of 128 = 4 groups of 32 invocations, each group NR = 1
+//   output feature (NR = 4 decoded 5 % slower on the M2 Pro: fewer work
+//   groups): an invocation takes whole Q8_0 blocks (34 bytes: the
+//   scale and 32 quants in 9 words, shifted by 16 bits when the block starts
+//   at 0 mod 4), and the 32 activations of a block stay in registers for all
+//   NR features - linear8.comp reads the scale byte by byte and only 8
+//   weights per step
+// - TInferVulkanBackend takes it on Apple GPUs only (UseMatvec): an RTX 5090
+//   decodes faster with linear8.comp
+// - the 32 partial sums of a feature are added in shared memory, or with
+//   -DSUBGROUP (SPV_MATVEC8_SG) by subgroupClusteredAdd, under the same
+//   conditions and lane mapping as linear8.comp
+#version 450
+#ifdef SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
+
+#define NR 1
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufW { uint w[]; };
+layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
+layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, nin, nout, dtype, hasBias;
+} p;
+
+shared float partial[NR * 128];
+
+// the 4 signed bytes of v times a
+float dot4(uint v, vec4 a)
+{
+  return float(bitfieldExtract(int(v), 0, 8)) * a.x +
+         float(bitfieldExtract(int(v), 8, 8)) * a.y +
+         float(bitfieldExtract(int(v), 16, 8)) * a.z +
+         float(bitfieldExtract(int(v), 24, 8)) * a.w;
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint lane = t & 31u;
+  uint group = t >> 5;
+  bool sg = false;
+#ifdef SUBGROUP
+  if ((gl_SubgroupSize >= 32u) && (gl_NumSubgroups * gl_SubgroupSize == 128u))
+  {
+    sg = true;
+    lane = gl_SubgroupInvocationID & 31u;
+    group = gl_SubgroupID * (gl_SubgroupSize >> 5) + (gl_SubgroupInvocationID >> 5);
+  }
+#endif
+  uint blocks = p.nin >> 5;
+  uint rowBytes = blocks * 34u;
+  for (uint ob = gl_WorkGroupID.x * (4u * NR); ob < p.nout;
+       ob += gl_NumWorkGroups.x * (4u * NR))
+  {
+    uint o0 = ob + group * NR;
+    float acc[NR];
+    for (uint r = 0u; r < uint(NR); r++)
+      acc[r] = 0.0;
+    for (uint b = lane; b < blocks; b += 32u)
+    {
+      vec4 xv[8];
+      for (uint k = 0u; k < 8u; k++)
+        xv[k] = x[b * 8u + k];
+      for (uint r = 0u; r < uint(NR); r++)
+      {
+        uint o = o0 + r;
+        if (o < p.nout)
+        {
+          // byte address of the block: even, its quants 4-aligned or not
+          uint a = o * rowBytes + b * 34u;
+          uint i = a >> 2;
+          uint w0 = w[i];
+          float s = 0.0;
+          float d;
+          if ((a & 2u) == 0u)
+          {
+            // scale in the low half of w0, quant word k across two words
+            d = unpackHalf2x16(w0).x;
+            uint prev = w0 >> 16;
+            for (uint k = 0u; k < 8u; k++)
+            {
+              uint nx = w[i + 1u + k];
+              s += dot4(prev | (nx << 16), xv[k]);
+              prev = nx >> 16;
+            }
+          }
+          else
+          {
+            d = unpackHalf2x16(w0 >> 16).x;
+            for (uint k = 0u; k < 8u; k++)
+              s += dot4(w[i + 1u + k], xv[k]);
+          }
+          acc[r] += d * s;
+        }
+      }
+    }
+#ifdef SUBGROUP
+    if (sg)
+    {
+      for (uint r = 0u; r < uint(NR); r++)
+      {
+        uint o = o0 + r;
+        float v = subgroupClusteredAdd(acc[r], 32u);
+        if ((lane == 0u) && (o < p.nout))
+        {
+          float b = 0.0;
+          if (p.hasBias != 0u)
+            b = bias[o];
+          y[o] = v + b;
+        }
+      }
+    }
+    else
+#endif
+    {
+      for (uint r = 0u; r < uint(NR); r++)
+        partial[r * 128u + t] = acc[r];
+      barrier();
+      for (uint h = 16u; h > 0u; h >>= 1)
+      {
+        if (lane < h)
+          for (uint r = 0u; r < uint(NR); r++)
+            partial[r * 128u + t] += partial[r * 128u + t + h];
+        barrier();
+      }
+      if (lane == 0u)
+        for (uint r = 0u; r < uint(NR); r++)
+        {
+          uint o = o0 + r;
+          if (o < p.nout)
+          {
+            float b = 0.0;
+            if (p.hasBias != 0u)
+              b = bias[o];
+            y[o] = partial[r * 128u + t] + b;
+          }
+        }
+      barrier(); // partial[] is reused for the next features
+    }
+  }
+}

@@ -291,6 +291,7 @@ var
   b: PSingleArray;
   e: double;
   calls: Int64;
+  matvec: boolean;
 begin
   if not HasDevice then
     exit;
@@ -303,9 +304,12 @@ begin
       AddConsole('Vulkan subgroups: % invocations', [gpu.Vulkan.SubgroupSize])
     else
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
-    for s := ord(not gpu.SubgroupLinear) to 1 do
+    // and matvec8.comp for one row of Q8_0 weights
+    matvec := gpu.UseMatvec;
+    for s := ord(not gpu.SubgroupLinear) * 2 to 3 do
     begin
-      gpu.UseSubgroups := s = 0;
+      gpu.UseSubgroups := s < 2;
+      gpu.UseMatvec := odd(s);
       for t := 0 to high(TYPES) do
       begin
         kind := TYPES[t];
@@ -360,6 +364,7 @@ begin
       end;
     end;
     gpu.UseSubgroups := gpu.SubgroupLinear;
+    gpu.UseMatvec := matvec;
     // F32 with inputs no multiple of 8: linear.comp instead of linear8.comp
     Fill(x, 3 * 36, 61, 2);
     Fill(wf, 5 * 36, 62, 0.5);

@@ -156,9 +156,9 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
   - Der Prefill-Linear erreicht rund 400 GFLOPS von 6,8 TFLOPS.
 
 **Vorgehen:**
-1. **Decode-Matvec:** Q8_0-Kernel mit mehr Arbeit pro Lane. Die Skalen werden einmal je
-   Block geladen, die Aktivierungen in Registern über mehrere Ausgaben wiederverwendet.
-   Gegen RTX-Regression messen.
+1. **Decode-Matvec, erledigt 2026-10-16:** `matvec8.comp` auf Apple-GPUs. Der Decode steigt
+   bei 200 Tokens von 65,8 auf 90,2 Tokens/s, die CPU schafft 73. Offen bleiben die
+   K-Quants (Q4_K_M) im Decode: Sie laufen weiter über `linear8`.
 2. **Prefill-GEMM:** gekachelter Kernel mit Kacheln von `x` und den dequantisierten
    Gewichten im Shared Memory, etwa 64 × 64 Ausgaben pro Workgroup.
 3. Erst danach über ein Metal-Backend entscheiden.

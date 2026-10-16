@@ -45,8 +45,8 @@ type
   TInferVulkanBackend = class(TInferCpuFastBackend)
   protected
     fVk: TInferVulkan;
-    fLinear, fLinear8, fLinear8Sg: TInferVkPipeline;
-    fUseSubgroups: boolean;
+    fLinear, fLinear8, fLinear8Sg, fMatvec8, fMatvec8Sg: TInferVkPipeline;
+    fUseSubgroups, fUseMatvec: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -61,9 +61,10 @@ type
     function Weight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
-    // the shader and work groups of a Linear: linear8.comp (4 features and 8
-    // rows per work group, its subgroup build when UseSubgroups) when the
-    // inputs allow it, else linear.comp
+    // the shader and work groups of a Linear: matvec8.comp for one row of
+    // Q8_0 weights when UseMatvec (4 features per work group), else
+    // linear8.comp (4 features and 8 rows per work group) when the inputs
+    // allow it, else linear.comp - the subgroup builds when UseSubgroups
     function LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
       out aX, aY: cardinal): TInferVkPipeline;
   public
@@ -101,6 +102,11 @@ type
     /// use the subgroup build when SubgroupLinear (the default) - false: the
     // shared-memory build, for comparisons
     property UseSubgroups: boolean read fUseSubgroups write fUseSubgroups;
+    /// one row of Q8_0 weights (decoding) through matvec8.comp instead of
+    // linear8.comp - by default on an Apple GPU (VendorId $106B) only: there
+    // Qwen3-0.6B Q8_0 decodes at 91 instead of 66 tokens/s, while an RTX 5090
+    // decodes 5 % slower with it (backlog B8)
+    property UseMatvec: boolean read fUseMatvec write fUseMatvec;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
@@ -135,6 +141,9 @@ begin
   fLinear8 := TInferVkPipeline.Create(fVk, @SPV_LINEAR8, length(SPV_LINEAR8), 4,
     SizeOf(TLinearPush));
   fLinear8.Name := 'linear';
+  fMatvec8 := TInferVkPipeline.Create(fVk, @SPV_MATVEC8, length(SPV_MATVEC8), 4,
+    SizeOf(TLinearPush));
+  fMatvec8.Name := 'linear';
   if (fVk.ApiVersion >= VK_API_VERSION_1_1) and
      (fVk.SubgroupStages and VK_SHADER_STAGE_COMPUTE_BIT <> 0) and
      (fVk.SubgroupOperations and (VK_SUBGROUP_FEATURE_BASIC_BIT or
@@ -147,8 +156,12 @@ begin
     fLinear8Sg := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_SG,
       length(SPV_LINEAR8_SG), 4, SizeOf(TLinearPush));
     fLinear8Sg.Name := 'linear';
+    fMatvec8Sg := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_SG,
+      length(SPV_MATVEC8_SG), 4, SizeOf(TLinearPush));
+    fMatvec8Sg.Name := 'linear';
     fUseSubgroups := true;
   end;
+  fUseMatvec := fVk.VendorId = $106B; // Apple
   fNoBias := TInferVkBuffer.Create(fVk, 4, true);
 end;
 
@@ -160,6 +173,8 @@ begin
     FreeAndNil(fX);
     FreeAndNil(fY);
     FreeAndNil(fNoBias);
+    FreeAndNil(fMatvec8Sg);
+    FreeAndNil(fMatvec8);
     FreeAndNil(fLinear8Sg);
     FreeAndNil(fLinear8);
     FreeAndNil(fLinear);
@@ -215,7 +230,16 @@ function TInferVulkanBackend.LinearShape(aType: TInferDType; aIn, aRows,
 var
   n: PtrInt;
 begin
-  if (aType <> idtF32) or (aIn and 7 = 0) then
+  if fUseMatvec and (aType = idtQ8_0) and (aRows = 1) then
+  begin
+    if fUseSubgroups and (fMatvec8Sg <> nil) then
+      result := fMatvec8Sg
+    else
+      result := fMatvec8;
+    n := (aOut + 3) shr 2; // one feature per 32 invocations
+    aY := 1;
+  end
+  else if (aType <> idtF32) or (aIn and 7 = 0) then
   begin
     // 8 weights per step: every block type qualifies, F32 when aIn allows
     if fUseSubgroups and (fLinear8Sg <> nil) then

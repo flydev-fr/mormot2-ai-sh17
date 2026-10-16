@@ -21,5 +21,7 @@ done
 # variants: linear8.comp with subgroup reductions, for Vulkan 1.1 devices
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/linear8_sg.spv" linear8.comp   > "$TMP/linear8_sg.log" || { cat "$TMP/linear8_sg.log"; exit 1; }
 ARGS+=("SPV_LINEAR8_SG=$TMP/linear8_sg.spv")
+"$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/matvec8_sg.spv" matvec8.comp   > "$TMP/matvec8_sg.log" || { cat "$TMP/matvec8_sg.log"; exit 1; }
+ARGS+=("SPV_MATVEC8_SG=$TMP/matvec8_sg.spv")
 python3 spv2pas.py "$OUT" "${ARGS[@]}"
 echo "written: $OUT (${#ARGS[@]} shaders)"

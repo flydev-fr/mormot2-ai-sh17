@@ -949,6 +949,23 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
     - Der Prefill-Linear (200 Zeilen) erreicht rund 400 GFLOPS. Der M2 Pro schafft in FP32
       rund 6,8 TFLOPS.
     - Der Subgroup-Build von `linear8` ist auf Apple im Prefill langsamer (rund 260 GFLOPS).
+  - *Decode-Kernel `matvec8.comp` (2026-10-16):* ein eigener Kernel für eine Tokenzeile mit
+    Q8_0-Gewichten.
+    - Je 32 Invocations rechnen eine Ausgabe, und jede Invocation nimmt ganze
+      34-Byte-Blöcke. Die Skala kommt aus einem Wort; die 32 Quants kommen aus 8 Wörtern,
+      bei einem Block an Adresse 0 mod 4 per 16-Bit-Verschiebung.
+    - Er hat einen Subgroup-Build wie `linear8`.
+    - Der LM-Head steigt in der Sonde von 76 auf rund 120 GB/s.
+    - Qwen3-0.6B Q8_0 dekodiert auf dem M2 Pro mit 90,2 statt 65,8 Tokens/s bei 200
+      Tokens Kontext, mit 68,2 statt 53,6 bei 1000 und mit 40,0 statt 34,3 bei 4000. Die
+      GPU dekodiert damit bei jeder Länge schneller als die CPU (73, 46, 21).
+    - Vier statt einer Ausgabe je Gruppe waren 4 % langsamer (weniger Workgroups).
+    - Auf der RTX 5090 ist der Kernel 5 % langsamer als `linear8`. Mit vier Ausgaben je
+      Gruppe waren es 10 %.
+    - `TInferVulkanBackend.UseMatvec` ist deshalb nur auf Apple-GPUs (Vendor-ID `$106B`)
+      voreingestellt.
+    - `LinearMatchesReference` prüft auf jedem Gerät beide Kernel. Die Gegenprobe (Skala aus
+      der falschen Worthälfte) lässt den Test scheitern.
   - *Zweiter Schritt, nur wenn MoltenVK spürbar bremst:* ein eigenes Metal-Backend. Das wäre
     ein Objective-C-Laufzeit-Aufruf über `objc_msgSend` (kein Xcode-Projekt, keine
     mitgelieferte Bibliothek), mit Shadern in MSL statt GLSL.
@@ -1185,7 +1202,7 @@ Eine eigene Spur daneben ist die Verteilung großer Jobs auf ungenutzte Rechner:
 |---|---|---|
 | WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, Inferenz 1215, alle Demos) |
 | WSL2 Linux x86_64 auf dem RTX-Rechner (Ubuntu 24.04) | FPC 3.2.2 (wie Docker) | grün aus einem sauberen `git archive`: MCP 1257, LLM 656, Inferenz 828 mit Korpus-Gate |
-| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. Am 2026-10-16 Inferenz 2450 einschließlich der Vulkan-Suite auf der M2-Pro-GPU über MoltenVK (Homebrew `molten-vk` 1.4.2, `vulkan-loader` 1.4.363.0, `LAI_REQUIRE_VULKAN=1`). |
+| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. Am 2026-10-16 Inferenz 2570 einschließlich der Vulkan-Suite auf der M2-Pro-GPU über MoltenVK (Homebrew `molten-vk` 1.4.2, `vulkan-loader` 1.4.363.0, `LAI_REQUIRE_VULKAN=1`). |
 | Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
 | Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659, Inferenz 1205) |
 | Windows x64 unter Prism | FPC 3.2.2 | nur Kompatibilitätsprobe, nicht für Leistungsaussagen |
