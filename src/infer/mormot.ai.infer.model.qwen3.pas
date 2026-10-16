@@ -193,6 +193,16 @@ type
     // last one when the context reached MaxPositions
     function Greedy(aCtx: TQwen3Context; const aPrompt: array of integer;
       aMaxNew: PtrInt; const aStop: array of integer): TIntegerDynArray;
+    /// the F32 embeddings of aIds[0..aCount-1] into aDest ([aCount, Hidden]),
+    // as Forward takes them (for another executor, e.g. the GPU)
+    // - raises EInferError for an id outside the vocabulary
+    procedure Embed(aIds: PIntegerArray; aCount: PtrInt; aDest: PSingleArray);
+    /// the rotary factors of aRows positions from aFirstPos into aCos and aSin
+    // ([aRows, HeadDim / 2] each), as Forward computes them
+    procedure Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
+    /// the weights of the final RMSNorm, as used
+    property FinalNorm: PSingleArray
+      read fNorm;
     /// the hyper-parameters
     property Config: TQwen3Config
       read fConfig;
@@ -870,20 +880,38 @@ begin
 end;
 
 procedure TQwen3Model.RopeFactors(aCtx: TQwen3Context; aRows, aFirstPos: PtrInt);
+begin
+  // once per Forward: every layer and both Q and K use the same factors
+  Rotary(aFirstPos, aRows, pointer(aCtx.fCos), pointer(aCtx.fSin));
+end;
+
+procedure TQwen3Model.Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
 var
   r, i, half: PtrInt;
   angle: single;
 begin
-  // once per Forward: every layer and both Q and K use the same factors
   half := fConfig.HeadDim shr 1;
   for r := 0 to aRows - 1 do
     for i := 0 to half - 1 do
     begin
       // the angle in single, as the reference's float32 product
       angle := fInvFreq[i] * (aFirstPos + r);
-      aCtx.fCos[r * half + i] := Cos(angle);
-      aCtx.fSin[r * half + i] := Sin(angle);
+      aCos^[r * half + i] := Cos(angle);
+      aSin^[r * half + i] := Sin(angle);
     end;
+end;
+
+procedure TQwen3Model.Embed(aIds: PIntegerArray; aCount: PtrInt; aDest: PSingleArray);
+var
+  i, id: PtrInt;
+begin
+  for i := 0 to aCount - 1 do
+  begin
+    id := aIds^[i];
+    if (id < 0) or (id >= fConfig.VocabSize) then
+      EInferError.RaiseUtf8('%.Embed: token id % outside the vocabulary', [self, id]);
+    WidenRow(fEmbedSrc, id, fConfig.Hidden, @aDest^[i * fConfig.Hidden]);
+  end;
 end;
 
 procedure TQwen3Model.Attention(aCtx: TQwen3Context; aLayer, aRows: PtrInt);

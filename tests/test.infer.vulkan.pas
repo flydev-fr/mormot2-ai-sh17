@@ -22,7 +22,12 @@ uses
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
-  test.infer.fast;
+  mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.qwen3.vulkan,
+  test.infer.ref,
+  test.infer.fast,
+  test.infer.bpe,
+  mormot.ai.infer.sampler;
 
 type
   /// phase 4a: loader, device, buffers and a compute pipeline
@@ -47,6 +52,16 @@ type
     // (a tolerance: another summation order), with and without bias, more
     // than 65535 outputs, the weight cache, and the CPU for other types
     procedure LinearMatchesReference;
+    /// phases 4c/4d: the tiny Qwen3 forward on the device against the CPU
+    // reference - every row of a prompt longer than one chunk, decoding, a
+    // reused prefix; F32 from safetensors (relative error), Q8_0 from GGUF
+    // (cosine: the CPU quantizes the activations, the device does not)
+    procedure TinyQwen3MatchesCpu;
+    /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
+    // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
+    // compared at every step - skipped on a CPU implementation (lavapipe:
+    // minutes), and without the model files
+    procedure Qwen3GgufMatchesCpu;
   end;
 
 
@@ -291,6 +306,215 @@ begin
     fast.Free;
     ref.Free;
     gpu.Free;
+  end;
+end;
+
+procedure TTestInferVulkan.TinyQwen3MatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+var
+  dir: TFileName;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  model: TQwen3Model;
+  vk: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2: TQwen3VkContext;
+  ids: TIntegerDynArray;
+  l1, l2: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+  out1, out2: TIntegerDynArray;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  SetLength(ids, PROMPT);
+  seed := 7;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  for k := 0 to 1 do
+  begin
+    gpu := TInferVulkanBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      if k = 0 then
+        model := TQwen3Model.Create(dir, ref)
+      else
+        model := TQwen3Model.CreateFromGguf(IncludeTrailingPathDelimiter(FindInferRefDir('tiny-qwen3-gguf')) +
+          'q8_0.gguf', ref);
+      v := model.Config.VocabSize;
+      vk := TQwen3Vulkan.Create(model, gpu);
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      // the prompt: every row's logits
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      Check(c2.Length = PROMPT, 'context length');
+      if k = 0 then
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= 1e-4, 'F32 prompt logits: relative error %', [e]);
+      end
+      else
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.05, 0.02);
+        CheckUtf8(cmp.Cosine >= 0.999, 'Q8_0 prompt logits: %',
+          [InferCompareText(cmp)]);
+      end;
+      // decoding, one token at a time
+      for i := 0 to 4 do
+      begin
+        id := ids[i];
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+        if k = 0 then
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= 1e-4, 'F32 decode step %: relative error %', [i, e]);
+        end
+        else
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+          CheckUtf8(cmp.Cosine >= 0.999, 'Q8_0 decode step %: %',
+            [i, InferCompareText(cmp)]);
+        end;
+      end;
+      // a reused prefix: the cache cut back, then other tokens
+      Check(vk.Reuse(c2, pointer(ids), 100) = 99, 'reuse');
+      c1.Truncate(99);
+      model.Forward(c1, @ids[150], 20, pointer(l1));
+      vk.Forward(c2, @ids[150], 20, pointer(l2));
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      CheckUtf8(cmp.Cosine >= 0.999, 'after reuse: %', [InferCompareText(cmp)]);
+      // the backend forgot its weights: the next forward uploads them again
+      gpu.ClearWeights;
+      id := ids[200];
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      CheckUtf8(cmp.Cosine >= 0.999, 'after ClearWeights: %', [InferCompareText(cmp)]);
+      // greedy: every returned token is cached, as on the CPU
+      c1.Reset;
+      c2.Reset;
+      out1 := model.Greedy(c1, copy(ids, 0, 10), 6, []);
+      out2 := vk.Greedy(c2, copy(ids, 0, 10), 6, []);
+      Check((length(out2) = 6) and (c2.Length = 10 + 6), 'greedy cached its tokens');
+      Check((length(out1) = 6) and (c1.Length = c2.Length), 'greedy lengths');
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferVulkan.Qwen3GgufMatchesCpu;
+const
+  FILES: array[0..1] of TFileName = ('qwen3-0.6b-q4_k_m.gguf', 'qwen3-0.6b-q8_0.gguf');
+  // "Wie verlege ich ein Kupferrohr?" - any ids do; these are ordinary words
+  PROMPT: array[0..11] of integer = (
+    151644, 872, 198, 54, 645, 2739, 273, 10109, 12153, 3105, 63084, 30);
+  STEPS = 16;
+var
+  dir, gguf: TFileName;
+  f, i, v, agree: PtrInt;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  model: TQwen3Model;
+  vk: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2: TQwen3VkContext;
+  l1, l2: TSingleDynArray;
+  cmp: TInferCompare;
+  worst: double;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  if fVk.DeviceType = VK_PHYSICAL_DEVICE_TYPE_CPU then
+  begin
+    AddConsole('SKIP Qwen3-0.6B on the device: % is a CPU implementation',
+      [fVk.DeviceName]);
+    exit;
+  end;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3-0.6B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindQwen3Folder('model.safetensors');
+  for f := 0 to high(FILES) do
+  begin
+    gguf := '';
+    if dir <> '' then
+      gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+        FILES[f]);
+    if (gguf = '') or not FileExists(gguf) then
+    begin
+      CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+        'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [FILES[f]]);
+      AddConsole('SKIP Qwen3-0.6B on the device: no vendor/models/%', [FILES[f]]);
+      continue;
+    end;
+    gpu := TInferVulkanBackend.Create;
+    cpu := TInferCpuFastBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      model := TQwen3Model.CreateFromGguf(gguf, cpu);
+      v := model.Config.VocabSize;
+      vk := TQwen3Vulkan.Create(model, gpu);
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      SetLength(l1, v);
+      SetLength(l2, v);
+      model.Forward(c1, @PROMPT[0], length(PROMPT), pointer(l1));
+      vk.Forward(c2, @PROMPT[0], length(PROMPT), pointer(l2));
+      worst := 1;
+      agree := 0;
+      for i := 0 to STEPS - 1 do
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+        if cmp.Cosine < worst then
+          worst := cmp.Cosine;
+        id := InferArgMax(pointer(l1), v);
+        if InferArgMax(pointer(l2), v) = id then
+          inc(agree);
+        // the CPU's token to both: the comparison stays on one path
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+      end;
+      AddConsole('% on %: lowest logits cosine %, argmax agrees % of %',
+        [FILES[f], fVk.DeviceName, worst, agree, STEPS]);
+      CheckUtf8(worst >= 0.99, '% logits cosine %', [FILES[f], worst]);
+      CheckUtf8(agree >= STEPS - 2, '% argmax agrees % of %', [FILES[f], agree, STEPS]);
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      cpu.Free;
+      gpu.Free;
+    end;
   end;
 end;
 

@@ -936,6 +936,33 @@ auch > 65535 Ausgaben, Cache bitgleich; grün auf lavapipe und RTX 5090 (Delphi 
   (Delphi 7) wirft darauf `EInvalidOp` - Testgewichte immer mit endlichen Skalen erzeugen.
 - Noch kein Tempogewinn: jeder Aufruf wartet auf das Gerät. Das kommt mit 4c/4d.
 
+**4c/4d erledigt (2026-10-16):** `TQwen3Vulkan` (`src/infer/mormot.ai.infer.model.qwen3.vulkan.pas`)
+rechnet den ganzen Qwen3-Forward auf dem Gerät: RMSNorm, Projektionen, Q/K-Norm, RoPE,
+kausale Attention (GQA) über einen KV-Cache auf dem Gerät, SwiGLU, Residuals, Final-Norm und
+Kopf - als **ein** aufgezeichneter Batch je Chunk (bis 256 Tokens), also ein Warten je
+Token. Embeddings und RoPE-Faktoren gehen über einen gemappten Puffer hinauf, die Logits
+herunter. Shader `tools/vk/{rmsnorm,rope,swiglu,attention}.comp`, Batch-API in
+`mormot.ai.infer.vulkan` (Deskriptor-Sets aus einem je Batch zurückgesetzten Pool).
+Tests: Tiny-Qwen3 (F32 und Q8_0-GGUF) gegen die CPU-Referenz über 300 Tokens (zwei Chunks),
+Decode, Reuse, ClearWeights, Greedy; Qwen3-0.6B Q4_K_M/Q8_0 gegen das schnelle CPU-Backend
+mit erzwungener Tokenfolge: Logits-Kosinus ≥ 0,997 bzw. 0,999, Argmax 16 von 16 (RTX 5090).
+
+RTX 5090 (Treiber 616.64, Windows 11), `llm-bench … vulkan`, naive Shader:
+
+| | Prefill 200 | Decode 200 | Prefill 1000 | Decode 1000 | CPU i9 (Prefill/Decode 200) |
+|---|---|---|---|---|---|
+| Q4_K_M | 1001 Tok/s | 121 Tok/s | 954 Tok/s | 91 Tok/s | 455 / 78 Tok/s |
+| Q8_0 | 1612 Tok/s | 126 Tok/s | 1507 Tok/s | 94 Tok/s | 757 / 72 Tok/s |
+
+- Weit unter dem, was die Karte kann (0,6B in Q8_0 wären bandbreitenbegrenzt deutlich über
+  1000 Tok/s Decode): `linear.comp` liest Bytes einzeln und entpackt je Element, `attention.comp`
+  rechnet eine Arbeitsgruppe je Kopf und Zeile seriell über die Schlüssel. **Nächster Schritt
+  4e:** schnelle Shader (vektorisierte Loads, Blöcke statt Elemente, Subgroup-Reduktionen,
+  Matrix-Kacheln für Prefill, Attention mit geteilten Schlüssel-Blöcken), dann `TNativeLlmClient`
+  auf Wunsch über die GPU.
+- Grenzen werden vorab geprüft: Chunk-Zeilen begrenzt durch Scores-Puffer, Logits aller Zeilen
+  und die 65535 Arbeitsgruppen je Dimension; KV-Kapazität auf `maxStorageBufferRange` geklemmt.
+
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 

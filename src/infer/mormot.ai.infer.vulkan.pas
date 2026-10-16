@@ -494,6 +494,9 @@ type
     DestroyDescriptorPool: procedure(aDevice: TVkDispatch; aPool: TVkHandle;
       aAlloc: pointer);
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    ResetDescriptorPool: function(aDevice: TVkDispatch; aPool: TVkHandle;
+      aFlags: TVkFlags): TVkResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     AllocateDescriptorSets: function(aDevice: TVkDispatch; aInfo: pointer;
       aSets: PVkHandle): TVkResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
@@ -574,6 +577,11 @@ type
     fBroken: boolean;
     // the host-visible buffer of Upload / Download to device memory
     fStaging: TInferVkBuffer;
+    // the descriptor sets of a batch: one per dispatch, the pool reset at
+    // BatchBegin; fBatching while a batch is being recorded
+    fBatchPool: TVkHandle;
+    fBatchSets: integer;
+    fBatching: boolean;
     procedure Check(aResult: TVkResult; const aCall: RawUtf8);
     // a failed vkCreate*/vkAllocate*/vkMap* leaves its output undefined: reset
     // it, so that the destructor does not release what was never created
@@ -596,6 +604,13 @@ type
       aX, aY, aZ: cardinal);
     procedure DoCopy(aUp: boolean; aBuffer: TInferVkBuffer;
       aOffset: TVkDeviceSize; aHost: PByte; aBytes: TVkDeviceSize);
+    procedure Bind(aPipeline: TInferVkPipeline; aSet: TVkHandle;
+      const aBuffers: array of TInferVkBuffer);
+    procedure Barrier;
+    procedure DoBatchBegin;
+    procedure DoBatchDispatch(aPipeline: TInferVkPipeline;
+      const aBuffers: array of TInferVkBuffer; aPush: pointer;
+      aX, aY, aZ: cardinal);
   public
     /// load the loader, create an instance and a device; raises EInferVulkan
     // when any step fails (no loader, no device, no compute queue)
@@ -615,6 +630,23 @@ type
     /// copy aBytes of aBuffer at aOffset to aDest, waiting until done
     procedure Download(aBuffer: TInferVkBuffer; aOffset: TVkDeviceSize;
       aDest: pointer; aBytes: TVkDeviceSize);
+    /// start recording a batch: dispatches and copies, each after the previous
+    // one (a barrier between them), submitted at once by BatchSubmit - one
+    // wait for a whole forward pass instead of one per operation
+    // - no Run, Upload or Download until BatchSubmit; host writes to mapped
+    // buffers made before BatchSubmit are seen by the batch
+    procedure BatchBegin;
+    /// record aPipeline on aBuffers (see Run) into the batch
+    procedure BatchDispatch(aPipeline: TInferVkPipeline;
+      const aBuffers: array of TInferVkBuffer; aPush: pointer;
+      aX: cardinal; aY: cardinal = 1; aZ: cardinal = 1);
+    /// record a copy of aBytes from aSrc at aSrcOffset to aDst at aDstOffset
+    procedure BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
+      aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
+    /// submit the batch and wait: its writes are then visible to the host
+    procedure BatchSubmit;
+    /// leave a batch without submitting it (after an exception while recording)
+    procedure BatchAbort;
     property Api: TInferVkApi read fApi;
     property Device: TVkDispatch read fDevice;
     /// VkPhysicalDeviceProperties.deviceName, deviceType, vendorID
@@ -918,6 +950,7 @@ begin
   Load(fApi.DestroyPipeline, 'vkDestroyPipeline', true);
   Load(fApi.CreateDescriptorPool, 'vkCreateDescriptorPool', true);
   Load(fApi.DestroyDescriptorPool, 'vkDestroyDescriptorPool', true);
+  Load(fApi.ResetDescriptorPool, 'vkResetDescriptorPool', true);
   Load(fApi.AllocateDescriptorSets, 'vkAllocateDescriptorSets', true);
   Load(fApi.UpdateDescriptorSets, 'vkUpdateDescriptorSets', true);
   Load(fApi.CreateCommandPool, 'vkCreateCommandPool', true);
@@ -985,6 +1018,8 @@ begin
   begin
     if Assigned(fApi.DeviceWaitIdle) then
       fApi.DeviceWaitIdle(fDevice);
+    if (fBatchPool <> 0) and Assigned(fApi.DestroyDescriptorPool) then
+      fApi.DestroyDescriptorPool(fDevice, fBatchPool, nil);
     if (fFence <> 0) and Assigned(fApi.DestroyFence) then
       fApi.DestroyFence(fDevice, fFence, nil);
     if (fCmdPool <> 0) and Assigned(fApi.DestroyCommandPool) then
@@ -1027,13 +1062,30 @@ end;
 
 procedure TInferVulkan.DoRun(aPipeline: TInferVkPipeline;
   const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal);
+begin
+  if fBroken then
+    raise EInferVulkan.Create('Vulkan.Run: an earlier Run did not finish');
+  if fBatching then
+    raise EInferVulkan.Create('Vulkan.Run: a batch is being recorded');
+  Bind(aPipeline, aPipeline.fSet, aBuffers);
+  CmdBegin;
+  fApi.CmdBindPipeline(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE, aPipeline.fPipeline);
+  fApi.CmdBindDescriptorSets(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+    aPipeline.fLayout, 0, 1, @aPipeline.fSet, 0, nil);
+  if aPipeline.PushSize > 0 then
+    fApi.CmdPushConstants(fCmd, aPipeline.fLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+      aPipeline.PushSize, aPush);
+  fApi.CmdDispatch(fCmd, aX, aY, aZ);
+  CmdSubmit;
+end;
+
+procedure TInferVulkan.Bind(aPipeline: TInferVkPipeline; aSet: TVkHandle;
+  const aBuffers: array of TInferVkBuffer);
 var
   infos: array[0..VK_MAX_BINDINGS - 1] of TVkDescriptorBufferInfo;
   writes: array[0..VK_MAX_BINDINGS - 1] of TVkWriteDescriptorSet;
   i: PtrInt;
 begin
-  if fBroken then
-    raise EInferVulkan.Create('Vulkan.Run: an earlier Run did not finish');
   if length(aBuffers) <> aPipeline.Buffers then
     raise EInferVulkan.CreateUtf8('Vulkan.Run: % buffers for a pipeline of %',
       [length(aBuffers), aPipeline.Buffers]);
@@ -1049,22 +1101,13 @@ begin
     infos[i].offset := 0;
     infos[i].range := VK_WHOLE_SIZE;
     writes[i].sType := VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet := aPipeline.fSet;
+    writes[i].dstSet := aSet;
     writes[i].dstBinding := i;
     writes[i].descriptorCount := 1;
     writes[i].descriptorType := VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[i].pBufferInfo := @infos[i];
   end;
   fApi.UpdateDescriptorSets(fDevice, length(aBuffers), @writes, 0, nil);
-  CmdBegin;
-  fApi.CmdBindPipeline(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE, aPipeline.fPipeline);
-  fApi.CmdBindDescriptorSets(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-    aPipeline.fLayout, 0, 1, @aPipeline.fSet, 0, nil);
-  if aPipeline.PushSize > 0 then
-    fApi.CmdPushConstants(fCmd, aPipeline.fLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-      aPipeline.PushSize, aPush);
-  fApi.CmdDispatch(fCmd, aX, aY, aZ);
-  CmdSubmit;
 end;
 
 procedure TInferVulkan.CmdBegin;
@@ -1161,6 +1204,8 @@ var
 begin
   if fBroken then
     raise EInferVulkan.Create('Vulkan: an earlier Run did not finish');
+  if fBatching then
+    raise EInferVulkan.Create('Vulkan: a batch is being recorded');
   if (aOffset < 0) or (aBytes < 0) or (aOffset + aBytes > aBuffer.Size) then
     raise EInferVulkan.CreateUtf8('Vulkan: copy of % bytes at % into a buffer of %',
       [aBytes, aOffset, aBuffer.Size]);
@@ -1213,6 +1258,165 @@ begin
     inc(aHost, n);
     inc(aOffset, n);
     dec(aBytes, n);
+  end;
+end;
+
+const
+  /// descriptor sets of one batch: a forward pass of a 64-layer model needs
+  // about a thousand
+  VK_BATCH_SETS = 4096;
+
+procedure TInferVulkan.Barrier;
+var
+  barrier: TVkMemoryBarrier;
+begin
+  // every write so far before every later access: the operations of a batch
+  // form one chain
+  FillCharFast(barrier, SizeOf(barrier), 0);
+  barrier.sType := VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask := VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask := VK_ACCESS_MEMORY_READ_BIT or VK_ACCESS_MEMORY_WRITE_BIT;
+  fApi.CmdPipelineBarrier(fCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, @barrier, 0, nil, 0, nil);
+end;
+
+procedure TInferVulkan.BatchBegin;
+var
+  fpu: TDriverFpu;
+begin
+  fpu := DriverFpuEnter;
+  try
+    DoBatchBegin;
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.DoBatchBegin;
+var
+  size: TVkDescriptorPoolSize;
+  info: TVkDescriptorPoolCreateInfo;
+begin
+  if fBroken then
+    raise EInferVulkan.Create('Vulkan: an earlier Run did not finish');
+  if fBatching then
+    raise EInferVulkan.Create('Vulkan: a batch is being recorded');
+  if fBatchPool = 0 then
+  begin
+    size.descriptorType := VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    size.descriptorCount := VK_BATCH_SETS * VK_MAX_BINDINGS;
+    FillCharFast(info, SizeOf(info), 0);
+    info.sType := VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    info.maxSets := VK_BATCH_SETS;
+    info.poolSizeCount := 1;
+    info.pPoolSizes := @size;
+    CheckNew(fApi.CreateDescriptorPool(fDevice, @info, nil, fBatchPool), fBatchPool,
+      'vkCreateDescriptorPool');
+  end
+  else
+    // no batch is pending (each waited): its sets may go
+    Check(fApi.ResetDescriptorPool(fDevice, fBatchPool, 0), 'vkResetDescriptorPool');
+  fBatchSets := 0;
+  CmdBegin;
+  fBatching := true;
+end;
+
+procedure TInferVulkan.BatchDispatch(aPipeline: TInferVkPipeline;
+  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal);
+var
+  fpu: TDriverFpu;
+begin
+  fpu := DriverFpuEnter;
+  try
+    DoBatchDispatch(aPipeline, aBuffers, aPush, aX, aY, aZ);
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.DoBatchDispatch(aPipeline: TInferVkPipeline;
+  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal);
+var
+  ainfo: TVkDescriptorSetAllocateInfo;
+  dset: TVkHandle;
+begin
+  if not fBatching then
+    raise EInferVulkan.Create('Vulkan.BatchDispatch: no BatchBegin');
+  if fBatchSets >= VK_BATCH_SETS then
+    raise EInferVulkan.CreateUtf8('Vulkan.BatchDispatch: more than % dispatches',
+      [VK_BATCH_SETS]);
+  FillCharFast(ainfo, SizeOf(ainfo), 0);
+  ainfo.sType := VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  ainfo.descriptorPool := fBatchPool;
+  ainfo.descriptorSetCount := 1;
+  ainfo.pSetLayouts := @aPipeline.fSetLayout;
+  dset := 0;
+  Check(fApi.AllocateDescriptorSets(fDevice, @ainfo, @dset),
+    'vkAllocateDescriptorSets');
+  inc(fBatchSets);
+  Bind(aPipeline, dset, aBuffers);
+  fApi.CmdBindPipeline(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE, aPipeline.fPipeline);
+  fApi.CmdBindDescriptorSets(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+    aPipeline.fLayout, 0, 1, @dset, 0, nil);
+  if aPipeline.PushSize > 0 then
+    fApi.CmdPushConstants(fCmd, aPipeline.fLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+      aPipeline.PushSize, aPush);
+  fApi.CmdDispatch(fCmd, aX, aY, aZ);
+  Barrier;
+end;
+
+procedure TInferVulkan.BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
+  aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
+var
+  fpu: TDriverFpu;
+  region: TVkBufferCopy;
+begin
+  if not fBatching then
+    raise EInferVulkan.Create('Vulkan.BatchCopy: no BatchBegin');
+  if (aSrcOffset < 0) or (aDstOffset < 0) or (aBytes <= 0) or
+     (aSrcOffset + aBytes > aSrc.Size) or (aDstOffset + aBytes > aDst.Size) then
+    raise EInferVulkan.CreateUtf8('Vulkan.BatchCopy: % bytes from % of % to % of %',
+      [aBytes, aSrcOffset, aSrc.Size, aDstOffset, aDst.Size]);
+  fpu := DriverFpuEnter;
+  try
+    region.srcOffset := aSrcOffset;
+    region.dstOffset := aDstOffset;
+    region.size := aBytes;
+    fApi.CmdCopyBuffer(fCmd, aSrc.Handle, aDst.Handle, 1, @region);
+    Barrier;
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.BatchSubmit;
+var
+  fpu: TDriverFpu;
+begin
+  if not fBatching then
+    raise EInferVulkan.Create('Vulkan.BatchSubmit: no BatchBegin');
+  fBatching := false;
+  fpu := DriverFpuEnter;
+  try
+    CmdSubmit;
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.BatchAbort;
+var
+  fpu: TDriverFpu;
+begin
+  if not fBatching then
+    exit;
+  fBatching := false;
+  fpu := DriverFpuEnter;
+  try
+    // nothing was submitted: end the recording, the next CmdBegin resets it
+    fApi.EndCommandBuffer(fCmd);
+  finally
+    DriverFpuLeave(fpu);
   end;
 end;
 

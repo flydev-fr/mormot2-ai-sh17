@@ -1,0 +1,85 @@
+// LandrixAI - causal attention with grouped-query heads on the device (phase 4c
+// of docs/native-inference.md; CausalRows of the CPU backend in float)
+// - y[r, h] = softmax(q[r, h] . keys[0 .. past + r] / sqrt(d)) . values, the
+//   keys and values of the KV head h / (heads / kvHeads), rows at kvWidth
+// - one work group of 128 per (head, row): the scores go to a scratch buffer
+//   (at most past + rows per head and row), then max, exp and sum, then each
+//   invocation sums one output dimension (headDim <= 128 * k)
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float keys[]; };
+layout(std430, binding = 2) readonly buffer BufV { float vals[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+layout(std430, binding = 4) coherent buffer BufS { float sc[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, heads, headDim, kvHeads, past;
+} p;
+
+shared float partial[128];
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint h = gl_WorkGroupID.x;
+  uint r = gl_WorkGroupID.y;
+  uint d = p.headDim;
+  uint kvw = p.kvHeads * d;
+  uint qw = p.heads * d;
+  uint g = h / (p.heads / p.kvHeads);
+  uint total = p.past + r + 1u;
+  uint sbase = (h * p.rows + r) * (p.past + p.rows);
+  uint qbase = r * qw + h * d;
+  float scale = 1.0 / sqrt(float(d));
+  // scores and their maximum
+  float m = -3.402823e38;
+  for (uint j = t; j < total; j += 128u)
+  {
+    uint kb = j * kvw + g * d;
+    float s = 0.0;
+    for (uint k = 0u; k < d; k++)
+      s += q[qbase + k] * keys[kb + k];
+    s *= scale;
+    sc[sbase + j] = s;
+    m = max(m, s);
+  }
+  partial[t] = m;
+  barrier();
+  for (uint w = 64u; w > 0u; w >>= 1)
+  {
+    if (t < w)
+      partial[t] = max(partial[t], partial[t + w]);
+    barrier();
+  }
+  m = partial[0];
+  barrier();
+  // exponentials and their sum
+  float sum = 0.0;
+  for (uint j = t; j < total; j += 128u)
+  {
+    float e = exp(sc[sbase + j] - m);
+    sc[sbase + j] = e;
+    sum += e;
+  }
+  partial[t] = sum;
+  memoryBarrierBuffer();
+  barrier();
+  for (uint w = 64u; w > 0u; w >>= 1)
+  {
+    if (t < w)
+      partial[t] += partial[t + w];
+    barrier();
+  }
+  float inv = 1.0 / partial[0];
+  // the weighted values, one output dimension per invocation
+  for (uint k = t; k < d; k += 128u)
+  {
+    float acc = 0.0;
+    for (uint j = 0u; j < total; j++)
+      acc += sc[sbase + j] * vals[j * kvw + g * d + k];
+    y[qbase + k] = acc * inv;
+  }
+}

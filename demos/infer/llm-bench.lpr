@@ -6,9 +6,11 @@
 //   the peak memory
 //
 //   usage: llm-bench [model folder | file.gguf] [prompt tokens=200] [new tokens=32]
-//                    [threads=0 (default) | ref | exact] [q8 (default) | q4 | f32]
+//                    [threads=0 (default) | ref | exact | vulkan]
+//                    [q8 (default) | q4 | f32]
 //   - ref: the scalar reference backend; exact: TInferCpuFastBackend with
-//     Exact = true; otherwise TInferCpuFastBackend in its float mode
+//     Exact = true; vulkan: the whole forward pass on the Vulkan device
+//     (TQwen3Vulkan, phase 4d); otherwise TInferCpuFastBackend in its float mode
 //   e.g.   llm-bench vendor/models/qwen3-0.6b 200 32
 program llm.bench;
 
@@ -35,6 +37,9 @@ uses
   mormot.ai.infer.kernels,
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.vulkan,
+  mormot.ai.infer.backend.vulkan,
+  mormot.ai.infer.model.qwen3.vulkan,
   mormot.ai.infer.sampler;
 
 type
@@ -274,6 +279,9 @@ var
   ctx: TQwen3Context;
   text: RawUtf8;
   ids, all: TIntegerDynArray;
+  gpu: TInferVulkanBackend;
+  vk: TQwen3Vulkan;
+  vctx: TQwen3VkContext;
   logits: TSingleDynArray;
   id: integer;
   t0, t1, prefillUs, decodeUs: Int64;
@@ -351,6 +359,48 @@ begin
     until length(all) >= promptLen;
     ids := copy(all, 0, promptLen);
     SetLength(logits, model.Config.VocabSize);
+    if mode = 'vulkan' then
+    begin
+      gpu := TInferVulkanBackend.Create;
+      vk := nil;
+      vctx := nil;
+      try
+        QueryPerformanceMicroSeconds(t0);
+        vk := TQwen3Vulkan.Create(model, gpu);
+        QueryPerformanceMicroSeconds(t1);
+        ConsoleWrite('vulkan: % (type %), weights uploaded in % ms, peak % MB',
+          [gpu.Vulkan.DeviceName, gpu.Vulkan.DeviceType, (t1 - t0) div 1000,
+           PeakRssMB]);
+        vctx := vk.NewContext;
+        // warm-up: pipelines, buffers sized for the prompt
+        vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
+        vctx.Reset;
+        QueryPerformanceMicroSeconds(t0);
+        vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
+        QueryPerformanceMicroSeconds(t1);
+        prefillUs := t1 - t0;
+        ConsoleWrite('prefill: % tokens in % ms = % tokens/s',
+          [promptLen, prefillUs div 1000, promptLen * 1000000 / prefillUs]);
+        n := 0;
+        QueryPerformanceMicroSeconds(t0);
+        for i := 1 to newTokens do
+        begin
+          id := InferArgMax(pointer(logits), model.Config.VocabSize);
+          vk.Forward(vctx, @id, 1, pointer(logits));
+          inc(n);
+        end;
+        QueryPerformanceMicroSeconds(t1);
+        decodeUs := t1 - t0;
+        ConsoleWrite('decode: % tokens in % ms = % tokens/s (% ms/token)',
+          [n, decodeUs div 1000, n * 1000000 / decodeUs, decodeUs / 1000 / n]);
+        ConsoleWrite('context: % tokens, peak % MB', [vctx.Length, PeakRssMB]);
+      finally
+        vctx.Free;
+        vk.Free;
+        gpu.Free;
+      end;
+      exit;
+    end;
     ctx := model.NewContext;
     try
       timed.Reset;

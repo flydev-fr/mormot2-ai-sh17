@@ -56,6 +56,7 @@ type
     fWeightCount: PtrInt;
     fX, fY, fNoBias: TInferVkBuffer;
     fGpuLinears: Int64;
+    fWeightEpoch: integer;
     function Weight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
@@ -70,10 +71,26 @@ type
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
     procedure ClearWeights;
+    /// take the device for a sequence of batch operations (a forward pass on
+    // the GPU): Linear computes on the CPU meanwhile
+    procedure GpuLock;
+    procedure GpuUnLock;
+    /// the device copy of a weight (uploaded on first use) - GpuLock held
+    function DeviceWeight(aData: pointer; aType: TInferDType;
+      aBytes: Int64): TInferVkBuffer;
+    /// true when RecordLinear takes weights of aType with aIn inputs
+    function GpuLinear(aType: TInferDType; aIn: PtrInt): boolean;
+    /// record y = x * w^T (no bias) into the running batch of Vulkan, the
+    // weights from the cache - GpuLock held, BatchBegin called; x and y are
+    // [aRows, aIn] and [aRows, aOut] at offset 0
+    procedure RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
+      const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer);
     /// the device context
     property Vulkan: TInferVulkan read fVk;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
+    /// incremented by ClearWeights: a holder of uploaded weights uploads again
+    property WeightEpoch: integer read fWeightEpoch;
   end;
 
 
@@ -126,9 +143,54 @@ begin
     for i := 0 to fWeightCount - 1 do
       FreeAndNil(fWeightBuffer[i]);
     fWeightCount := 0;
+    inc(fWeightEpoch);
   finally
     fGpu.UnLock;
   end;
+end;
+
+procedure TInferVulkanBackend.GpuLock;
+begin
+  fGpu.Lock;
+end;
+
+procedure TInferVulkanBackend.GpuUnLock;
+begin
+  fGpu.UnLock;
+end;
+
+function TInferVulkanBackend.DeviceWeight(aData: pointer; aType: TInferDType;
+  aBytes: Int64): TInferVkBuffer;
+begin
+  result := Weight(aData, aType, aBytes);
+end;
+
+function TInferVulkanBackend.GpuLinear(aType: TInferDType; aIn: PtrInt): boolean;
+begin
+  result := (LINEAR_DTYPE[aType] <> 0) and (aIn > 0) and
+    (aIn mod INFER_DTYPE_BLOCK[aType] = 0);
+end;
+
+procedure TInferVulkanBackend.RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
+  const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer);
+var
+  push: TLinearPush;
+  groups: cardinal;
+begin
+  if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or (aOut < 1) then
+    raise EInferVulkan.CreateUtf8('%.RecordLinear: % rows of % % into %',
+      [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
+  push.Rows := aRows;
+  push.InCount := aIn;
+  push.OutCount := aOut;
+  push.DType := LINEAR_DTYPE[w.DType];
+  push.HasBias := 0;
+  groups := aOut;
+  if groups > 65535 then
+    groups := 65535;
+  fVk.BatchDispatch(fLinear, [DeviceWeight(w.Data, w.DType, Int64(aOut) *
+    (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]), x, fNoBias, y],
+    @push, groups, aRows);
 end;
 
 function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;
