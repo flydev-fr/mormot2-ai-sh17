@@ -147,11 +147,20 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
 - **Profil:** `Profile` misst unter MoltenVK nichts, weil alle Zeitstempel eines Batches
   gleich sind.
 
+**Erledigt (2026-10-16):**
+- Eine Wanduhr-Sonde misst je Kernel.
+- MoltenVK läuft ohne Metal-Argumentpuffer. Barrieren kosten dann 5 statt 25 µs, der Decode
+  gewinnt 5,6 %.
+- Die Sonde zeigt die Kernel als Engpass, nicht MoltenVK:
+  - Decode-Linears erreichen 40 bis 57 GB/s von rund 200 GB/s.
+  - Der Prefill-Linear erreicht rund 400 GFLOPS von 6,8 TFLOPS.
+
 **Vorgehen:**
-1. Per Dispatch messen: Batches mit nur einer Operation, also Wanduhr um `BatchSubmit`.
-2. Prüfen, ob Barrieren oder Dispatch-Overhead in MoltenVK die Zeit kosten (etwa 340
-   Dispatches je Token) oder die Kernel selbst. Die Kernel sind auf die RTX abgestimmt:
-   Kachelgrößen, Shared Memory, Subgroup-Nutzung.
+1. **Decode-Matvec:** Q8_0-Kernel mit mehr Arbeit pro Lane. Die Skalen werden einmal je
+   Block geladen, die Aktivierungen in Registern über mehrere Ausgaben wiederverwendet.
+   Gegen RTX-Regression messen.
+2. **Prefill-GEMM:** gekachelter Kernel mit Kacheln von `x` und den dequantisierten
+   Gewichten im Shared Memory, etwa 64 × 64 Ausgaben pro Workgroup.
 3. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;

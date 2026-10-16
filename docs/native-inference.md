@@ -909,6 +909,19 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
       Vulkan-Suite ist mit `LAI_REQUIRE_VULKAN=1` grün (181 Assertions, auch Qwen3-0.6B
       und `TNativeLlmClient` auf dem Gerät). Die Subgroups haben 32 Lanes, der
       Subgroup-Pfad von `linear8` läuft also.
+  - *Metal-Argumentpuffer aus (2026-10-16):* MoltenVK nutzt standardmäßig Metal-Argumentpuffer
+    für Deskriptorsätze.
+    - Dann beendet jede Pipeline-Barriere den Metal-Compute-Encoder.
+    - Eine kleine Sonde misst je Dispatch mit Barriere rund 25 µs, ohne Argumentpuffer
+      rund 5 µs.
+    - `TInferVulkan` schaltet die Argumentpuffer deshalb über `VK_EXT_layer_settings` ab:
+      Einstellung `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS` = 0 für den Layer `MoltenVK`.
+      Das geschieht nur zusammen mit der Portability-Instanz und nur, wenn die
+      gleichnamige Umgebungsvariable nicht gesetzt ist.
+    - Unsere Shader binden höchstens acht Puffer und brauchen die Argumentpuffer nicht.
+    - Im A/B-Test (je drei Läufe, 200 Tokens) stieg der Decode von 62,3 auf 65,8 Tokens/s
+      (+5,6 %); der Prefill sank von 306 auf 303 Tokens/s (−1,0 %).
+    - Die Tabelle unten ist vor dieser Änderung gemessen.
   - *Zeitstempel:* MoltenVK setzt auf Apple-GPUs nur zwischen Metal-Encodern einen
     Zeitstempel. Alle Stempel eines Batches tragen deshalb denselben Wert.
     - `TInferVulkan` erkennt das nur auf einem Portability-Gerät: Zwei aufeinanderfolgende
@@ -929,7 +942,13 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
     - Bei kurzem Kontext ist die GPU langsamer als die CPU.
     - Ab etwa 1000 Tokens dekodiert sie schneller, bei 4000 Tokens auch der Prefill.
     - Der Prefill liegt weit unter dem, was die GPU rechnen könnte. Die Kernel sind auf
-      die RTX abgestimmt; die Ursache auf Apple ist noch nicht untersucht (Backlog B8).
+      die RTX abgestimmt (Backlog B8).
+  - *Kernel-Sonde (Wanduhr, ein Kernel 50-mal je Batch, Q8_0):*
+    - Decode-Linears (eine Zeile) erreichen 40 bis 57 GB/s Gewichtsbandbreite, der LM-Head
+      76 GB/s. Der M2 Pro hat rund 200 GB/s.
+    - Der Prefill-Linear (200 Zeilen) erreicht rund 400 GFLOPS. Der M2 Pro schafft in FP32
+      rund 6,8 TFLOPS.
+    - Der Subgroup-Build von `linear8` ist auf Apple im Prefill langsamer (rund 260 GFLOPS).
   - *Zweiter Schritt, nur wenn MoltenVK spürbar bremst:* ein eigenes Metal-Backend. Das wäre
     ein Objective-C-Laufzeit-Aufruf über `objc_msgSend` (kein Xcode-Projekt, keine
     mitgelieferte Bibliothek), mit Shadern in MSL statt GLSL.

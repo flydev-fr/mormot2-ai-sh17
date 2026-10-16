@@ -103,6 +103,23 @@ type
   end;
   TVkExtensionPropertiesDynArray = array of TVkExtensionProperties;
 
+  /// VkLayerSettingEXT (VK_EXT_layer_settings): one setting of a layer or driver
+  TVkLayerSettingEXT = record
+    pLayerName: PAnsiChar;
+    pSettingName: PAnsiChar;
+    settingType: integer;
+    valueCount: cardinal;
+    pValues: pointer;
+  end;
+
+  /// VkLayerSettingsCreateInfoEXT, chained to VkInstanceCreateInfo
+  TVkLayerSettingsCreateInfoEXT = record
+    sType: integer;
+    pNext: pointer;
+    settingCount: cardinal;
+    pSettings: ^TVkLayerSettingEXT;
+  end;
+
   TVkInstanceCreateInfo = record
     sType: integer;
     pNext: pointer;
@@ -364,6 +381,17 @@ const
   VK_KHR_PORTABILITY_SUBSET = 'VK_KHR_portability_subset';
   /// VK_KHR_portability_subset needs it with a Vulkan 1.0 instance (core in 1.1)
   VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2 = 'VK_KHR_get_physical_device_properties2';
+  /// the instance extension which passes settings to a layer or driver
+  VK_EXT_LAYER_SETTINGS = 'VK_EXT_layer_settings';
+  VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT = 1000496000;
+  VK_LAYER_SETTING_TYPE_BOOL32_EXT = 0;
+  /// MoltenVK as a driver layer (kMVKMoltenVKDriverLayerName of mvk_vulkan.h)
+  MVK_LAYER_NAME = 'MoltenVK';
+  /// the MoltenVK setting for Metal argument buffers (a VkBool32): on, every
+  // pipeline barrier ends the Metal compute encoder - about 25 us on the M2
+  // Pro, against 5 us without (one barrier between the dependent dispatches
+  // of a forward pass, some 340 per decoded token of Qwen3-0.6B)
+  MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS = 'MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS';
 
   VK_STRUCTURE_TYPE_APPLICATION_INFO = 0;
   VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1;
@@ -1010,7 +1038,10 @@ var
   cinfo: TVkCommandBufferAllocateInfo;
   finfo: TVkFenceCreateInfo;
   exts: TVkExtensionPropertiesDynArray;
-  names: array[0..1] of PAnsiChar;
+  names: array[0..2] of PAnsiChar;
+  setting: TVkLayerSettingEXT;
+  settings: TVkLayerSettingsCreateInfoEXT;
+  off: cardinal;
   res: TVkResult;
 begin
   fLib := LibraryOpen(VULKAN_LIBRARY);
@@ -1065,8 +1096,29 @@ begin
     if (fApiVersion < VK_API_VERSION_1_1) and
        VkHasExtension(exts, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2) then
     begin
-      names[1] := VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2;
-      info.enabledExtensionCount := 2;
+      names[info.enabledExtensionCount] := VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2;
+      inc(info.enabledExtensionCount);
+    end;
+    // MoltenVK without Metal argument buffers: cheap barriers (the compute
+    // shaders bind at most eight buffers) - unless the environment sets it,
+    // which a layer setting would override
+    if VkHasExtension(exts, VK_EXT_LAYER_SETTINGS) and
+       (GetEnvironmentVariable(MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS) = '') then
+    begin
+      names[info.enabledExtensionCount] := VK_EXT_LAYER_SETTINGS;
+      inc(info.enabledExtensionCount);
+      off := 0;
+      FillCharFast(setting, SizeOf(setting), 0);
+      setting.pLayerName := MVK_LAYER_NAME;
+      setting.pSettingName := MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS;
+      setting.settingType := VK_LAYER_SETTING_TYPE_BOOL32_EXT;
+      setting.valueCount := 1;
+      setting.pValues := @off;
+      FillCharFast(settings, SizeOf(settings), 0);
+      settings.sType := VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
+      settings.settingCount := 1;
+      settings.pSettings := @setting;
+      info.pNext := @settings;
     end;
     info.ppEnabledExtensionNames := @names;
     info.flags := VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
