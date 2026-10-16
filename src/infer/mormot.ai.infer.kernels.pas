@@ -58,6 +58,13 @@ type
   // activation row xA / xB, in float lanes: no bias, not the double reference
   TInferQ8DotF32x4x2 = procedure(w, xA, xB: PInferBlockQ8_0; aBlocks: PtrInt;
     aDxA, aDxB: PSingleArray; aStride: PtrInt; aOut: PSingleArray);
+  /// the integer part of a K-quant dot product, aBlocks super-blocks of w
+  // (Q4_K or Q6_K) against Q8_K activations x: per block two int32 in aOut -
+  // Q4_K: isum = sum over the sub-blocks of scale * (nibbles . x), msum = sum
+  // of min * (the two activation block sums of the sub-block); Q6_K: isum =
+  // sum over the groups of scale * ((q - 32) . x), then 0
+  // - exact, so every kernel gives the same ints; the caller only scales
+  TInferKSums = procedure(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray);
   /// the same for the four weight rows w, w + aStride, w + 2 aStride and
   // w + 3 aStride (aStride in bytes) against one row x:
   // aSums[b * 4 + k] = block b of row k
@@ -88,6 +95,10 @@ var
   /// float weighted value sum of the fast backend, nil without a kernel:
   // y += sum over j of p[j] * (v + j * aStride bytes), aDim a multiple of 16
   InferAxpyRowsF32: TInferDotsF32;
+  /// the Q4_K sub-block sums of this CPU (see TInferKSums)
+  InferQ4KSums: TInferKSums;
+  /// the Q6_K group sums of this CPU (see TInferKSums)
+  InferQ6KSums: TInferKSums;
   /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod', 'avx2'
   InferQ8KernelName: RawUtf8;
   /// every IEEE half (raw bits) as single - 256 KB, filled at initialization
@@ -100,6 +111,12 @@ procedure InferQ8BlockDotsPascal(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
 /// the plain Pascal 4-row kernel
 procedure InferQ8BlockDots4Pascal(w, x: PInferBlockQ8_0; aBlocks: PtrInt;
   aSums: PIntegerArray; aStride: PtrInt);
+
+/// the plain Pascal Q4_K sums - the yardstick of the SIMD ones
+procedure InferQ4KSumsPascal(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
+
+/// the plain Pascal Q6_K sums
+procedure InferQ6KSumsPascal(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
 
 
 implementation
@@ -148,6 +165,83 @@ begin
         inc(sum, integer(wk^.qs[j]) * xb^.qs[j]);
       aSums^[b * 4 + k] := sum;
     end;
+    inc(xb);
+  end;
+end;
+
+procedure InferQ4KSumsPascal(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
+var
+  b, j, l, k: PtrInt;
+  s, sc, m, isum, msum: integer;
+  wb: PInferBlockQ4_K;
+  xb: PInferBlockQ8_K;
+begin
+  wb := w;
+  xb := x;
+  for b := 0 to aBlocks - 1 do
+  begin
+    isum := 0; // at most 8 * 63 * 32 * 15 * 128: fits an integer
+    msum := 0;
+    for j := 0 to 7 do
+    begin
+      // sub-block 2k: the low nibbles of qs[32k..], 2k + 1: their high ones
+      k := 32 * (j shr 1);
+      s := 0;
+      if odd(j) then
+        for l := 0 to 31 do
+          inc(s, integer(wb^.qs[k + l] shr 4) * xb^.qs[32 * j + l])
+      else
+        for l := 0 to 31 do
+          inc(s, integer(wb^.qs[k + l] and 15) * xb^.qs[32 * j + l]);
+      InferScaleMinK4(j, @wb^.scales, sc, m);
+      inc(isum, sc * s);
+      inc(msum, m * (xb^.bsums[2 * j] + xb^.bsums[2 * j + 1]));
+    end;
+    aSums^[b * 2] := isum;
+    aSums^[b * 2 + 1] := msum;
+    inc(wb);
+    inc(xb);
+  end;
+end;
+
+procedure InferQ6KSumsPascal(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
+var
+  b, g, l, i, n, q: PtrInt;
+  s, isum: integer;
+  wb: PInferBlockQ6_K;
+  xb: PInferBlockQ8_K;
+begin
+  wb := w;
+  xb := x;
+  for b := 0 to aBlocks - 1 do
+  begin
+    isum := 0; // at most 16 * 128 * 16 * 32 * 128: fits an integer
+    for g := 0 to 15 do
+    begin
+      s := 0;
+      for l := 0 to 15 do
+      begin
+        // the 4 low bits from ql, the 2 high ones from qh (see TInferBlockQ6_K)
+        i := 16 * g + l;
+        n := i shr 7;
+        q := wb^.qh[32 * n + (i and 31)] shr (2 * ((i and 127) shr 5)) and 3;
+        case (i and 127) shr 5 of
+          0:
+            q := (wb^.ql[64 * n + (i and 31)] and 15) or (q shl 4);
+          1:
+            q := (wb^.ql[64 * n + (i and 31) + 32] and 15) or (q shl 4);
+          2:
+            q := (wb^.ql[64 * n + (i and 31)] shr 4) or (q shl 4);
+        else
+          q := (wb^.ql[64 * n + (i and 31) + 32] shr 4) or (q shl 4);
+        end;
+        inc(s, integer(q - 32) * xb^.qs[i]);
+      end;
+      inc(isum, wb^.scales[g] * s);
+    end;
+    aSums^[b * 2] := isum;
+    aSums^[b * 2 + 1] := 0;
+    inc(wb);
     inc(xb);
   end;
 end;
@@ -696,6 +790,223 @@ asm
   sub x0, x11, x1
   add x0, x0, #1
 .Lretq:
+end;
+
+/// Q4_K x Q8_K, fused: per block the sub-block sums (SDOT; nibbles 0..15,
+// activations -127..127), the 6-bit scales and mins unpacked with ggml's
+// masks, isum = sum scale * sum, msum = sum min * (two activation block sums)
+// - exact int32, as InferQ4KSumsPascal; v0..v7, v16..v31 (v8..v15 are
+// callee-saved), x0..x15
+procedure Q4KSumsNeonDot(w, x: pointer; aBlocks: PtrInt;
+  aOut: PIntegerArray); assembler; nostackframe;
+asm
+  // x0 = w (144-byte blocks), x1 = x (292-byte Q8_K blocks), x2 = aBlocks,
+  // x3 = aOut (isum, msum per block)
+  cbz x2, .Lq4k2_1
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+.Lq4k2_0:
+  .long 0xb9400409 // ldr w9, [x0, #4]
+  .long 0xb940080a // ldr w10, [x0, #8]
+  .long 0xb9400c0b // ldr w11, [x0, #12]
+  .long 0x1200d52c // and w12, w9, #0x3f3f3f3f
+  .long 0x53047d6d // lsr w13, w11, #4
+  .long 0x1200cdad // and w13, w13, #0xf0f0f0f
+  .long 0x53067d4e // lsr w14, w10, #6
+  .long 0x1200c5ce // and w14, w14, #0x3030303
+  .long 0x2a0e11ad // orr w13, w13, w14, lsl #4
+  .long 0x1200d54f // and w15, w10, #0x3f3f3f3f
+  .long 0x1200cd6e // and w14, w11, #0xf0f0f0f
+  .long 0x53067d2b // lsr w11, w9, #6
+  .long 0x1200c56b // and w11, w11, #0x3030303
+  .long 0x2a0b11ce // orr w14, w14, w11, lsl #4
+  .long 0x1e270194 // fmov s20, w12
+  .long 0x4e0c1dd4 // mov v20.s[1], w14
+  .long 0x1e2701f5 // fmov s21, w15
+  .long 0x4e0c1db5 // mov v21.s[1], w13
+  add x4, x0, #16
+  add x5, x1, #4
+  .long 0x4cdfa080 // ld1 {v0.16b-v1.16b}, [x4], #32
+  .long 0x4cdf20a2 // ld1 {v2.16b-v5.16b}, [x5], #64
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3f1c27 // and v7.16b, v1.16b, v31.16b
+  .long 0x6f0c0410 // ushr v16.16b, v0.16b, #4
+  .long 0x6f0c0431 // ushr v17.16b, v1.16b, #4
+  .long 0x4f000416 // movi v22.4s, #0x0
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e8294d6 // sdot v22.4s, v6.16b, v2.16b
+  .long 0x4e8394f6 // sdot v22.4s, v7.16b, v3.16b
+  .long 0x4e849617 // sdot v23.4s, v16.16b, v4.16b
+  .long 0x4e859637 // sdot v23.4s, v17.16b, v5.16b
+  .long 0x4cdfa080 // ld1 {v0.16b-v1.16b}, [x4], #32
+  .long 0x4cdf20a2 // ld1 {v2.16b-v5.16b}, [x5], #64
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3f1c27 // and v7.16b, v1.16b, v31.16b
+  .long 0x6f0c0410 // ushr v16.16b, v0.16b, #4
+  .long 0x6f0c0431 // ushr v17.16b, v1.16b, #4
+  .long 0x4f000418 // movi v24.4s, #0x0
+  .long 0x4f000419 // movi v25.4s, #0x0
+  .long 0x4e8294d8 // sdot v24.4s, v6.16b, v2.16b
+  .long 0x4e8394f8 // sdot v24.4s, v7.16b, v3.16b
+  .long 0x4e849619 // sdot v25.4s, v16.16b, v4.16b
+  .long 0x4e859639 // sdot v25.4s, v17.16b, v5.16b
+  .long 0x4cdfa080 // ld1 {v0.16b-v1.16b}, [x4], #32
+  .long 0x4cdf20a2 // ld1 {v2.16b-v5.16b}, [x5], #64
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3f1c27 // and v7.16b, v1.16b, v31.16b
+  .long 0x6f0c0410 // ushr v16.16b, v0.16b, #4
+  .long 0x6f0c0431 // ushr v17.16b, v1.16b, #4
+  .long 0x4f00041a // movi v26.4s, #0x0
+  .long 0x4f00041b // movi v27.4s, #0x0
+  .long 0x4e8294da // sdot v26.4s, v6.16b, v2.16b
+  .long 0x4e8394fa // sdot v26.4s, v7.16b, v3.16b
+  .long 0x4e84961b // sdot v27.4s, v16.16b, v4.16b
+  .long 0x4e85963b // sdot v27.4s, v17.16b, v5.16b
+  .long 0x4cdfa080 // ld1 {v0.16b-v1.16b}, [x4], #32
+  .long 0x4cdf20a2 // ld1 {v2.16b-v5.16b}, [x5], #64
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3f1c27 // and v7.16b, v1.16b, v31.16b
+  .long 0x6f0c0410 // ushr v16.16b, v0.16b, #4
+  .long 0x6f0c0431 // ushr v17.16b, v1.16b, #4
+  .long 0x4f00041c // movi v28.4s, #0x0
+  .long 0x4f00041d // movi v29.4s, #0x0
+  .long 0x4e8294dc // sdot v28.4s, v6.16b, v2.16b
+  .long 0x4e8394fc // sdot v28.4s, v7.16b, v3.16b
+  .long 0x4e84961d // sdot v29.4s, v16.16b, v4.16b
+  .long 0x4e85963d // sdot v29.4s, v17.16b, v5.16b
+  .long 0x4eb7bede // addp v30.4s, v22.4s, v23.4s
+  .long 0x4eb9bf12 // addp v18.4s, v24.4s, v25.4s
+  .long 0x4eb2bfd6 // addp v22.4s, v30.4s, v18.4s
+  .long 0x4ebbbf5e // addp v30.4s, v26.4s, v27.4s
+  .long 0x4ebdbf92 // addp v18.4s, v28.4s, v29.4s
+  .long 0x4eb2bfd7 // addp v23.4s, v30.4s, v18.4s
+  .long 0x2f08a694 // uxtl v20.8h, v20.8b
+  .long 0x2f10a698 // uxtl v24.4s, v20.4h
+  .long 0x6f10a699 // uxtl2 v25.4s, v20.8h
+  .long 0x4eb89ed6 // mul v22.4s, v22.4s, v24.4s
+  .long 0x4eb996f6 // mla v22.4s, v23.4s, v25.4s
+  .long 0x4eb1bad6 // addv s22, v22.4s
+  .long 0x4c40a4ba // ld1 {v26.8h-v27.8h}, [x5]
+  .long 0x4e7bbf5a // addp v26.8h, v26.8h, v27.8h
+  .long 0x2f08a6b5 // uxtl v21.8h, v21.8b
+  .long 0x0e75c35c // smull v28.4s, v26.4h, v21.4h
+  .long 0x4e75835c // smlal2 v28.4s, v26.8h, v21.8h
+  .long 0x4eb1bb9c // addv s28, v28.4s
+  .long 0xbc004476 // str s22, [x3], #4
+  .long 0xbc00447c // str s28, [x3], #4
+  add x0, x0, #144
+  add x1, x1, #292
+  subs x2, x2, #1
+  b.ne .Lq4k2_0
+.Lq4k2_1:
+end;
+
+/// Q6_K x Q8_K, fused: per half block the 6-bit values rebuilt from ql and qh,
+// the group sums (SDOT), minus 32 times the activation block sums, times the
+// int8 group scales: isum per block (then 0), exact int32
+procedure Q6KSumsNeonDot(w, x: pointer; aBlocks: PtrInt;
+  aOut: PIntegerArray); assembler; nostackframe;
+asm
+  // x0 = w (210-byte blocks), x1 = x, x2 = aBlocks, x3 = aOut
+  cbz x2, .Lq6k2_2
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+  .long 0x4f00e47e // movi v30.16b, #0x3
+.Lq6k2_0:
+  mov x4, x0
+  add x5, x0, #128
+  add x6, x1, #4
+  add x10, x1, #260
+  add x11, x0, #192
+  .long 0x52800009 // mov w9, #0x0
+  mov x7, #2
+.Lq6k2_1:
+  .long 0x4cdf2080 // ld1 {v0.16b-v3.16b}, [x4], #64
+  .long 0x4cdfa0a4 // ld1 {v4.16b-v5.16b}, [x5], #32
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3e1c87 // and v7.16b, v4.16b, v30.16b
+  .long 0x4f0c54e7 // shl v7.16b, v7.16b, #4
+  .long 0x4ea71cc6 // orr v6.16b, v6.16b, v7.16b
+  .long 0x4e3f1c30 // and v16.16b, v1.16b, v31.16b
+  .long 0x4e3e1cb1 // and v17.16b, v5.16b, v30.16b
+  .long 0x4f0c5631 // shl v17.16b, v17.16b, #4
+  .long 0x4eb11e10 // orr v16.16b, v16.16b, v17.16b
+  .long 0x4e3f1c52 // and v18.16b, v2.16b, v31.16b
+  .long 0x6f0e0493 // ushr v19.16b, v4.16b, #2
+  .long 0x4e3e1e73 // and v19.16b, v19.16b, v30.16b
+  .long 0x4f0c5673 // shl v19.16b, v19.16b, #4
+  .long 0x4eb31e52 // orr v18.16b, v18.16b, v19.16b
+  .long 0x4e3f1c74 // and v20.16b, v3.16b, v31.16b
+  .long 0x6f0e04b5 // ushr v21.16b, v5.16b, #2
+  .long 0x4e3e1eb5 // and v21.16b, v21.16b, v30.16b
+  .long 0x4f0c56b5 // shl v21.16b, v21.16b, #4
+  .long 0x4eb51e94 // orr v20.16b, v20.16b, v21.16b
+  .long 0x6f0c0416 // ushr v22.16b, v0.16b, #4
+  .long 0x6f0c0497 // ushr v23.16b, v4.16b, #4
+  .long 0x4e3e1ef7 // and v23.16b, v23.16b, v30.16b
+  .long 0x4f0c56f7 // shl v23.16b, v23.16b, #4
+  .long 0x4eb71ed6 // orr v22.16b, v22.16b, v23.16b
+  .long 0x6f0c0438 // ushr v24.16b, v1.16b, #4
+  .long 0x6f0c04b9 // ushr v25.16b, v5.16b, #4
+  .long 0x4e3e1f39 // and v25.16b, v25.16b, v30.16b
+  .long 0x4f0c5739 // shl v25.16b, v25.16b, #4
+  .long 0x4eb91f18 // orr v24.16b, v24.16b, v25.16b
+  .long 0x6f0c045a // ushr v26.16b, v2.16b, #4
+  .long 0x6f0a049b // ushr v27.16b, v4.16b, #6
+  .long 0x4f0c577b // shl v27.16b, v27.16b, #4
+  .long 0x4ebb1f5a // orr v26.16b, v26.16b, v27.16b
+  .long 0x6f0c047c // ushr v28.16b, v3.16b, #4
+  .long 0x6f0a04bd // ushr v29.16b, v5.16b, #6
+  .long 0x4f0c57bd // shl v29.16b, v29.16b, #4
+  .long 0x4ebd1f9c // orr v28.16b, v28.16b, v29.16b
+  .long 0x4cdf20c0 // ld1 {v0.16b-v3.16b}, [x6], #64
+  .long 0x4cdfa0c4 // ld1 {v4.16b-v5.16b}, [x6], #32
+  .long 0x4cdf70c7 // ld1 {v7.16b}, [x6], #16
+  .long 0x4cdf70d1 // ld1 {v17.16b}, [x6], #16
+  .long 0x4f000413 // movi v19.4s, #0x0
+  .long 0x4e8094d3 // sdot v19.4s, v6.16b, v0.16b
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e819615 // sdot v21.4s, v16.16b, v1.16b
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e829655 // sdot v21.4s, v18.16b, v2.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e839697 // sdot v23.4s, v20.16b, v3.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e8496d5 // sdot v21.4s, v22.16b, v4.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e859717 // sdot v23.4s, v24.16b, v5.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e879757 // sdot v23.4s, v26.16b, v7.16b
+  .long 0x4f000419 // movi v25.4s, #0x0
+  .long 0x4e919799 // sdot v25.4s, v28.16b, v17.16b
+  .long 0x4eb9bef7 // addp v23.4s, v23.4s, v25.4s
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4cdf755b // ld1 {v27.8h}, [x10], #16
+  .long 0x0f10a77d // sxtl v29.4s, v27.4h
+  .long 0x4f10a77b // sxtl2 v27.4s, v27.8h
+  .long 0x4f2557bd // shl v29.4s, v29.4s, #5
+  .long 0x4f25577b // shl v27.4s, v27.4s, #5
+  .long 0x6ebd8673 // sub v19.4s, v19.4s, v29.4s
+  .long 0x6ebb86b5 // sub v21.4s, v21.4s, v27.4s
+  .long 0x0cdf7177 // ld1 {v23.8b}, [x11], #8
+  .long 0x0f08a6f7 // sxtl v23.8h, v23.8b
+  .long 0x0f10a6f9 // sxtl v25.4s, v23.4h
+  .long 0x4f10a6f7 // sxtl2 v23.4s, v23.8h
+  .long 0x4eb99e73 // mul v19.4s, v19.4s, v25.4s
+  .long 0x4eb796b3 // mla v19.4s, v21.4s, v23.4s
+  .long 0x4eb1ba73 // addv s19, v19.4s
+  .long 0x1e26026c // fmov w12, s19
+  .long 0x0b0c0129 // add w9, w9, w12
+  subs x7, x7, #1
+  b.ne .Lq6k2_1
+  .long 0x28817c69 // stp w9, wzr, [x3], #8
+  add x0, x0, #210
+  add x1, x1, #292
+  subs x2, x2, #1
+  b.ne .Lq6k2_0
+.Lq6k2_2:
 end;
 
 {$endif FPC}
@@ -1336,6 +1647,395 @@ begin
   result := args.A[3];
 end;
 
+/// Q4KSumsAvx2 body: A = w, x, aBlocks, aOut
+// - per block: isum = sum over the 8 sub-blocks of scale * (nibbles . x), msum =
+// sum of min * (the two activation block sums of the sub-block), both exact
+// int32 (u8 x s8 pairs, then int16 pairs times the scale); the 6-bit scales
+// and mins are unpacked with ggml's masks into the X area of aArgs
+// - ymm0..ymm5 only
+procedure Q4KSumsAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     r10, qword ptr [r11 + 24]
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm4, eax
+        vpbroadcastd ymm4, xmm4          // the low nibble mask
+        test    rcx, rcx
+        jz      @done
+@block: mov     eax, dword ptr [r8 + 4]
+        and     eax, 3F3F3F3FH
+        mov     dword ptr [r11 + 128], eax      // scales 0..3
+        mov     eax, dword ptr [r8 + 4]
+        shr     eax, 6
+        and     eax, 03030303H
+        shl     eax, 4
+        mov     edx, dword ptr [r8 + 12]
+        and     edx, 0F0F0F0FH
+        or      eax, edx
+        mov     dword ptr [r11 + 132], eax      // scales 4..7
+        mov     eax, dword ptr [r8 + 8]
+        and     eax, 3F3F3F3FH
+        mov     dword ptr [r11 + 136], eax      // mins 0..3
+        mov     eax, dword ptr [r8 + 8]
+        shr     eax, 6
+        and     eax, 03030303H
+        shl     eax, 4
+        mov     edx, dword ptr [r8 + 12]
+        shr     edx, 4
+        and     edx, 0F0F0F0FH
+        or      eax, edx
+        mov     dword ptr [r11 + 140], eax      // mins 4..7
+        vpxor   ymm5, ymm5, ymm5
+        vmovdqu ymm0, yword ptr [r8 + 16]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        vpmaddubsw ymm1, ymm1, yword ptr [r9 + 4]
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 36]
+        movzx   eax, byte ptr [r11 + 128]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm1, ymm1, ymm3
+        vpaddd  ymm5, ymm5, ymm1
+        movzx   eax, byte ptr [r11 + 129]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm2, ymm2, ymm3
+        vpaddd  ymm5, ymm5, ymm2
+        vmovdqu ymm0, yword ptr [r8 + 48]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        vpmaddubsw ymm1, ymm1, yword ptr [r9 + 68]
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 100]
+        movzx   eax, byte ptr [r11 + 130]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm1, ymm1, ymm3
+        vpaddd  ymm5, ymm5, ymm1
+        movzx   eax, byte ptr [r11 + 131]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm2, ymm2, ymm3
+        vpaddd  ymm5, ymm5, ymm2
+        vmovdqu ymm0, yword ptr [r8 + 80]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        vpmaddubsw ymm1, ymm1, yword ptr [r9 + 132]
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 164]
+        movzx   eax, byte ptr [r11 + 132]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm1, ymm1, ymm3
+        vpaddd  ymm5, ymm5, ymm1
+        movzx   eax, byte ptr [r11 + 133]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm2, ymm2, ymm3
+        vpaddd  ymm5, ymm5, ymm2
+        vmovdqu ymm0, yword ptr [r8 + 112]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        vpmaddubsw ymm1, ymm1, yword ptr [r9 + 196]
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 228]
+        movzx   eax, byte ptr [r11 + 134]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm1, ymm1, ymm3
+        vpaddd  ymm5, ymm5, ymm1
+        movzx   eax, byte ptr [r11 + 135]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddwd ymm2, ymm2, ymm3
+        vpaddd  ymm5, ymm5, ymm2
+        vextracti128 xmm1, ymm5, 1
+        vpaddd  xmm5, xmm5, xmm1
+        vphaddd xmm5, xmm5, xmm5
+        vphaddd xmm5, xmm5, xmm5
+        vmovd   dword ptr [r10], xmm5
+        mov     rax, qword ptr [r11 + 136]      // FPC 3.2: no vmovq from memory
+        vmovq   xmm1, rax
+        vpmovzxbw xmm1, xmm1                    // the mins as int16
+        vpunpcklwd xmm2, xmm1, xmm1
+        vpunpckhwd xmm1, xmm1, xmm1
+        vinserti128 ymm2, ymm2, xmm1, 1         // m0 m0 m1 m1 .. m7 m7
+        vpmaddwd ymm2, ymm2, yword ptr [r9 + 260]
+        vextracti128 xmm1, ymm2, 1
+        vpaddd  xmm2, xmm2, xmm1
+        vphaddd xmm2, xmm2, xmm2
+        vphaddd xmm2, xmm2, xmm2
+        vmovd   dword ptr [r10 + 4], xmm2
+        add     r10, 8
+        add     r8, 144
+        add     r9, 292
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+end;
+
+/// Q6KSumsAvx2 body: A = w, x, aBlocks, aOut
+// - per block: isum = sum over the 16 groups of scale * (q - 32) . x, exact
+// int32: the unsigned 6-bit q (u8) times x (s8) in pairs, int16 pairs times
+// the group scale, minus 32 times the scales . activation block sums; then 0
+// - unrolled, every offset constant; ymm0..ymm5 only
+procedure Q6KSumsAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     r10, qword ptr [r11 + 24]
+        mov     eax, 03030303H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3          // the 2-bit mask
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm4, eax
+        vpbroadcastd ymm4, xmm4          // the low nibble mask
+        test    rcx, rcx
+        jz      @done
+@block: vpxor   ymm5, ymm5, ymm5
+        // positions 0..31
+        vpand   ymm2, ymm4, yword ptr [r8 + 0]
+        vpand   ymm0, ymm3, yword ptr [r8 + 128]
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 4]
+        movsx   eax, byte ptr [r8 + 192]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 193]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 32..63
+        vpand   ymm2, ymm4, yword ptr [r8 + 32]
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 2
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 36]
+        movsx   eax, byte ptr [r8 + 194]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 195]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 64..95
+        vmovdqu ymm2, yword ptr [r8 + 0]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 4
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 68]
+        movsx   eax, byte ptr [r8 + 196]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 197]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 96..127
+        vmovdqu ymm2, yword ptr [r8 + 32]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 6
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 100]
+        movsx   eax, byte ptr [r8 + 198]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 199]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 128..159
+        vpand   ymm2, ymm4, yword ptr [r8 + 64]
+        vpand   ymm0, ymm3, yword ptr [r8 + 160]
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 132]
+        movsx   eax, byte ptr [r8 + 200]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 201]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 160..191
+        vpand   ymm2, ymm4, yword ptr [r8 + 96]
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 2
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 164]
+        movsx   eax, byte ptr [r8 + 202]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 203]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 192..223
+        vmovdqu ymm2, yword ptr [r8 + 64]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 4
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 196]
+        movsx   eax, byte ptr [r8 + 204]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 205]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // positions 224..255
+        vmovdqu ymm2, yword ptr [r8 + 96]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 6
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        vpmaddubsw ymm2, ymm2, yword ptr [r9 + 228]
+        movsx   eax, byte ptr [r8 + 206]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 207]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddwd ymm2, ymm2, ymm1
+        vpaddd  ymm5, ymm5, ymm2
+        // minus 32 * sum of scale * activation block sum
+        vpmovsxbw ymm1, oword ptr [r8 + 192]
+        vpmaddwd ymm1, ymm1, yword ptr [r9 + 260]
+        vpslld  ymm1, ymm1, 5
+        vpsubd  ymm5, ymm5, ymm1
+        vextracti128 xmm1, ymm5, 1
+        vpaddd  xmm5, xmm5, xmm1
+        vphaddd xmm5, xmm5, xmm5
+        vphaddd xmm5, xmm5, xmm5
+        vmovd   dword ptr [r10], xmm5
+        mov     dword ptr [r10 + 4], 0
+        add     r10, 8
+        add     r8, 210
+        add     r9, 292
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+end;
+
+procedure Q4KSumsAvx2(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aSums);
+  Q4KSumsAvx2Asm(args);
+end;
+
+procedure Q6KSumsAvx2(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aSums);
+  Q6KSumsAvx2Asm(args);
+end;
+
 {$endif ASMX64AVX1}
 {$endif CPUX64}
 
@@ -1378,6 +2078,8 @@ begin
     PCardinal(@INFER_HALF[h])^ := InferHalfToSingleBits(h);
   InferQ8BlockDots := InferQ8BlockDotsPascal;
   InferQ8BlockDots4 := InferQ8BlockDots4Pascal;
+  InferQ4KSums := InferQ4KSumsPascal;
+  InferQ6KSums := InferQ6KSumsPascal;
   InferQ8KernelName := 'pascal';
   {$ifdef CPUAARCH64}
   {$ifdef FPC}
@@ -1394,6 +2096,8 @@ begin
     InferQ8Linear4 := TInferQ8Linear4(@Q8Linear4NeonDot);
     InferQ8Linear4x2 := TInferQ8Linear4(@Q8Linear4x2NeonDot);
     InferQ8DotF32x4x2 := TInferQ8DotF32x4x2(@Q8DotF32x4x2NeonDot);
+    InferQ4KSums := TInferKSums(@Q4KSumsNeonDot);
+    InferQ6KSums := TInferKSums(@Q6KSumsNeonDot);
     InferQ8KernelName := 'neon-dotprod';
   end;
   {$endif FPC}
@@ -1410,6 +2114,8 @@ begin
     InferQ8BlockDots := Q8BlockDotsAvx2;
     InferQ8BlockDots4 := Q8BlockDots4Avx2;
     InferQ8DotF32x4x2 := Q8DotF32x4x2Avx2;
+    InferQ4KSums := Q4KSumsAvx2;
+    InferQ6KSums := Q6KSumsAvx2;
     InferQ8KernelName := 'avx2';
   end;
   {$endif INFERAVX2}

@@ -831,8 +831,46 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   Gegenproben (Skala/Minimum von Teilblock 4-7, vertauschte Nibbles, Minima addiert,
   Q6_K-Hochbits, Q8_K-Gleichstände und erster Größter) schlagen an.
 
-- Offen in Phase 3: K-Quant-Kernel (3e-3b), Q4_0-Kernel (s. o.), Benchmark auf x86_64
-  (RTX-Rechner).
+**3e-3b, erledigt 2026-10-16: K-Quant-Kernel (NEON, AVX2).**
+
+- Befund (ein Thread, `perf`): Mit SIMD nur für die Teilsummen gingen 46 % der Zeit in
+  das Pascal-Fertigrechnen (6-Bit-Skalen je Teilblock auspacken, multiplizieren), 10 % in
+  Half-Float-Aufrufe, 22 % in die Kernel.
+- Fusionierte Kernel wie bei ggml: je Superblock liefern sie zwei exakte int32, bei
+  Q4_K `isum` (Σ Skala · Teilsumme) und `msum` (Σ Minimum · Blocksummen der
+  Aktivierungen), bei Q6_K `isum` (Σ Skala · (q − 32) · x über die Gruppen). Die Skalen
+  werden mit ggmls Masken in einem Zug ausgepackt. NEON: SDOT auf den Nibbles bzw. den
+  aus `ql`/`qh` gebauten 6-Bit-Werten (Opcodes aus dem GNU-Assembler); AVX2:
+  `vpmaddubsw` (u8 × s8) und `vpmaddwd` gleich mit der Skala, vollständig ausgerollt,
+  nur ymm0..ymm5. Pascal multipliziert danach nur noch zwei Half-Float-Skalen je Block
+  (aus der Tabelle). Weil die Ganzzahlen exakt sind, bleibt `Exact` bitgleich zur
+  Referenz; die Referenz rechnet die Teilsummen weiter ausführlich in Pascal.
+- FPC 3.2 kennt `vmovq`/`vpmovzxbw` mit 64-Bit-Speicheroperand nicht: geladen wird
+  über ein Allzweckregister.
+- Messung (Snapdragon X, 8 Threads, ein Lauf):
+
+  | | Prefill | Dekodieren | Speicher-Peak |
+  |---|---|---|---|
+  | Q4_K_M-GGUF, 200 | 290 Tokens/s | 73 Tokens/s | 475 MB |
+  | Q4_K_M-GGUF, 1000 | 178 Tokens/s | 44 Tokens/s | 744 MB |
+  | Q8_0-GGUF, 200 | 545 Tokens/s | 65 Tokens/s | 707 MB |
+  | Q8_0 aus safetensors, 200 | 457 Tokens/s | 66 Tokens/s | 2068 MB |
+
+  Q4_K_M dekodiert damit schneller als Q8_0 (halbe Bandbreite). Im Prefill liegt es
+  noch zurück: Der Kernel rechnet eine Aktivierungszeile je Aufruf und packt dieselben
+  Gewichte für jede Zeile neu aus (offen: mehrere Zeilen je Kernel).
+- Tests: Kernel gegen Pascal bitgleich (auch 513 Blöcke, über die Stückelung zu 512
+  hinaus), `Exact` gleich Referenz, auf aarch64 (NEON) und unter x86-64-Emulation
+  (AVX2, FPC 3.2.2 Win64 und Delphi 13). Gegenproben (Skalen auf 4 Bit maskiert,
+  16 statt 32 · Blocksumme, je in NEON und AVX2; hohe Nibbles gegen die falschen
+  Aktivierungen; Minima addiert; Stückelung um Blöcke statt Bytes) schlagen an.
+
+- Nativ auf x86-64 (i9-14900K, Windows 11, FPC 3.2.2, 22 Threads, 2026-10-16): Delphi 13
+  (2255) und Delphi 7 (1401) grün; `llm-bench` 200 Tokens: Q8_0-GGUF 757 / 72 Tokens/s,
+  Q4_K_M 455 / 78 Tokens/s (Prefill / Decode), 1000 Tokens: Q8_0 540 / 44, Q4_K_M 369 / 47.
+  `llm-bench` schaltet unter Windows die EcoQoS-Drossel ab (wie `embed-bench`).
+
+- Offen in Phase 3: K-Quant-Prefill (mehrere Zeilen je Kernel), Q4_0-Kernel (s. o.).
 
 ### Phase 4 — GPU
 

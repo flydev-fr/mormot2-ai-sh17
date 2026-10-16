@@ -518,10 +518,14 @@ end;
 procedure TTestInferFast.LinearKMatchesReference;
 const
   // rows, in, out: partial tiles, several super-blocks
-  SHAPES: array[0..4, 0..2] of integer = (
-    (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (64, 256, 40));
+  // 513 blocks of 256: beyond the 512 the dot product takes at a time
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (64, 256, 40),
+    (1, 513 * 256, 2));
 var
-  i, k, r, o, rows, nin, nout: PtrInt;
+  i, k, r, o, rows, nin, nout, nb: PtrInt;
+  mine, pascal: TIntegerDynArray;
+  xk: array of TInferBlockQ8_K;
   x, bias, y1, y2, y3, wf: TSingleDynArray;
   wq: RawByteString;
   kind: TInferDType;
@@ -556,6 +560,25 @@ begin
       e := RelError(pointer(y3), pointer(y1), rows * nout);
       CheckUtf8(e <= 2e-6, '% float % x % x %: relative error %',
         [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
+      // the kernel of this CPU (NEON, AVX2) gives the ints of the Pascal one
+      nb := nin div 256;
+      SetLength(xk, nb);
+      InferQuantizeRowQ8_K(pointer(x), nin, pointer(xk));
+      SetLength(mine, nb * 2);
+      SetLength(pascal, nb * 2);
+      if kind = idtQ4_K then
+      begin
+        InferQ4KSums(pointer(wq), pointer(xk), nb, pointer(mine));
+        InferQ4KSumsPascal(pointer(wq), pointer(xk), nb, pointer(pascal));
+      end
+      else
+      begin
+        InferQ6KSums(pointer(wq), pointer(xk), nb, pointer(mine));
+        InferQ6KSumsPascal(pointer(wq), pointer(xk), nb, pointer(pascal));
+      end;
+      CheckUtf8(CompareMem(pointer(mine), pointer(pascal), nb * 2 * SizeOf(integer)),
+        '% kernel (%) = Pascal, % blocks', [INFER_DTYPE_NAME[kind],
+        InferQ8KernelName, nb]);
       // independent of the block sums: F32 on the dequantized weights, apart
       // only by the rounding of the activations to Q8_K
       SetLength(wf, nout * nin);

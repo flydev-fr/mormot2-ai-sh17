@@ -5,7 +5,7 @@
 //   tokens/s of both, the share of the matrix products (backend Linear) and
 //   the peak memory
 //
-//   usage: llm-bench [model folder] [prompt tokens=200] [new tokens=32]
+//   usage: llm-bench [model folder | file.gguf] [prompt tokens=200] [new tokens=32]
 //                    [threads=0 (default) | ref | exact] [q8 (default) | q4 | f32]
 //   - ref: the scalar reference backend; exact: TInferCpuFastBackend with
 //     Exact = true; otherwise TInferCpuFastBackend in its float mode
@@ -224,6 +224,32 @@ begin
   {$endif OSWINDOWS}
 end;
 
+{$ifdef OSWINDOWS}
+/// opt out of Windows power throttling (EcoQoS): a process without a visible
+// window - e.g. started over SSH or as a service - is otherwise slowed down
+// after a while, which spoils any long measurement
+procedure NoPowerThrottling;
+type
+  TPowerThrottling = record
+    Version, ControlMask, StateMask: cardinal;
+  end;
+var
+  setInfo: function(aProcess: THandle; aClass: integer; aInfo: pointer;
+    aSize: cardinal): LongBool; stdcall;
+  state: TPowerThrottling;
+begin
+  setInfo := GetProcAddress(GetModuleHandle('kernel32.dll'), 'SetProcessInformation');
+  if not Assigned(setInfo) then
+    exit;
+  state.Version := 1;            // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+  state.ControlMask := 1;        // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+  state.StateMask := 0;          // ... switched off
+  if setInfo(GetCurrentProcess, 4 {ProcessPowerThrottling}, @state,
+       SizeOf(state)) then
+    ConsoleWrite('power throttling: off');
+end;
+{$endif OSWINDOWS}
+
 function Pct(aPart, aTotal: Int64): double;
 begin
   if aTotal <= 0 then
@@ -287,6 +313,9 @@ begin
     weights := idtQ4_0;
   if (ParamCount >= 5) and (ParamStr(5) = 'f32') then
     weights := idtF32;
+  {$ifdef OSWINDOWS}
+  NoPowerThrottling;
+  {$endif OSWINDOWS}
   timed := TTimedBackend.Create(inner);
   tok := nil;
   model := nil;
@@ -298,12 +327,22 @@ begin
     else
       ConsoleWrite('backend: scalar reference');
     QueryPerformanceMicroSeconds(t0);
-    tok := TBpeTokenizer.Create(IncludeTrailingPathDelimiter(folder) + 'tokenizer.json');
-    model := TQwen3Model.Create(folder, timed, weights);
+    if SameText(ExtractFileExt(folder), '.gguf') then
+    begin
+      // one llama.cpp file: its own weight types and tokenizer
+      model := TQwen3Model.CreateFromGguf(folder, timed);
+      tok := TBpeTokenizer.CreateFromGguf(model.Gguf);
+    end
+    else
+    begin
+      tok := TBpeTokenizer.Create(IncludeTrailingPathDelimiter(folder) +
+        'tokenizer.json');
+      model := TQwen3Model.Create(folder, timed, weights);
+    end;
     QueryPerformanceMicroSeconds(t1);
     ConsoleWrite('loaded in % ms: % layers, hidden %, vocab %, weights %, peak % MB',
       [(t1 - t0) div 1000, model.Config.Layers, model.Config.Hidden,
-       model.Config.VocabSize, INFER_DTYPE_NAME[weights], PeakRssMB]);
+       model.Config.VocabSize, INFER_DTYPE_NAME[model.Weights], PeakRssMB]);
     // a prompt of exactly promptLen ids
     text := '';
     repeat

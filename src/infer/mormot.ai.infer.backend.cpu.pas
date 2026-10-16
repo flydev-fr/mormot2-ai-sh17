@@ -743,76 +743,63 @@ begin
   end;
 end;
 
-function InferDotQ4K(w: PInferBlockQ4_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+/// a K-quant dot product of aBlocks super-blocks: the integer parts from
+// aKernel (TInferKSums), then the half-float scales in double
+function DotK(aType: TInferDType; w, x: pointer; aBlocks: PtrInt;
+  aKernel: TInferKSums): double;
 var
-  b, j, l, k: PtrInt;
-  sc, m, isum, msum, s: integer;
+  sums: array[0..1023] of integer; // 512 blocks at a time: no heap
+  n, b, size: PtrInt;
+  wq: PInferBlockQ4_K;
+  w6: PInferBlockQ6_K;
+  xb: PInferBlockQ8_K;
   dx: double;
 begin
   result := 0;
-  for b := 0 to aBlocks - 1 do
+  size := INFER_DTYPE_SIZE[aType];
+  xb := x;
+  while aBlocks > 0 do
   begin
-    isum := 0; // at most 8 * 63 * 32 * 15 * 128: fits an integer
-    msum := 0;
-    for j := 0 to 7 do
+    n := aBlocks;
+    if n > 512 then
+      n := 512;
+    aKernel(w, xb, n, @sums);
+    if aType = idtQ4_K then
     begin
-      InferScaleMinK4(j, @w^.scales, sc, m);
-      k := 32 * (j shr 1);
-      s := 0;
-      if odd(j) then
-        for l := 0 to 31 do
-          inc(s, integer(w^.qs[k + l] shr 4) * x^.qs[32 * j + l])
-      else
-        for l := 0 to 31 do
-          inc(s, integer(w^.qs[k + l] and 15) * x^.qs[32 * j + l]);
-      inc(isum, sc * s);
-      inc(msum, m * (x^.bsums[2 * j] + x^.bsums[2 * j + 1]));
+      wq := w;
+      for b := 0 to n - 1 do
+      begin
+        dx := xb^.d;
+        result := result + (INFER_HALF[wq^.d] * dx) * sums[b * 2] -
+          (INFER_HALF[wq^.dmin] * dx) * sums[b * 2 + 1];
+        inc(wq);
+        inc(xb);
+      end;
+    end
+    else
+    begin
+      w6 := w;
+      for b := 0 to n - 1 do
+      begin
+        dx := xb^.d;
+        result := result + (INFER_HALF[w6^.d] * dx) * sums[b * 2];
+        inc(w6);
+        inc(xb);
+      end;
     end;
-    dx := x^.d;
-    result := result + (InferHalfToSingle(w^.d) * dx) * isum -
-      (InferHalfToSingle(w^.dmin) * dx) * msum;
-    inc(w);
-    inc(x);
+    w := PAnsiChar(w) + n * size;
+    dec(aBlocks, n);
   end;
 end;
 
-function InferDotQ6K(w: PInferBlockQ6_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
-var
-  b, n, g, l, i: PtrInt;
-  q, isum, s: integer;
-  dx: double;
+function InferDotQ4K(w: PInferBlockQ4_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
 begin
-  result := 0;
-  for b := 0 to aBlocks - 1 do
-  begin
-    isum := 0; // at most 16 * 128 * 16 * 32 * 128: fits an integer
-    for g := 0 to 15 do
-    begin
-      s := 0;
-      for l := 0 to 15 do
-      begin
-        i := 16 * g + l;
-        n := i shr 7;
-        q := w^.qh[32 * n + (i and 31)] shr (2 * ((i and 127) shr 5)) and 3;
-        case (i and 127) shr 5 of
-          0:
-            q := (w^.ql[64 * n + (i and 31)] and 15) or (q shl 4);
-          1:
-            q := (w^.ql[64 * n + (i and 31) + 32] and 15) or (q shl 4);
-          2:
-            q := (w^.ql[64 * n + (i and 31)] shr 4) or (q shl 4);
-        else
-          q := (w^.ql[64 * n + (i and 31) + 32] shr 4) or (q shl 4);
-        end;
-        inc(s, (q - 32) * x^.qs[i]);
-      end;
-      inc(isum, w^.scales[g] * s);
-    end;
-    dx := x^.d;
-    result := result + (InferHalfToSingle(w^.d) * dx) * isum;
-    inc(w);
-    inc(x);
-  end;
+  result := DotK(idtQ4_K, w, x, aBlocks, InferQ4KSumsPascal);
+end;
+
+function InferDotQ6K(w: PInferBlockQ6_K; x: PInferBlockQ8_K; aBlocks: PtrInt): double;
+begin
+  result := DotK(idtQ6_K, w, x, aBlocks, InferQ6KSumsPascal);
 end;
 
 /// the K-quant Linear of the reference: activations as Q8_K, exact block sums
@@ -1526,17 +1513,19 @@ begin
   oEnd := MinPtrInt((aTile + 1) * TILE, aJob.OutCount) - 1;
   if aJob.W.DType in [idtQ4_K, idtQ6_K] then
   begin
-    // K-quants: the exact block sums of the reference, per output and row
+    // K-quants: per output and row
     nb := aJob.Blocks;
     for o := aTile * TILE to oEnd do
       for r := 0 to aJob.Rows - 1 do
       begin
+        // the integer sums of this CPU's kernel, then the arithmetic of the
+        // reference: Exact and the float path are bit-identical to it
         if aJob.W.DType = idtQ4_K then
-          acc := InferDotQ4K(@PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
-            @aJob.Xk^[r * nb], nb)
+          acc := DotK(idtQ4_K, @PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ4_K)],
+            @aJob.Xk^[r * nb], nb, InferQ4KSums)
         else
-          acc := InferDotQ6K(@PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ6_K)],
-            @aJob.Xk^[r * nb], nb);
+          acc := DotK(idtQ6_K, @PByteArray(aJob.W.Data)^[o * nb * SizeOf(TInferBlockQ6_K)],
+            @aJob.Xk^[r * nb], nb, InferQ6KSums);
         aJob.Y^[r * aJob.OutCount + o] := Bias(o) + acc;
       end;
   end

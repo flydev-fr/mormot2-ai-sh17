@@ -31,15 +31,15 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
 ## Where it runs
 
-Number of assertions per suite, every one passing; each row with numbers ran on 2026-10-14 or 15:
+Number of assertions per suite, every one passing; each row with numbers ran between 2026-10-14 and 16:
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2247 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2265 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 726 | 2237 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 1383 ⁶ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2010 ⁷ |
+| Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2265 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
@@ -156,6 +156,8 @@ then 32 new tokens (`demos/infer/llm-bench`), 2026-10-15:
 | Q8_0 | 498 tokens/s | 64 tokens/s | 2.1 GB |
 | FP32, 1000-token prompt | 138 tokens/s | 24 tokens/s | 4.1 GB |
 | Q8_0, 1000-token prompt | 240 tokens/s | 40 tokens/s | 2.4 GB |
+| Q8_0 GGUF file | 545 tokens/s | 65 tokens/s | 0.7 GB |
+| Q4_K_M GGUF file | 290 tokens/s | 73 tokens/s | 0.5 GB |
 
 The same on an Apple M2 Pro (macOS, FPC 3.2.4, 7 threads; two runs, which differ by
 up to 12 %):
@@ -166,6 +168,16 @@ up to 12 %):
 | Q8_0 | 515-562 tokens/s | 70-75 tokens/s | 2.1 GB |
 | FP32, 1000-token prompt | 147-160 tokens/s | 31-32 tokens/s | 4.1 GB |
 | Q8_0, 1000-token prompt | 371-408 tokens/s | 44-47 tokens/s | 2.4 GB |
+
+And on an Intel i9-14900K (Windows 11, FPC 3.2.2, 22 threads, AVX2), 2026-10-16:
+
+| | prefill | decode | peak RSS |
+|---|---|---|---|
+| Q8_0 (from safetensors) | 746 tokens/s | 70 tokens/s | 2.1 GB |
+| Q8_0 GGUF file | 757 tokens/s | 72 tokens/s | 0.7 GB |
+| Q4_K_M GGUF file | 455 tokens/s | 78 tokens/s | 0.5 GB |
+| Q8_0 GGUF, 1000-token prompt | 540 tokens/s | 44 tokens/s | 1.0 GB |
+| Q4_K_M GGUF, 1000-token prompt | 369 tokens/s | 47 tokens/s | 0.8 GB |
 
 FP32 keeps greedy output token-identical to `transformers`; Q8_0 passes its own gate but
 can flip a close decision - with it, Qwen3-0.6B answers the weather question of the
@@ -556,9 +568,10 @@ Next, in this order:
    coarse for a 0.6B model and, without kernels of its own, slower than Q8_0. Qwen3
    loads straight from llama.cpp GGUF files (Q8_0, Q4_0, F16), tokenizer included, so
    one .gguf file is a complete native `ILlmClient`, and Q4_K_M files load too (Q4_K
-   and Q6_K, checked against ggml itself). Next: SIMD kernels for the K-quants, then
-   Q4_0 kernels; a benchmark on x86_64.
-2. **GPU** — CUDA through the driver API, kernels as embedded PTX; optionally Vulkan.
+   and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
+   decoding in 475 MB). Next: K-quant prefill, Q4_0 kernels.
+2. **GPU** — Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
+   no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
