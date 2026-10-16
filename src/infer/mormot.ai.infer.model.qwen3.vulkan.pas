@@ -54,7 +54,7 @@ type
     fKeys, fValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
     // device scratch for up to fRows token rows
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp, fCos: TInferVkBuffer;
-    fScores, fPart, fLogits: TInferVkBuffer;
+    fPart, fLogits: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
     procedure FreeScratch;
@@ -80,9 +80,10 @@ type
     fVk: TInferVulkan;
     fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
+    fSplitKeys: integer;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
-    function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
+    function ChunkRows(aCount: PtrInt; aAllLogits: boolean): PtrInt;
     procedure Prepare(aCtx: TQwen3VkContext; aTokens, aRows, aOutRows: PtrInt);
     procedure Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean);
@@ -112,6 +113,11 @@ type
       read fModel;
     property Backend: TInferVulkanBackend
       read fBackend;
+    /// the attention cuts the keys of a row into ranges of about this many
+    // keys while there are few work groups (decoding); 0 = never - for tests
+    // and tuning, the default (64) suits a discrete GPU
+    property SplitKeys: integer
+      read fSplitKeys write fSplitKeys;
   end;
 
 
@@ -124,7 +130,7 @@ type
   end;
 
   TAttentionPush = record
-    Rows, Heads, HeadDim, KvHeads, Past, Splits: cardinal;
+    Rows, Heads, HeadDim, KvHeads, Past, Splits, HeadBlock, RowBlock: cardinal;
   end;
 
   TMergePush = record
@@ -140,13 +146,14 @@ const
   /// token rows per recorded batch at most: every dispatch dimension stays
   // below 65535 work groups (rows * Intermediate / 128 for SwiGLU)
   CHUNK_MAX = 256;
-  /// the attention scores of one chunk at most (heads * rows * context floats)
-  SCORES_MAX = 256 shl 20;
+  /// the queries of one attention.comp work group at most (MAXQ there): the
+  // heads of one KV head times rows, which share every key and value read
+  ATTENTION_QUERIES = 8;
   /// attention.comp cuts the keys of a row into ranges of about SPLIT_KEYS
-  // when there are few (head, row) work groups - decoding one token - at most
+  // when there are few work groups - decoding one token - at most
   // SPLIT_GROUPS work groups in all (then attnmerge.comp combines them)
   SPLIT_KEYS = 64;
-  SPLIT_GROUPS = 1024;
+  SPLIT_GROUPS = 2048;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
 procedure NeedDevice(aVk: TInferVulkan; var aBuffer: TInferVkBuffer;
@@ -195,7 +202,6 @@ begin
   end;
   fKeys := nil;
   fValues := nil;
-  FreeAndNil(fScores);
   FreeAndNil(fPart);
   FreeAndNil(fLogits);
   FreeAndNil(fOut);
@@ -238,12 +244,13 @@ begin
       aModel.Config.HeadDim]);
   fModel := aModel;
   fBackend := aBackend;
+  fSplitKeys := SPLIT_KEYS;
   fVk := aBackend.Vulkan;
   fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
     SizeOf(TNormPush));
   fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2, 4);
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
-    6, SizeOf(TAttentionPush));
+    5, SizeOf(TAttentionPush));
   fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 2,
     SizeOf(TMergePush));
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
@@ -338,9 +345,9 @@ begin
   result.fOwner := self;
 end;
 
-function TQwen3Vulkan.ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
+function TQwen3Vulkan.ChunkRows(aCount: PtrInt; aAllLogits: boolean): PtrInt;
 var
-  limit, widest: Int64;
+  widest: Int64;
   c: TQwen3Config;
 begin
   c := fModel.Config;
@@ -363,16 +370,6 @@ begin
   if aAllLogits then
     while (result > 1) and (Int64(result) * c.VocabSize * 4 > fVk.MaxStorageRange) do
       result := result shr 1;
-  limit := SCORES_MAX;
-  if limit > fVk.MaxStorageRange then
-    limit := fVk.MaxStorageRange;
-  // the scores of every head and row over the whole context must fit
-  while (result > 1) and
-        (Int64(fModel.Config.Heads) * result * (aPast + result) * 4 > limit) do
-    result := result shr 1;
-  if Int64(fModel.Config.Heads) * result * (aPast + result) * 4 > limit then
-    EInferError.RaiseUtf8('%: a context of % tokens is too long for this device',
-      [self, aPast + result]);
 end;
 
 procedure TQwen3Vulkan.Prepare(aCtx: TQwen3VkContext; aTokens, aRows,
@@ -462,7 +459,6 @@ begin
     aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
     aCtx.fRows := aRows;
   end;
-  NeedDevice(fVk, aCtx.fScores, Int64(c.Heads) * aRows * aTokens * 4);
   if aOutRows > 0 then
   begin
     NeedDevice(fVk, aCtx.fLogits, Int64(aOutRows) * c.VocabSize * 4);
@@ -498,7 +494,7 @@ procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows, splits, most: PtrInt;
+  n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
@@ -522,9 +518,18 @@ begin
     else
       outRows := 1;
   Prepare(aCtx, past + n, n, outRows);
-  // key ranges per (head, row): one unless there are few work groups
-  splits := (past + n + SPLIT_KEYS - 1) div SPLIT_KEYS;
-  most := SPLIT_GROUPS div (c.Heads * n);
+  // the attention work groups: hb heads of one KV head (hb divides the
+  // group) times rb rows, the keys of a row cut into splits ranges unless
+  // there are enough work groups without
+  hb := c.Heads div c.KvHeads;
+  while (hb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod hb <> 0) do
+    dec(hb);
+  rb := ATTENTION_QUERIES div hb;
+  blocks := (n + rb - 1) div rb;
+  splits := 1;
+  if fSplitKeys > 0 then
+    splits := (past + n + fSplitKeys - 1) div fSplitKeys;
+  most := SPLIT_GROUPS div ((c.Heads div hb) * blocks);
   if splits > most then
     splits := most;
   if splits < 1 then
@@ -535,7 +540,7 @@ begin
     part := aCtx.fPart;
   end
   else
-    part := aCtx.fScores; // bound, but not accessed by attention.comp
+    part := aCtx.fAttn; // bound, but not accessed by attention.comp
   // the inputs, written into the host-visible buffer before the batch
   p := aCtx.fIn.Mapped;
   fModel.Embed(aIds, n, p);
@@ -559,6 +564,8 @@ begin
     att.KvHeads := c.KvHeads;
     att.Past := past;
     att.Splits := splits;
+    att.HeadBlock := hb;
+    att.RowBlock := rb;
     merge.Rows := n;
     merge.Heads := c.Heads;
     merge.HeadDim := c.HeadDim;
@@ -579,7 +586,7 @@ begin
         Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fCos,
         aCtx.fKeys[l], aCtx.fValues[l]], @qk, c.Heads + c.KvHeads, n);
       fVk.BatchDispatch(fAttention, [aCtx.fQ, aCtx.fKeys[l], aCtx.fValues[l],
-        aCtx.fAttn, aCtx.fScores, part], @att, c.Heads, n, splits);
+        aCtx.fAttn, part], @att, c.Heads div hb, blocks, splits);
       if splits > 1 then
         fVk.BatchDispatch(fMerge, [part, aCtx.fAttn], @merge, c.Heads, n);
       fBackend.RecordLinear(aCtx.fAttn, n, qw, ly^.O, h, aCtx.fTmp);
@@ -650,7 +657,7 @@ begin
     done := 0;
     while done < aCount do
     begin
-      n := ChunkRows(aCtx.fLength, aCount - done, aAllLogits and (aLogits <> nil));
+      n := ChunkRows(aCount - done, aAllLogits and (aLogits <> nil));
       last := done + n = aCount;
       if aAllLogits and (aLogits <> nil) then
         Chunk(aCtx, @aIds^[done], n, @aLogits^[done * vocab], true)

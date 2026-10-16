@@ -2,17 +2,23 @@
 // of docs/native-inference.md; CausalRows of the CPU backend in float)
 // - y[r, h] = softmax(q[r, h] . keys[0 .. past + r] / sqrt(d)) . values, the
 //   keys and values of the KV head h / (heads / kvHeads), rows at kvWidth
-// - headDim a multiple of 4 and at most 256 (the query head is kept in shared
-//   memory as vec4, the keys read as vec4)
-// - one work group of 128 per (head, row, split): the keys of a row are cut
-//   into splits ranges (phase 4e, flash-decoding), so a single decoded token
-//   still fills the device; the scores go to a scratch buffer (at most
-//   past + rows per head and row), then max, exp and sum, then each invocation
-//   sums one output dimension (headDim <= 128 * k)
-// - splits = 1: y is written normalized; splits > 1: each range writes its
-//   unnormalized sums, its maximum and its sum of exponentials to part[], and
-//   attnmerge.comp combines them into y
+// - headDim a multiple of 4 and at most 256 (the queries are kept in shared
+//   memory as vec4, the keys read as vec4; each invocation owns the output
+//   dimensions t and t + 128)
+// - phase 4e, flash attention: one work group of 128 per (head block, row
+//   block, split); a block holds up to MAXQ queries - headBlock heads of one
+//   KV head times rowBlock rows - so every key and value read serves all of
+//   them; the keys go by in tiles of 128, their scores stay in shared memory
+//   and the softmax is kept online (running maximum, sums rescaled)
+// - the keys of a row are cut into splits ranges (flash-decoding), so a single
+//   decoded token still fills the device; splits = 1: y is written normalized;
+//   splits > 1: each range writes its unnormalized sums, its maximum and its
+//   sum of exponentials to part[], and attnmerge.comp combines them into y
+// - shared memory: 16 KB, the least every device offers
 #version 450
+
+#define MAXQ 8
+#define NEG -3.402823e38
 
 layout(local_size_x = 128) in;
 
@@ -20,96 +26,164 @@ layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
 layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
 layout(std430, binding = 2) readonly buffer BufV { float vals[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
-layout(std430, binding = 4) coherent buffer BufS { float sc[]; };
 // [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
-layout(std430, binding = 5) writeonly buffer BufP { float part[]; };
+layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
 
+// headBlock divides heads / kvHeads, headBlock * rowBlock <= MAXQ
 layout(push_constant) uniform Push {
-  uint rows, heads, headDim, kvHeads, past, splits;
+  uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
 } p;
 
-shared float partial[128];
-shared vec4 qs[64]; // the query head: headDim <= 256, a multiple of 4
+shared vec4 qs[MAXQ * 64];      // the queries
+shared float ps[MAXQ * 128];    // the scores, then the weights of a tile
+shared float red[MAXQ * 128];   // the maximum of a tile
 
 void main()
 {
   uint t = gl_LocalInvocationID.x;
-  uint h = gl_WorkGroupID.x;
-  uint r = gl_WorkGroupID.y;
+  uint hb = p.headBlock;
+  uint h0 = gl_WorkGroupID.x * hb;
+  uint r0 = gl_WorkGroupID.y * p.rowBlock;
   uint s = gl_WorkGroupID.z;
   uint d = p.headDim;
+  uint d4 = d >> 2;
   uint kvw = p.kvHeads * d;
   uint qw = p.heads * d;
-  uint g = h / (p.heads / p.kvHeads);
-  uint total = p.past + r + 1u;
-  // the keys j0 .. j1 - 1 of this split (an empty range for a late split of
-  // an early row)
-  uint chunk = (total + p.splits - 1u) / p.splits;
-  uint j0 = min(total, s * chunk);
-  uint j1 = min(total, j0 + chunk);
-  uint sbase = (h * p.rows + r) * (p.past + p.rows);
-  uint qbase = r * qw + h * d;
+  uint g = h0 / (p.heads / p.kvHeads);
+  // query i: head h0 + i % hb, row r0 + i / hb
+  uint nq = hb * min(p.rowBlock, p.rows - r0);
   float scale = 1.0 / sqrt(float(d));
-  uint d4 = d >> 2;
-  for (uint k = t; k < d4; k += 128u)
-    qs[k] = vec4(q[qbase + 4u * k], q[qbase + 4u * k + 1u], q[qbase + 4u * k + 2u],
-      q[qbase + 4u * k + 3u]);
-  barrier();
-  // scores and their maximum
-  float m = -3.402823e38;
-  for (uint j = j0 + t; j < j1; j += 128u)
+  for (uint i = t; i < nq * d4; i += 128u)
   {
-    uint kb = (j * kvw + g * d) >> 2;
-    float sv = 0.0;
-    for (uint k = 0u; k < d4; k++)
-      sv += dot(qs[k], keys4[kb + k]);
-    sv *= scale;
-    sc[sbase + j] = sv;
-    m = max(m, sv);
+    uint qi = i / d4;
+    uint k = i - qi * d4;
+    uint qb = (r0 + qi / hb) * qw + (h0 + qi % hb) * d + 4u * k;
+    qs[qi * 64u + k] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
   }
-  partial[t] = m;
-  barrier();
-  for (uint w = 64u; w > 0u; w >>= 1)
+  // the keys j0 .. j1 - 1 of each query in this split (empty for a late
+  // split of an early row); both grow with the row, the block reads lo .. hi
+  uint j0[MAXQ], j1[MAXQ];
+  uint lo = 0xffffffffu;
+  uint hi = 0u;
+  for (uint i = 0u; i < MAXQ; i++)
   {
-    if (t < w)
-      partial[t] = max(partial[t], partial[t + w]);
+    j0[i] = 0u;
+    j1[i] = 0u;
+    if (i < nq)
+    {
+      uint total = p.past + r0 + i / hb + 1u;
+      uint chunk = (total + p.splits - 1u) / p.splits;
+      j0[i] = min(total, s * chunk);
+      j1[i] = min(total, j0[i] + chunk);
+      lo = min(lo, j0[i]);
+      hi = max(hi, j1[i]);
+    }
+  }
+  barrier();
+  float m[MAXQ], l[MAXQ], acc0[MAXQ], acc1[MAXQ];
+  for (uint i = 0u; i < MAXQ; i++)
+  {
+    m[i] = NEG;
+    l[i] = 0.0;
+    acc0[i] = 0.0;
+    acc1[i] = 0.0;
+  }
+  uint vk = g * d + t;
+  for (uint base = lo; base < hi; base += 128u)
+  {
+    // the scores of key base + t
+    uint j = base + t;
+    float sv[MAXQ];
+    for (uint i = 0u; i < MAXQ; i++)
+      sv[i] = 0.0;
+    if (j < hi)
+    {
+      uint kb = (j * kvw + g * d) >> 2;
+      for (uint k = 0u; k < d4; k++)
+      {
+        vec4 kv = keys4[kb + k];
+        for (uint i = 0u; i < MAXQ; i++)
+          if (i < nq)
+            sv[i] += dot(qs[i * 64u + k], kv);
+      }
+    }
+    for (uint i = 0u; i < MAXQ; i++)
+    {
+      float v = NEG;
+      if ((i < nq) && (j >= j0[i]) && (j < j1[i]))
+        v = sv[i] * scale;
+      ps[i * 128u + t] = v;
+      red[i * 128u + t] = v;
+    }
     barrier();
-  }
-  m = partial[0];
-  barrier();
-  // exponentials and their sum
-  float sum = 0.0;
-  for (uint j = j0 + t; j < j1; j += 128u)
-  {
-    float e = exp(sc[sbase + j] - m);
-    sc[sbase + j] = e;
-    sum += e;
-  }
-  partial[t] = sum;
-  memoryBarrierBuffer();
-  barrier();
-  for (uint w = 64u; w > 0u; w >>= 1)
-  {
-    if (t < w)
-      partial[t] += partial[t + w];
+    for (uint w = 64u; w > 0u; w >>= 1)
+    {
+      if (t < w)
+        for (uint i = 0u; i < MAXQ; i++)
+          red[i * 128u + t] = max(red[i * 128u + t], red[i * 128u + t + w]);
+      barrier();
+    }
+    // the new maxima: the sums so far rescaled, the weights of this tile
+    for (uint i = 0u; i < MAXQ; i++)
+    {
+      float mn = max(m[i], red[i * 128u]);
+      float f = exp(m[i] - mn);
+      acc0[i] *= f;
+      acc1[i] *= f;
+      l[i] *= f;
+      m[i] = mn;
+      float e = 0.0;
+      if ((i < nq) && (j >= j0[i]) && (j < j1[i]))
+        e = exp(ps[i * 128u + t] - mn);
+      ps[i * 128u + t] = e;
+    }
     barrier();
+    // the weighted values of this tile
+    uint n = min(128u, hi - base);
+    for (uint jj = 0u; jj < n; jj++)
+    {
+      uint vb = (base + jj) * kvw + vk;
+      float v0 = 0.0;
+      float v1 = 0.0;
+      if (t < d)
+        v0 = vals[vb];
+      if (t + 128u < d)
+        v1 = vals[vb + 128u];
+      for (uint i = 0u; i < MAXQ; i++)
+      {
+        float w = ps[i * 128u + jj];
+        l[i] += w;
+        acc0[i] += w * v0;
+        acc1[i] += w * v1;
+      }
+    }
+    barrier(); // ps and red are refilled by the next tile
   }
-  sum = partial[0];
-  // the weighted values, one output dimension per invocation
-  uint pbase = ((h * p.rows + r) * p.splits + s) * (d + 2u);
-  for (uint k = t; k < d; k += 128u)
-  {
-    float acc = 0.0;
-    for (uint j = j0; j < j1; j++)
-      acc += sc[sbase + j] * vals[j * kvw + g * d + k];
-    if (p.splits == 1u)
-      y[qbase + k] = acc / sum;
-    else
-      part[pbase + k] = acc;
-  }
-  if ((p.splits > 1u) && (t == 0u))
-  {
-    part[pbase + d] = m;
-    part[pbase + d + 1u] = sum;
-  }
+  for (uint i = 0u; i < MAXQ; i++)
+    if (i < nq)
+    {
+      uint h = h0 + i % hb;
+      uint r = r0 + i / hb;
+      if (p.splits == 1u)
+      {
+        uint yb = r * qw + h * d + t;
+        if (t < d)
+          y[yb] = acc0[i] / l[i];
+        if (t + 128u < d)
+          y[yb + 128u] = acc1[i] / l[i];
+      }
+      else
+      {
+        uint pb = ((h * p.rows + r) * p.splits + s) * (d + 2u);
+        if (t < d)
+          part[pb + t] = acc0[i];
+        if (t + 128u < d)
+          part[pb + t + 128u] = acc1[i];
+        if (t == 0u)
+        {
+          part[pb + d] = m[i];
+          part[pb + d + 1u] = l[i];
+        }
+      }
+    }
 }

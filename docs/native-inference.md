@@ -960,8 +960,9 @@ RTX 5090 (Treiber 616.64, Windows 11), `llm-bench … vulkan`, naive Shader:
   4e:** schnelle Shader (vektorisierte Loads, Blöcke statt Elemente, Subgroup-Reduktionen,
   Matrix-Kacheln für Prefill, Attention mit geteilten Schlüssel-Blöcken), dann `TNativeLlmClient`
   auf Wunsch über die GPU.
-- Grenzen werden vorab geprüft: Chunk-Zeilen begrenzt durch Scores-Puffer, Logits aller Zeilen
-  und die 65535 Arbeitsgruppen je Dimension; KV-Kapazität auf `maxStorageBufferRange` geklemmt.
+- Grenzen werden vorab geprüft: Chunk-Zeilen begrenzt durch die Logits aller Zeilen und die
+  65535 Arbeitsgruppen je Dimension; KV-Kapazität auf `maxStorageBufferRange` geklemmt. (Der
+  Scores-Puffer, der anfangs die Kontextlänge begrenzte, entfiel mit der Flash-Attention in 4e.)
 
 **4e, erster Teil (2026-10-16):** gemessen mit GPU-Zeitstempeln (`LAI_VULKAN_PROFILE=1` in
 `llm-bench … vulkan`: GPU-Zeit je Operation, Host-Zeit für Aufzeichnen und Warten), dann:
@@ -985,9 +986,39 @@ RTX 5090 (Treiber 616.64, Windows 11), `llm-bench … vulkan`, naive Shader:
 
 - Falle: `VkPhysicalDeviceLimits` enthält `size_t`-Felder - `timestampPeriod` liegt unter
   32 Bit bei 416, unter 64 Bit bei 424 (gefunden von Codex; Test `ProfilesBatches`).
-- Offen in 4e: Attention bei langen Kontexten (eine Arbeitsgruppe je Kopf ist zu wenig:
-  Decode fällt bei 1000 Tokens auf rund 200 Tok/s), Subgroup-Reduktionen (Vulkan 1.1),
-  Matrix-Kacheln für Prefill; dann `TNativeLlmClient` über die GPU.
+
+**4e, zweiter Teil (2026-10-16):** die Attention für lange Kontexte.
+
+- Split-K (Flash-Decoding): Beim Dekodieren gab es nur eine Arbeitsgruppe je Kopf (16 auf
+  einer Karte mit 170 SMs). Die Schlüssel einer Zeile werden jetzt in Bereiche von rund 64
+  geteilt, solange es wenige Arbeitsgruppen gibt (höchstens 2048 insgesamt);
+  `tools/vk/attnmerge.comp` führt die Teilergebnisse per Log-Sum-Exp zusammen. Decode bei 1000
+  Tokens: 204 → 341 Tok/s.
+- Flash-Attention: Eine Arbeitsgruppe rechnet bis zu 8 Anfragen, nämlich die Köpfe eines
+  KV-Kopfs (GQA) mal Zeilen. Jeder gelesene Schlüssel und Wert dient allen. Die Schlüssel laufen
+  in Kacheln zu 128 durch, ihre Scores bleiben im Shared Memory (16 KB, das garantierte
+  Minimum), der Softmax läuft online (laufendes Maximum, Summen neu skaliert). Der globale
+  Scores-Puffer und mit ihm die Kontextgrenze entfallen. Attention-Zeit beim Prefill von 4000
+  Tokens: 829 → 185 ms.
+- Lehrgeld: Die erste Kachel-Variante behielt den globalen Scores-Puffer und war langsamer
+  (1139 ms). Nicht der K/V-Verkehr begrenzte, sondern die Score-Ladevorgänge im Werte-Schritt.
+- `TQwen3Vulkan.SplitKeys` stellt die Bereichsgröße ein (0 = keine Bereiche). Der Test
+  `AttentionRangesMatchCpu` fährt beide Extreme, denn mit der Standard-Heuristik bekommt das
+  Tiny-Modell nie mehr als eine Kachel je Arbeitsgruppe. Die Gegenprobe (ohne Neuskalierung)
+  fiel erst mit diesem Test auf.
+
+| RTX 5090, Q8_0 | Prefill 200 | Decode 200 | Prefill 1000 | Decode 1000 | Prefill 4000 | Decode 4000 |
+|---|---|---|---|---|---|---|
+| 4e, Teil 1 | 8756 | 320 | 6581 | 204 | 3264* | - |
+| 4e, Teil 2 | 9087 | 323 | 8818 | 319 | 6777 | 287 |
+
+\* mit Split-K gemessen. Q4_K_M: Prefill 1000 8345, Decode 1000 299 Tok/s. Decode schwankt
+zwischen Läufen um etwa ±5 %.
+
+- Offen in 4e: Beim Prefill dominieren jetzt die Linear-Kerne (64 % bei 4000 Tokens):
+  Matrix-Kacheln mit Shared Memory, Subgroup-Reduktionen (Vulkan 1.1). Beim Dekodieren sind
+  Linear, addnorm und die festen Kosten je Dispatch der größte Teil. Danach
+  `TNativeLlmClient` über die GPU.
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.

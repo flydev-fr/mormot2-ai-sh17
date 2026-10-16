@@ -61,6 +61,10 @@ type
     // reused prefix; F32 from safetensors (relative error), Q8_0 from GGUF
     // (cosine: the CPU quantizes the activations, the device does not)
     procedure TinyQwen3MatchesCpu;
+    /// the tiny Qwen3 with the attention keys in one range per row (several
+    // tiles of 128 keys, the online softmax rescaled) and in ranges of one
+    // key (many ranges merged), against the CPU
+    procedure AttentionRangesMatchCpu;
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
     // compared at every step - skipped on a CPU implementation (lavapipe:
@@ -472,6 +476,80 @@ begin
       ref.Free;
       gpu.Free;
     end;
+  end;
+end;
+
+procedure TTestInferVulkan.AttentionRangesMatchCpu;
+const
+  PROMPT = 400; // two chunks; a row sees up to 400 keys: 4 tiles
+var
+  dir: TFileName;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  model: TQwen3Model;
+  vk: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2: TQwen3VkContext;
+  ids: TIntegerDynArray;
+  l1, l2: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  SetLength(ids, PROMPT);
+  seed := 11;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  gpu := TInferVulkanBackend.Create;
+  ref := TInferCpuBackend.Create;
+  model := nil;
+  vk := nil;
+  c1 := nil;
+  c2 := nil;
+  try
+    model := TQwen3Model.Create(dir, ref);
+    v := model.Config.VocabSize;
+    vk := TQwen3Vulkan.Create(model, gpu);
+    c1 := model.NewContext;
+    c2 := vk.NewContext;
+    SetLength(l1, PROMPT * v);
+    SetLength(l2, PROMPT * v);
+    model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+    for k := 0 to 1 do
+    begin
+      vk.SplitKeys := k; // 0: one range per row, 1: a range per key
+      c2.Reset;
+      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+      CheckUtf8(e <= 1e-4, 'SplitKeys=% prompt: relative error %', [k, e]);
+    end;
+    // decoding past the prompt, one range and many ranges in turn
+    for i := 0 to 3 do
+    begin
+      vk.SplitKeys := i and 1;
+      id := ids[i];
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+      e := RelError(pointer(l2), pointer(l1), v);
+      CheckUtf8(e <= 1e-4, 'SplitKeys=% decode step %: relative error %',
+        [i and 1, i, e]);
+    end;
+  finally
+    c2.Free;
+    c1.Free;
+    vk.Free;
+    model.Free;
+    ref.Free;
+    gpu.Free;
   end;
 end;
 

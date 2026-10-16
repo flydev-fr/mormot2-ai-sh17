@@ -151,6 +151,23 @@ Werte und Strukturen aus dem gepinnten `vulkan_core.h` (Tag in `UPSTREAM_BASE`).
 
 ---
 
+## B9 — Vulkan-Attention: Test für Kopfdimensionen über 128
+
+**Ziel:** Der Zweig für die Dimensionen `t + 128` in `tools/vk/attention.comp` (`acc1`,
+Kopfdimension 129 bis 256) läuft in einem Test.
+
+**Ausgangslage:** Das Tiny-Modell hat die Kopfdimension 32, Qwen3-0.6B hat 128. Der Zweig ist
+gebaut und von Claude und Codex gelesen, aber nie ausgeführt worden. Modelle mit der
+Kopfdimension 256 (etwa Gemma) würden ihn brauchen.
+
+**Vorgehen:** ein Tiny-Qwen3 mit `head_dim` 256 (oder 160) erzeugen wie `tests/data/infer-ref/tiny-qwen3`
+und durch `AttentionRangesMatchCpu` schicken. Gegenprobe: `acc1` nicht neu skalieren, der
+Test muss scheitern.
+
+**Fertig, wenn:** der Test grün ist und die Gegenprobe greift.
+
+---
+
 ## Nicht mehr verfolgen
 
 - SQLite-Extensions `vec0` / `lembed`: fliegen langfristig raus (nativer Store und native
