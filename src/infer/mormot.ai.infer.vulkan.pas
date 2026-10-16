@@ -695,7 +695,7 @@ type
     fMemory: TVkPhysicalDeviceMemoryProperties;
     fDeviceName: RawUtf8;
     fDeviceType, fVendorId: integer;
-    fMaxStorageRange, fMaxInvocations: cardinal;
+    fMaxStorageRange, fMaxInvocations, fMaxGroupSizeX: cardinal;
     fApiVersion, fSubgroupSize, fSubgroupStages, fSubgroupOperations: cardinal;
     fPortability: boolean;
     // a Run whose work may still be pending on the device (its wait failed):
@@ -814,6 +814,8 @@ type
     property MaxStorageRange: cardinal read fMaxStorageRange;
     /// VkPhysicalDeviceLimits.maxComputeWorkGroupInvocations (at least 128)
     property MaxInvocations: cardinal read fMaxInvocations;
+    /// VkPhysicalDeviceLimits.maxComputeWorkGroupSize[0] (at least 128)
+    property MaxGroupSizeX: cardinal read fMaxGroupSizeX;
     /// the Vulkan version in use: VK_API_VERSION_1_1 when the loader and the
     // device have it (SPIR-V 1.3 shaders, subgroup operations), else 1.0
     property ApiVersion: cardinal read fApiVersion;
@@ -1198,6 +1200,7 @@ begin
   // same for 32 and 64 bits up to the first size_t member)
   fMaxStorageRange := PCardinal(@props[296 + 28])^;
   fMaxInvocations := PCardinal(@props[296 + 232])^;
+  fMaxGroupSizeX := PCardinal(@props[296 + 236])^;
   // nanoseconds per tick; behind minMemoryMapAlignment, a size_t: the offset
   // differs between 32 and 64 bits (vulkan_core.h)
   fTimestampPeriod := PSingle(@props[296 + {$ifdef CPU64} 424 {$else} 416 {$endif}])^;

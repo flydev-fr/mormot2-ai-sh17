@@ -39,7 +39,7 @@ Number of assertions per suite, every one passing; each row with numbers ran bet
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
 | Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2570 ⁷ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2618 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
@@ -574,12 +574,12 @@ Next, in this order:
    and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
    decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md).
 2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
-   at about 9800 and decodes at about 360 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
+   at about 13600 and decodes at about 365 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
    flash attention still about 330 tokens/s at 4000 tokens of context; `TNativeLlmClient`
    decodes there with `client.Device := TQwen3Vulkan.Create(client.Model, gpu)`. On a Mac
    the same backend runs through MoltenVK (Homebrew `molten-vk` and `vulkan-loader`); on
-   the M2 Pro it decodes faster than the NEON CPU path (90 against 73 tokens/s at 200
-   tokens of context), while prefill still trails it below about 4000 tokens. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
+   the M2 Pro it beats the NEON CPU path (prefill 1125 against 563, decode 90 against
+   73 tokens/s at 200 tokens of context). Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

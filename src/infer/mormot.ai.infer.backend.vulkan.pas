@@ -45,8 +45,8 @@ type
   TInferVulkanBackend = class(TInferCpuFastBackend)
   protected
     fVk: TInferVulkan;
-    fLinear, fLinear8, fLinear8Sg, fMatvec8, fMatvec8Sg: TInferVkPipeline;
-    fUseSubgroups, fUseMatvec: boolean;
+    fLinear, fLinear8, fLinear8Sg, fMatvec8, fMatvec8Sg, fGemm8: TInferVkPipeline;
+    fUseSubgroups, fUseMatvec, fUseGemm: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -107,6 +107,9 @@ type
     // Qwen3-0.6B Q8_0 decodes at 91 instead of 66 tokens/s, while an RTX 5090
     // decodes 5 % slower with it (backlog B8)
     property UseMatvec: boolean read fUseMatvec write fUseMatvec;
+    /// many rows (prefill) through the tiled gemm8.comp instead of linear8.comp
+    // - by default where the device runs work groups of 256 invocations
+    property UseGemm: boolean read fUseGemm write fUseGemm;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
@@ -121,6 +124,9 @@ const
   // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K; 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
     0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4);
+
+  /// from this many rows on a Linear runs the tiled gemm8.comp (UseGemm)
+  GEMM_ROWS = 16;
 
 type
   /// the push constants of tools/vk/linear.comp
@@ -144,6 +150,14 @@ begin
   fMatvec8 := TInferVkPipeline.Create(fVk, @SPV_MATVEC8, length(SPV_MATVEC8), 4,
     SizeOf(TLinearPush));
   fMatvec8.Name := 'linear';
+  // 256 invocations per work group: more than Vulkan guarantees (128)
+  if (fVk.MaxInvocations >= 256) and (fVk.MaxGroupSizeX >= 256) then
+  begin
+    fGemm8 := TInferVkPipeline.Create(fVk, @SPV_GEMM8, length(SPV_GEMM8), 4,
+      SizeOf(TLinearPush));
+    fGemm8.Name := 'linear';
+    fUseGemm := true;
+  end;
   if (fVk.ApiVersion >= VK_API_VERSION_1_1) and
      (fVk.SubgroupStages and VK_SHADER_STAGE_COMPUTE_BIT <> 0) and
      (fVk.SubgroupOperations and (VK_SUBGROUP_FEATURE_BASIC_BIT or
@@ -173,6 +187,7 @@ begin
     FreeAndNil(fX);
     FreeAndNil(fY);
     FreeAndNil(fNoBias);
+    FreeAndNil(fGemm8);
     FreeAndNil(fMatvec8Sg);
     FreeAndNil(fMatvec8);
     FreeAndNil(fLinear8Sg);
@@ -238,6 +253,16 @@ begin
       result := fMatvec8;
     n := (aOut + 3) shr 2; // one feature per 32 invocations
     aY := 1;
+  end
+  else if fUseGemm and (fGemm8 <> nil) and (aRows >= GEMM_ROWS) and
+          (aIn and 31 = 0) and
+          ((aOut + 63) shr 6 <= 65535) then
+  begin
+    // 64 rows x 64 features per work group
+    result := fGemm8;
+    aX := (aOut + 63) shr 6;
+    aY := (aRows + 63) shr 6;
+    exit;
   end
   else if (aType <> idtF32) or (aIn and 7 = 0) then
   begin

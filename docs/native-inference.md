@@ -966,6 +966,31 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
       voreingestellt.
     - `LinearMatchesReference` prüft auf jedem Gerät beide Kernel. Die Gegenprobe (Skala aus
       der falschen Worthälfte) lässt den Test scheitern.
+  - *Prefill-Kernel `gemm8.comp` (2026-10-16):* ein gekachelter Kernel ab 16 Tokenzeilen
+    (`GEMM_ROWS`), für alle Gewichtstypen von `linear8`.
+    - *Kachel:* Eine Workgroup aus 256 Invocations rechnet 64 Zeilen × 64 Ausgaben.
+    - *Shared Memory:* Je Schritt von 32 Eingaben liegen die Aktivierungen und die
+      dequantisierten Gewichte dort als `vec4`, zusammen 16 KB.
+    - *Rechnung:* Jede Invocation addiert daraus 4 Zeilen × 4 Ausgaben. Ein geladener Wert
+      dient so 64 Produkten statt 8.
+    - *Sonde:* Der Prefill-Linear steigt auf dem M2 Pro von rund 400 auf 1300 GFLOPS.
+    - *Qwen3-0.6B Q8_0, Prefill (Tokens/s):*
+
+      | Gerät | 200 | 1000 | 4000 |
+      |---|---|---|---|
+      | M2 Pro vorher | 303 | 272 | 193 |
+      | M2 Pro mit `gemm8` | 1125 | 889 | 381 |
+      | M2 Pro CPU (NEON) | 563 | 409 | 145 |
+      | RTX 5090 vorher | 10 000 | 9 500 | 7 150 |
+      | RTX 5090 mit `gemm8` | 13 600 | 14 550 | 9 840 |
+
+      Der Decode bleibt unverändert.
+    - `TInferVulkanBackend.UseGemm` ist überall voreingestellt, wo das Gerät Workgroups
+      mit 256 Invocations erlaubt. Vulkan garantiert nur 128, ohne diese Möglichkeit bleibt es
+      bei `linear8` (Codex-Review).
+    - `LinearMatchesReference` prüft `gemm8` und `linear8` für viele Zeilen auf jedem
+      Gerät, mit einer Form über mehrere Kacheln in beiden Richtungen (70 × 512 × 130).
+    - Die Gegenprobe (falsche Zeile im Akkumulator) lässt 30 Assertions scheitern.
   - *Zweiter Schritt, nur wenn MoltenVK spürbar bremst:* ein eigenes Metal-Backend. Das wäre
     ein Objective-C-Laufzeit-Aufruf über `objc_msgSend` (kein Xcode-Projekt, keine
     mitgelieferte Bibliothek), mit Shadern in MSL statt GLSL.
@@ -1202,7 +1227,7 @@ Eine eigene Spur daneben ist die Verteilung großer Jobs auf ungenutzte Rechner:
 |---|---|---|
 | WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, Inferenz 1215, alle Demos) |
 | WSL2 Linux x86_64 auf dem RTX-Rechner (Ubuntu 24.04) | FPC 3.2.2 (wie Docker) | grün aus einem sauberen `git archive`: MCP 1257, LLM 656, Inferenz 828 mit Korpus-Gate |
-| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. Am 2026-10-16 Inferenz 2570 einschließlich der Vulkan-Suite auf der M2-Pro-GPU über MoltenVK (Homebrew `molten-vk` 1.4.2, `vulkan-loader` 1.4.363.0, `LAI_REQUIRE_VULKAN=1`). |
+| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. Am 2026-10-16 Inferenz 2618 einschließlich der Vulkan-Suite auf der M2-Pro-GPU über MoltenVK (Homebrew `molten-vk` 1.4.2, `vulkan-loader` 1.4.363.0, `LAI_REQUIRE_VULKAN=1`). |
 | Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
 | Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659, Inferenz 1205) |
 | Windows x64 unter Prism | FPC 3.2.2 | nur Kompatibilitätsprobe, nicht für Leistungsaussagen |

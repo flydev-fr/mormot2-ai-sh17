@@ -159,8 +159,10 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
 1. **Decode-Matvec, erledigt 2026-10-16:** `matvec8.comp` auf Apple-GPUs. Der Decode steigt
    bei 200 Tokens von 65,8 auf 90,2 Tokens/s, die CPU schafft 73. Offen bleiben die
    K-Quants (Q4_K_M) im Decode: Sie laufen weiter über `linear8`.
-2. **Prefill-GEMM:** gekachelter Kernel mit Kacheln von `x` und den dequantisierten
-   Gewichten im Shared Memory, etwa 64 × 64 Ausgaben pro Workgroup.
+2. **Prefill-GEMM, erledigt 2026-10-16:** `gemm8.comp` auf allen Geräten. Der Prefill steigt
+   bei 200 Tokens auf dem M2 Pro von 303 auf 1125 Tokens/s, auf der RTX 5090 von 10 000
+   auf 13 600. Offen bleibt der Prefill mit langem Kontext auf Apple: 381 Tokens/s bei
+   4000 Tokens, dort dominiert wohl die Attention (nicht gemessen).
 3. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;

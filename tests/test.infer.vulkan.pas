@@ -274,10 +274,12 @@ end;
 
 procedure TTestInferVulkan.LinearMatchesReference;
 const
-  // rows, in, out: one row, partial work, many rows, odd outputs, and more
-  // outputs than one dispatch dimension holds
-  SHAPES: array[0..4, 0..2] of integer = (
-    (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001));
+  // rows, in, out: one row, partial work, many rows, odd outputs, more
+  // outputs than one dispatch dimension holds, and several gemm8.comp tiles
+  // of rows and features
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
+    (70, 512, 130));
   TYPES: array[0..3] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K);
 var
   gpu: TInferVulkanBackend;
@@ -291,7 +293,7 @@ var
   b: PSingleArray;
   e: double;
   calls: Int64;
-  matvec: boolean;
+  matvec, gemm: boolean;
 begin
   if not HasDevice then
     exit;
@@ -304,12 +306,15 @@ begin
       AddConsole('Vulkan subgroups: % invocations', [gpu.Vulkan.SubgroupSize])
     else
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
-    // and matvec8.comp for one row of Q8_0 weights
+    // and matvec8.comp for one row of Q8_0 weights, gemm8.comp or
+    // linear8.comp for many rows
     matvec := gpu.UseMatvec;
+    gemm := gpu.UseGemm;
     for s := ord(not gpu.SubgroupLinear) * 2 to 3 do
     begin
       gpu.UseSubgroups := s < 2;
       gpu.UseMatvec := odd(s);
+      gpu.UseGemm := not odd(s);
       for t := 0 to high(TYPES) do
       begin
         kind := TYPES[t];
@@ -365,6 +370,7 @@ begin
     end;
     gpu.UseSubgroups := gpu.SubgroupLinear;
     gpu.UseMatvec := matvec;
+    gpu.UseGemm := gemm;
     // F32 with inputs no multiple of 8: linear.comp instead of linear8.comp
     Fill(x, 3 * 36, 61, 2);
     Fill(wf, 5 * 36, 62, 0.5);
