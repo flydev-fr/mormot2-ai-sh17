@@ -23,7 +23,8 @@ uses
   test.infer.fast,
   test.infer.bpe,
   test.infer.qwen3,
-  test.infer.llm;
+  test.infer.llm,
+  test.infer.vulkan;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -42,7 +43,8 @@ begin
     TTestInferFast,
     TTestInferBpe,
     TTestInferQwen3,
-    TTestInferLlmNative
+    TTestInferLlmNative,
+    TTestInferVulkan
   ]);
 end;
 

@@ -870,21 +870,57 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   Q4_K_M 455 / 78 Tokens/s (Prefill / Decode), 1000 Tokens: Q8_0 540 / 44, Q4_K_M 369 / 47.
   `llm-bench` schaltet unter Windows die EcoQoS-Drossel ab (wie `embed-bench`).
 
-- Offen in Phase 3: K-Quant-Prefill (mehrere Zeilen je Kernel), Q4_0-Kernel (s. o.).
+- Offen in Phase 3, als agentenfertige Einträge in [backlog.md](backlog.md): K-Quant-Prefill
+  (B1, ein Versuch ohne eigenen Kernel war langsamer), Q4_0-Kernel (B2).
 
-### Phase 4 — GPU
+### Phase 4 — GPU: Vulkan zuerst, CUDA danach
 
-- CUDA über die Driver API, dynamisch geladen.
-- Kernel als eingebettetes PTX (Vorlagen: calm, llama.cpp, beide MIT).
-- Reihenfolge: MatMul → Norm/RoPE/Softmax → Attention.
-- Optional Vulkan Compute für herstellerübergreifenden Einsatz.
-- Zielhardware: der RTX-Rechner, Windows 11 x64 mit RTX 5090 (32 GB VRAM, ca. 1,8 TB/s;
-  mit 4 Bit Modelle bis ca. 30B).
-- Zur Laufzeit genügt der Treiber (`nvcuda.dll` bzw. `libcuda.so`). Das PTX entsteht beim
-  Bauen und wird als Ressource eingecheckt. Dafür braucht der Bau-Rechner das
-  CUDA-Toolkit (`nvcc`), das heute noch fehlt.
+Entscheidung 2026-10-15: **Vulkan zuerst** (herstellerübergreifend: NVIDIA, AMD, Intel,
+Qualcomm Adreno; unter Linux zusätzlich lavapipe als CPU-Treiber für Tests), **CUDA bleibt
+zweites Backend** (Backlog B3). Für beide gilt: **keine mitgelieferten DLLs** — zur
+Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so.1`).
 
-**Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU.
+- **Bindung:** eigene schlanke Unit nur mit den benötigten Typen und Funktionen
+  (Instanz, Gerät, Queue, Puffer, Speicher, Shader-Modul, Compute-Pipeline,
+  Descriptor-Sets, Command-Buffer, Fence), geschrieben nach den Khronos-Headern
+  (`vulkan_core.h` / `vk.xml`, Lizenz „Apache-2.0 OR MIT", genutzt wird der MIT-Zweig).
+  PasVulkan (`src/Vulkan.pas`) dient nur zum Nachschlagen. Grund für die eigene Unit:
+  Delphi 7 bis 13 und FPC, kein 40 000-Zeilen-Generat im Repo.
+- **Shader:** GLSL-Compute-Shader unter `tools/vk/`, beim Bauen mit `glslangValidator`
+  nach SPIR-V übersetzt und als Pascal-Konstanten eingecheckt (generierte `.inc`). Der
+  Compiler wird nur zum Erzeugen gebraucht, nicht zur Laufzeit und nicht für den Build.
+- **Tests:** lavapipe unter WSL (Korrektheit ohne GPU, läuft in jeder FPC-Suite mit), RTX
+  5090 auf dem RTX-Rechner (Leistung); ohne Vulkan-Loader überspringen die Tests.
+
+Stufen:
+
+- **4a** Loader, Instanz, Gerätewahl (diskret vor integriert vor CPU), Puffer, eine
+  Compute-Pipeline; Test: ein trivialer Shader gegen die CPU.
+- **4b** `Linear` auf der GPU (F32, Q8_0, Q4_K): Gewichte einmal hochgeladen und
+  gecacht, Aktivierungen je Aufruf hin und zurück — als Differenztest gegen die
+  Referenz, noch kein Tempogewinn beim Dekodieren (Übertragung und Fence je Aufruf).
+- **4c** Norm, RoPE, SwiGLU, Softmax, Attention mit KV-Cache auf der GPU.
+- **4d** der ganze Qwen3-Forward auf der GPU, Tensoren bleiben dort; nur Tokens hinein,
+  Logits heraus. Erst hier zählt die Leistung.
+
+**4a erledigt (2026-10-16):** `src/infer/mormot.ai.infer.vulkan.pas` (Bindung, Gerätewahl,
+Puffer in host-sichtbarem Speicher, Compute-Pipeline, `Run` mit Fence), Shader-Werkzeug
+`tools/vk/build-shaders.sh` (glslangValidator, ohne Root installierbar per
+`apt-get download glslang-tools` + `dpkg -x`), Test `TTestInferVulkan`: Summe auf dem
+Gerät bitgleich zur CPU. Grün auf lavapipe (WSL, FPC 3.2.4) und auf der RTX 5090 mit
+Delphi 13 (Win64) und Delphi 7 (Win32). Quellversionen in `UPSTREAM_BASE`.
+
+- Falle: FPC und Delphi schalten Gleitkomma-Ausnahmen scharf; die Threads, die ein
+  Treiber startet (lavapipe/LLVM), erben das, und ein Trap darin legt den Prozess still
+  (Futex-Hänger in `vkCreateDevice`). Jeder Einstieg in den Treiber maskiert deshalb alle
+  Ausnahmen und stellt sie danach wieder her; unter Delphi Win32 zusätzlich MXCSR.
+- Struktur-Offsets in `VkPhysicalDeviceLimits` sind aus dem gepinnten `vulkan_core.h`
+  berechnet (nicht aus dem Gedächtnis); 32-Bit-Layout auf der RTX 5090 mit Delphi 7 belegt.
+- `LAI_VULKAN_DEVICE=<Index>` wählt ein Gerät, `LAI_REQUIRE_VULKAN=1` macht das SKIP
+  ohne Gerät zum Fehler.
+
+**Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
+Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 
 ### Danach — nach Bedarf
 

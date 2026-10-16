@@ -30,6 +30,13 @@ Model Context Protocol — specification
   (2026-09-22; first copy db4bfcff, 2026-07-28). https://modelcontextprotocol.io
   https://github.com/modelcontextprotocol/modelcontextprotocol
 
+Vulkan-Headers  (Khronos Group)  (FOLLOWED: the compute subset of vulkan_core.h)
+  src/infer/mormot.ai.infer.vulkan.pas declares the Vulkan types and entry points
+  it uses after include/vulkan/vulkan_core.h, tag vulkan-sdk-1.4.363.0 (commit
+  6802bb4733b63ed5efd3adb308a6c885ef180ea1), licensed "Apache-2.0 OR MIT"; the
+  MIT branch applies. Copyright 2015-2026 The Khronos Group Inc.
+  https://github.com/KhronosGroup/Vulkan-Headers
+
 llama.cpp  (ggml-org)  (PORTED: Unigram tokenizer)
   src/infer/mormot.ai.infer.tokenizer.ugm.pas is ported from src/llama-vocab.cpp
   (llm_tokenizer_ugm) at commit 6868a52cb337450658006ad2f9281c2eb63f1666

@@ -24,7 +24,10 @@ param(
   [string]$Suite = 'all',
   # Pfad zu dcc64.exe; gesetzt = ohne Versionspruefung (bewusste Gegenprobe)
   [string]$Dcc = $env:DCC64,
-  [switch]$ShowAll
+  [switch]$ShowAll,
+  # nur uebersetzen, nicht laufen lassen (z. B. um das Binary auf einem
+  # anderen Rechner zu testen; unter x64-Emulation dauert die Suite Stunden)
+  [switch]$BuildOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,6 +110,11 @@ foreach ($s in $suites) {
     Write-Host "FAIL(compile): $prog (rc=$rc) - Details: $buildLog" -ForegroundColor Red
     Get-Content $buildLog -Tail 15
     $failed++
+    continue
+  }
+
+  if ($BuildOnly) {
+    Write-Host "BUILT: $prog -> $out"
     continue
   }
 

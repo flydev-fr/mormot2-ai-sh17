@@ -55,8 +55,8 @@ never a build input.
 ## Runtime foundation
 
   mORMot 2 — shared/delphi/libs/_git_Synopse2
-  Last tested against: b4a210033da8f9e5f66c3719aedf1ff1b2eec2c1
-                       (2.4-stable-4208, 2026-10-14; the consumer's submodule pointer)
+  Last tested against: 3a4443f95bf880537f9420d93ae471f14b487c7f
+                       (2.4-stable-4278, 2026-10-15; the consumer's submodule pointer)
   Rule: whoever bumps mORMot2 in the consumer and runs the suites here updates this line.
 
 ## Native inference engine: templates (code ported into src/infer/)
@@ -87,6 +87,37 @@ never a build input.
            (SDOT lane sums scaled per block in float lanes, FCVTNS activation
            quantization) -> src/infer/mormot.ai.infer.kernels.pas. The erf/erfc
            polynomials are our own fits (tools/infer-ref/fit_erf.py).
+  Followed (phase 3, written anew - no code taken): the block formats Q4_0, Q4_K,
+           Q6_K and Q8_K, quantize_row_q4_0_ref / quantize_row_q8_0_ref (roundf),
+           the K-quant scale/min unpacking and the integer arithmetic of
+           ggml_vec_dot_q4_K_q8_K / ggml_vec_dot_q6_K_q8_K (NEON and AVX2 paths)
+           -> mormot.ai.infer.tensor / backend.cpu / kernels. Checked byte- and
+           bit-exactly against the same lembed oracle build (libggml-*.so sha256
+           in the next section; datasets q4 and qk), not against a source commit.
+
+## GPU: Vulkan (phase 4)
+
+  Project: KhronosGroup/Vulkan-Headers
+  URL:     https://github.com/KhronosGroup/Vulkan-Headers
+  Tag:     vulkan-sdk-1.4.363.0  (VK_HEADER_VERSION 363)
+  Commit:  6802bb4733b63ed5efd3adb308a6c885ef180ea1
+  Date:    2026-09-18
+  License: "Apache-2.0 OR MIT" (SPDX) - the MIT branch applies
+  Followed (written anew - no code taken): the Vulkan 1.0 core types, constants
+           and entry points that compute needs, from include/vulkan/vulkan_core.h
+           -> src/infer/mormot.ai.infer.vulkan.pas. Update: diff vulkan_core.h
+           between this tag and a new one for the structures used there.
+
+  Project: BeRo1985/pasvulkan  (src/Vulkan.pas, the Pascal headers)
+  URL:     https://github.com/BeRo1985/pasvulkan
+  Commit:  1467e9b27e0244b94162da630cc3c584bfb74e4b  (VK_HEADER_VERSION 346)
+  Date:    2026-10-08
+  License: MIT-style (Khronos Group / Benjamin Rosseaux)
+  Use:     looked up only (Pascal spelling of the C declarations), nothing copied.
+
+  Shader compiler (build time only, output checked in): glslangValidator 15.1.0
+           (Ubuntu 24.04 package glslang-tools 15.1.0-2~ubuntu0.24.04.2), driven by
+           tools/vk/build-shaders.sh -> src/infer/mormot.ai.infer.vulkan.spv.inc.
 
 ## Native inference engine: reference data and models
 
@@ -114,5 +145,23 @@ never a build input.
     vendor/models/bge-m3-q8_0.gguf (gitignored)
                      aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173
     Datasets from it: q8, tiny-gguf, lembed-tokens.
+  Model:     Qwen/Qwen3-0.6B (Apache-2.0, weights only) - https://huggingface.co/Qwen/Qwen3-0.6B
+  Revision:  c1899de289a04d12100db370d81485cdf75e47ca
+  Files (sha256):
+    model.safetensors        f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b
+    Datasets from it: qwen3, qwen3-chat, qwen3-tokens (tiny-qwen3* are generated).
+
+  Model:     Qwen/Qwen3-0.6B-GGUF, Qwen3-0.6B-Q8_0.gguf (Apache-2.0)
+  Revision:  23749fefcc72300e3a2ad315e1317431b06b590a
+  File:      vendor/models/qwen3-0.6b-q8_0.gguf (gitignored)
+             9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
+             (made from other weights than the BF16 revision above: tests compare
+             per-matrix cosine, see docs/native-inference.md)
+
+  Model:     unsloth/Qwen3-0.6B-GGUF, Qwen3-0.6B-Q4_K_M.gguf (Apache-2.0)
+  Revision:  50968a4468ef4233ed78cd7c3de230dd1d61a56b
+  File:      vendor/models/qwen3-0.6b-q4_k_m.gguf (gitignored)
+             ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a
+
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.
