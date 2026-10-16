@@ -1,0 +1,202 @@
+// LandrixAI - causal attention for many token rows (prefill): a tiled form of
+// attention.comp with the same bindings, push constants and output (y, or the
+// part[] ranges of attnmerge.comp) - backlog B8
+// - headDim a multiple of 4 up to 128 (the vec4 slots of a row: 32); a
+//   work group of 256 holds up to QN = 32 queries -
+//   headBlock heads of one KV head times rowBlock rows - in shared memory and
+//   runs over the keys in tiles of KT = 16: the tile of keys, then of values,
+//   is loaded coalesced into shared memory once for all queries
+//   (attention.comp serves 8 queries per read, each invocation reading a key
+//   of its own)
+// - per tile: invocation t scores query t / 8 against keys 2 (t % 8) and
+//   2 (t % 8) + 1; invocations 0 .. 31 keep the online softmax of their query
+//   (running maximum and sum, the factor of the tile); then invocation t adds
+//   the weighted values to dimensions 16 (t % 8) .. 16 (t % 8) + 15 of query
+//   t / 8
+// - shared memory: 26.4 KB, more than the 16 KB every device offers
+//   (TQwen3Vulkan checks the limit and keeps attention.comp otherwise)
+// - TQwen3Vulkan takes it on Apple GPUs only (UseFlash): an M2 Pro prefills
+//   4000 tokens 1.9 times as fast with it, an RTX 5090 1.7 times as slow
+#version 450
+
+#define QN 32
+#define KT 16
+#define NEG -3.402823e38
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufQ { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
+layout(std430, binding = 2) readonly buffer BufV { vec4 vals4[]; };
+layout(std430, binding = 3) writeonly buffer BufY { vec4 y4[]; };
+// [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
+layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
+
+// headBlock divides heads / kvHeads, headBlock * rowBlock <= QN
+layout(push_constant) uniform Push {
+  uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
+} p;
+
+shared vec4 qs[QN * 32];   // the queries, 32 vec4 each
+shared vec4 kv[KT * 32];   // a tile of keys, then of values
+shared float ps[QN * KT];  // the scores, then the weights of a tile
+shared float ms[QN];       // running maximum
+shared float ls[QN];       // running sum of exp
+shared float fs[QN];       // rescale factor of the tile
+
+uint nq;
+
+// the keys [j0, j1) of query i in split s, as attention.comp
+uvec2 keyRange(uint i, uint s)
+{
+  if (i >= nq)
+    return uvec2(0u);
+  uint total = p.past + gl_WorkGroupID.y * p.rowBlock + i / p.headBlock + 1u;
+  uint chunk = (total + p.splits - 1u) / p.splits;
+  uint j0 = min(total, s * chunk);
+  return uvec2(j0, min(total, j0 + chunk));
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint hb = p.headBlock;
+  uint h0 = gl_WorkGroupID.x * hb;
+  uint r0 = gl_WorkGroupID.y * p.rowBlock;
+  uint s = gl_WorkGroupID.z;
+  uint d4 = p.headDim >> 2;
+  uint kvw4 = p.kvHeads * d4;
+  uint qw4 = p.heads * d4;
+  uint g = h0 / (p.heads / p.kvHeads);
+  nq = hb * min(p.rowBlock, p.rows - r0);
+  float scale = 1.0 / sqrt(float(p.headDim));
+  // query i: head h0 + i % hb, row r0 + i / hb
+  for (uint i = t; i < QN * 32u; i += 256u)
+  {
+    uint qi = i >> 5;
+    uint k = i & 31u;
+    vec4 v = vec4(0.0);
+    if ((qi < nq) && (k < d4))
+      v = q4[(r0 + qi / hb) * qw4 + (h0 + qi % hb) * d4 + k] * scale;
+    qs[i] = v;
+  }
+  if (t < QN)
+  {
+    ms[t] = NEG;
+    ls[t] = 0.0;
+  }
+  // the keys read by the block: the ranges grow with the row
+  uint lo = keyRange(0u, s).x;
+  uint hi = keyRange(nq - 1u, s).y;
+  // scoring: query sq, keys sk and sk + 1 of the tile
+  uint sq = t >> 3;
+  uint sk = (t & 7u) * 2u;
+  uvec2 sr = keyRange(sq, s);
+  // values: query sq, vec4 sd .. sd + 3 of its 32
+  uint sd = (t & 7u) * 4u;
+  vec4 acc[4];
+  for (uint c = 0u; c < 4u; c++)
+    acc[c] = vec4(0.0);
+  barrier();
+  for (uint base = lo; base < hi; base += KT)
+  {
+    // the keys of the tile, zero beyond hi
+    for (uint i = t; i < KT * 32u; i += 256u)
+    {
+      uint j = base + (i >> 5);
+      uint k = i & 31u;
+      vec4 v = vec4(0.0);
+      if ((j < hi) && (k < d4))
+        v = keys4[j * kvw4 + g * d4 + k];
+      kv[i] = v;
+    }
+    barrier();
+    for (uint e = 0u; e < 2u; e++)
+    {
+      uint jj = sk + e;
+      uint j = base + jj;
+      float v = NEG;
+      if ((j >= sr.x) && (j < sr.y))
+      {
+        float d = 0.0;
+        for (uint k = 0u; k < d4; k++)
+          d += dot(qs[sq * 32u + k], kv[jj * 32u + k]);
+        v = d;
+      }
+      ps[sq * KT + jj] = v;
+    }
+    barrier();
+    // the online softmax of query t; then everyone loads the values
+    if (t < QN)
+    {
+      float mt = NEG;
+      for (uint jj = 0u; jj < KT; jj++)
+        mt = max(mt, ps[t * KT + jj]);
+      float mn = max(ms[t], mt);
+      float f = exp(ms[t] - mn);
+      float sum = 0.0;
+      for (uint jj = 0u; jj < KT; jj++)
+      {
+        float v = ps[t * KT + jj];
+        float w = 0.0;
+        if (v > NEG)
+          w = exp(v - mn);
+        ps[t * KT + jj] = w;
+        sum += w;
+      }
+      ls[t] = ls[t] * f + sum;
+      ms[t] = mn;
+      fs[t] = f;
+    }
+    for (uint i = t; i < KT * 32u; i += 256u)
+    {
+      uint j = base + (i >> 5);
+      uint k = i & 31u;
+      vec4 v = vec4(0.0);
+      if ((j < hi) && (k < d4))
+        v = vals4[j * kvw4 + g * d4 + k];
+      kv[i] = v;
+    }
+    barrier();
+    float f = fs[sq];
+    for (uint c = 0u; c < 4u; c++)
+      acc[c] *= f;
+    for (uint jj = 0u; jj < KT; jj++)
+    {
+      float w = ps[sq * KT + jj];
+      for (uint c = 0u; c < 4u; c++)
+        acc[c] += w * kv[jj * 32u + sd + c];
+    }
+    barrier(); // kv and ps are refilled by the next tile
+  }
+  if (sq < nq)
+  {
+    uint h = h0 + sq % hb;
+    uint r = r0 + sq / hb;
+    if (p.splits == 1u)
+    {
+      float l = ls[sq];
+      uint yb = r * qw4 + h * d4 + sd;
+      for (uint c = 0u; c < 4u; c++)
+        if (sd + c < d4)
+          y4[yb + c] = acc[c] / l;
+    }
+    else
+    {
+      uint pb = ((h * p.rows + r) * p.splits + s) * (p.headDim + 2u);
+      for (uint c = 0u; c < 4u; c++)
+        if (sd + c < d4)
+        {
+          part[pb + (sd + c) * 4u] = acc[c].x;
+          part[pb + (sd + c) * 4u + 1u] = acc[c].y;
+          part[pb + (sd + c) * 4u + 2u] = acc[c].z;
+          part[pb + (sd + c) * 4u + 3u] = acc[c].w;
+        }
+      if ((t & 7u) == 0u)
+      {
+        part[pb + p.headDim] = ms[sq];
+        part[pb + p.headDim + 1u] = ls[sq];
+      }
+    }
+  }
+}

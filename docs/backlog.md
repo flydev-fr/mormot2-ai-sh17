@@ -161,9 +161,12 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
    K-Quants (Q4_K_M) im Decode: Sie laufen weiter über `linear8`.
 2. **Prefill-GEMM, erledigt 2026-10-16:** `gemm8.comp` auf allen Geräten. Der Prefill steigt
    bei 200 Tokens auf dem M2 Pro von 303 auf 1125 Tokens/s, auf der RTX 5090 von 10 000
-   auf 13 600. Offen bleibt der Prefill mit langem Kontext auf Apple: 381 Tokens/s bei
-   4000 Tokens, dort dominiert wohl die Attention (nicht gemessen).
-3. Erst danach über ein Metal-Backend entscheiden.
+   auf 13 600.
+3. **Prefill-Attention, erledigt 2026-10-16:** `flash.comp` auf Apple-GPUs. Der Prefill bei 4000
+   Tokens steigt von 381 auf 708 Tokens/s; auf der RTX ist der Kernel langsamer.
+4. **Offen:** die Decode-Attention bei langem Kontext. Der Decode fällt auf dem M2 Pro von
+   90 Tokens/s (200 Tokens Kontext) auf 40 (4000). `attention.comp` erreicht dort 63 GFLOPS.
+5. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;
 Vorgehen wie in `docs/native-inference.md` (Plattformtabelle).

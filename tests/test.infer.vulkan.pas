@@ -535,6 +535,7 @@ var
   seed: cardinal;
   e: double;
   id: integer;
+  flash: boolean;
 begin
   if not HasDevice then
     exit;
@@ -563,14 +564,19 @@ begin
     SetLength(l1, PROMPT * v);
     SetLength(l2, PROMPT * v);
     model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
-    for k := 0 to 1 do
+    // flash.comp (where the device runs it) and attention.comp for the prompt
+    flash := vk.UseFlash;
+    for k := 0 to 3 do
     begin
-      vk.SplitKeys := k; // 0: one range per row, 1: a range per key
+      vk.SplitKeys := k and 1; // 0: one range per row, 1: a range per key
+      vk.UseFlash := vk.HasFlash and (k < 2);
       c2.Reset;
       vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
       e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-      CheckUtf8(e <= 1e-4, 'SplitKeys=% prompt: relative error %', [k, e]);
+      CheckUtf8(e <= 1e-4, 'SplitKeys=% UseFlash=% prompt: relative error %',
+        [k and 1, vk.UseFlash, e]);
     end;
+    vk.UseFlash := flash;
     // decoding past the prompt, one range and many ranges in turn
     for i := 0 to 3 do
     begin

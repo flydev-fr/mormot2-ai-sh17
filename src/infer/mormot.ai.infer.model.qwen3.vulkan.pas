@@ -70,7 +70,9 @@ type
   protected
     fBackend: TInferVulkanBackend;
     fVk: TInferVulkan;
-    fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
+    fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm,
+      fFlash: TInferVkPipeline;
+    fUseFlash: boolean;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
     procedure UploadWeights;
@@ -111,6 +113,16 @@ type
     // and tuning, the default (64) suits a discrete GPU
     property SplitKeys: integer
       read fSplitKeys write fSplitKeys;
+    /// the attention of FLASH_ROWS token rows or more (prefill) through the
+    // tiled flash.comp instead of attention.comp - possible with a head
+    // dimension up to 128, work groups of 256 and 27 KB of shared memory, by
+    // default on an Apple GPU (VendorId $106B) only: there Qwen3-0.6B Q8_0
+    // prefills 4000 tokens at 708 instead of 381 tokens/s, while an RTX 5090
+    // drops from 9880 to 5840 with it (backlog B8)
+    property UseFlash: boolean
+      read fUseFlash write fUseFlash;
+    /// true when the device runs flash.comp (UseFlash can take it)
+    function HasFlash: boolean;
   end;
 
 
@@ -147,6 +159,13 @@ const
   // SPLIT_GROUPS work groups in all (then attnmerge.comp combines them)
   SPLIT_KEYS = 64;
   SPLIT_GROUPS = 2048;
+  /// the queries of one flash.comp work group at most (QN there)
+  FLASH_QUERIES = 32;
+  /// from this many token rows on the attention runs flash.comp (UseFlash)
+  FLASH_ROWS = 16;
+  /// the shared memory of flash.comp in bytes: queries, a tile of keys or
+  // values, the scores and three floats per query
+  FLASH_SHARED = 32 * 32 * 16 + 16 * 32 * 16 + 32 * 16 * 4 + 3 * 32 * 4;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
 procedure NeedDevice(aVk: TInferVulkan; var aBuffer: TInferVkBuffer;
@@ -225,6 +244,14 @@ begin
     5, SizeOf(TAttentionPush));
   fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 2,
     SizeOf(TMergePush));
+  if (aModel.Config.HeadDim <= 128) and (fVk.MaxInvocations >= 256) and
+     (fVk.MaxGroupSizeX >= 256) and (fVk.MaxSharedMemory >= FLASH_SHARED) then
+  begin
+    fFlash := TInferVkPipeline.Create(fVk, @SPV_FLASH, length(SPV_FLASH), 5,
+      SizeOf(TAttentionPush));
+    fFlash.Name := 'flash';
+    fUseFlash := fVk.VendorId = $106B; // Apple
+  end;
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
   fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
     SizeOf(TQkRopePush));
@@ -245,6 +272,11 @@ begin
   end;
 end;
 
+function TQwen3Vulkan.HasFlash: boolean;
+begin
+  result := fFlash <> nil;
+end;
+
 destructor TQwen3Vulkan.Destroy;
 begin
   // the model no longer hands out contexts of this device
@@ -253,6 +285,7 @@ begin
   fAddNorm.Free;
   fQkRope.Free;
   fAdd.Free;
+  fFlash.Free;
   fMerge.Free;
   fAttention.Free;
   fSwiGlu.Free;
@@ -474,7 +507,9 @@ procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks: PtrInt;
+  n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
+    queries: PtrInt;
+  attention: TInferVkPipeline;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
@@ -501,10 +536,18 @@ begin
   // the attention work groups: hb heads of one KV head (hb divides the
   // group) times rb rows, the keys of a row cut into splits ranges unless
   // there are enough work groups without
+  // - flash.comp for FLASH_ROWS rows or more
+  attention := fAttention;
+  queries := ATTENTION_QUERIES;
+  if fUseFlash and (fFlash <> nil) and (n >= FLASH_ROWS) then
+  begin
+    attention := fFlash;
+    queries := FLASH_QUERIES;
+  end;
   hb := c.Heads div c.KvHeads;
-  while (hb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod hb <> 0) do
+  while (hb > queries) or (c.Heads div c.KvHeads mod hb <> 0) do
     dec(hb);
-  rb := ATTENTION_QUERIES div hb;
+  rb := queries div hb;
   blocks := (n + rb - 1) div rb;
   splits := 1;
   if fSplitKeys > 0 then
@@ -565,7 +608,7 @@ begin
       fVk.BatchDispatch(fQkRope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV,
         Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fDevCos,
         aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.KvHeads, n);
-      fVk.BatchDispatch(fAttention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
+      fVk.BatchDispatch(attention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
         aCtx.fDevAttn, part], @att, c.Heads div hb, blocks, splits);
       if splits > 1 then
         fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn], @merge, c.Heads, n);
