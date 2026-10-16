@@ -15,9 +15,11 @@
 //   (4b): on a discrete GPU the latter is not mapped and Upload / Download go
 //   through a staging buffer; on an integrated GPU or a CPU implementation
 //   device memory is host-visible too and is mapped instead
-// - not yet: macOS (MoltenVK lists its device only with the instance extension
-//   VK_KHR_portability_enumeration, which is not requested - Available is
-//   false there); 32-bit FPC (the record layout relies on Int64 fields aligned
+// - macOS through MoltenVK (Vulkan on Metal): the instance asks for
+//   VK_KHR_portability_enumeration when the loader lists it (else MoltenVK
+//   reports no device) and the device enables VK_KHR_portability_subset when
+//   it lists it; the loader comes from the system (Vulkan SDK or Homebrew)
+// - not yet: 32-bit FPC (the record layout relies on Int64 fields aligned
 //   to 8 as MSVC does: Delphi's {$A8} does that, FPC i386 is no target)
 unit mormot.ai.infer.vulkan;
 
@@ -93,6 +95,13 @@ type
     pNext: pointer;
     properties: array[0..1023] of byte;
   end;
+
+  /// VkExtensionProperties: extensionName[VK_MAX_EXTENSION_NAME_SIZE = 256]
+  TVkExtensionProperties = record
+    extensionName: array[0..255] of AnsiChar;
+    specVersion: cardinal;
+  end;
+  TVkExtensionPropertiesDynArray = array of TVkExtensionProperties;
 
   TVkInstanceCreateInfo = record
     sType: integer;
@@ -340,10 +349,21 @@ type
 
 const
   VK_SUCCESS = 0;
+  /// an enumeration got fewer entries than exist (the list grew)
+  VK_INCOMPLETE = 5;
   VK_API_VERSION_1_0 = 1 shl 22;
   VK_API_VERSION_1_1 = (1 shl 22) or (1 shl 12);
   /// the major and minor bits of a version (no variant, no patch)
   VK_API_VERSION_MASK = $1ffff000;
+
+  /// VkInstanceCreateInfo.flags: list the portability implementations too
+  VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 1;
+  /// the instance extension which lists them (MoltenVK is one)
+  VK_KHR_PORTABILITY_ENUMERATION = 'VK_KHR_portability_enumeration';
+  /// the device extension of such an implementation: to enable when listed
+  VK_KHR_PORTABILITY_SUBSET = 'VK_KHR_portability_subset';
+  /// VK_KHR_portability_subset needs it with a Vulkan 1.0 instance (core in 1.1)
+  VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2 = 'VK_KHR_get_physical_device_properties2';
 
   VK_STRUCTURE_TYPE_APPLICATION_INFO = 0;
   VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1;
@@ -479,6 +499,12 @@ type
     EnumerateInstanceVersion: function(var aVersion: cardinal): TVkResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     GetPhysicalDeviceProperties2: procedure(aPhysical: TVkDispatch; aProps: pointer);
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    EnumerateInstanceExtensionProperties: function(aLayer: PAnsiChar;
+      var aCount: cardinal; aProps: pointer): TVkResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    EnumerateDeviceExtensionProperties: function(aPhysical: TVkDispatch;
+      aLayer: PAnsiChar; var aCount: cardinal; aProps: pointer): TVkResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     GetPhysicalDeviceQueueFamilyProperties: procedure(aPhysical: TVkDispatch;
       var aCount: cardinal; aProps: pointer);
@@ -643,6 +669,7 @@ type
     fDeviceType, fVendorId: integer;
     fMaxStorageRange, fMaxInvocations: cardinal;
     fApiVersion, fSubgroupSize, fSubgroupStages, fSubgroupOperations: cardinal;
+    fPortability: boolean;
     // a Run whose work may still be pending on the device (its wait failed):
     // the command buffer and descriptor sets must not be touched any more
     fBroken: boolean;
@@ -664,6 +691,9 @@ type
     fProfile, fProfiling: boolean;
     fTimestampBits: cardinal;
     fTimestampPeriod: single;
+    // a portability device stamped two operations with the same tick:
+    // HasTimestamps is false from then on
+    fTimestampsFlat: boolean;
     fQueryPool: TVkHandle;
     fQueries: integer;
     fQueryTag: TRawUtf8DynArray;
@@ -763,14 +793,20 @@ type
     property SubgroupSize: cardinal read fSubgroupSize;
     property SubgroupStages: cardinal read fSubgroupStages;
     property SubgroupOperations: cardinal read fSubgroupOperations;
+    /// true on a portability implementation such as MoltenVK: the device lists
+    // VK_KHR_portability_subset, which is then enabled
+    property Portability: boolean read fPortability;
     /// true: every batch writes a GPU timestamp after each operation and sums
-    // the time per pipeline name (needs timestamp support on the queue)
+    // the time per pipeline name (needs timestamp support on the queue; MoltenVK
+    // on Apple GPUs samples only between Metal encoders: one value for a whole
+    // batch, see HasTimestamps)
     property Profile: boolean read fProfile write fProfile;
     /// the summed GPU time per name since ProfileReset, longest first
     function ProfileText: RawUtf8;
     /// forget the summed times
     procedure ProfileReset;
-    /// true when the compute queue writes timestamps (Profile can measure)
+    /// true when the compute queue writes timestamps (Profile can measure) -
+    // false once a portability device (MoltenVK) stamped two operations alike
     function HasTimestamps: boolean;
   end;
 
@@ -780,6 +816,12 @@ const
     {$ifdef OSWINDOWS} 'vulkan-1.dll' {$else}
     {$ifdef OSDARWIN} 'libvulkan.1.dylib' {$else}
     'libvulkan.so.1' {$endif OSDARWIN} {$endif OSWINDOWS};
+  {$ifdef OSDARWIN}
+  /// the loader of Homebrew on Apple silicon: dlopen() of a bare name does
+  // not search /opt/homebrew/lib (it does search /usr/local/lib, where the
+  // Vulkan SDK and Homebrew on Intel put it)
+  VULKAN_LIBRARY_HOMEBREW = '/opt/homebrew/lib/' + VULKAN_LIBRARY;
+  {$endif OSDARWIN}
 
 {$I mormot.ai.infer.vulkan.spv.inc}
 
@@ -793,6 +835,18 @@ const
 var
   // TInferVulkan.Available: 0 = not tried yet, 1 = yes, 2 = no
   VulkanAvailable: integer;
+
+function VkHasExtension(const aList: TVkExtensionPropertiesDynArray;
+  aName: PAnsiChar): boolean;
+var
+  i: PtrInt;
+begin
+  result := true;
+  for i := 0 to length(aList) - 1 do
+    if StrComp(@aList[i].extensionName, aName) = 0 then
+      exit;
+  result := false;
+end;
 
 {$ifdef CPUX86}
 {$ifndef FPC}
@@ -955,8 +1009,15 @@ var
   pinfo: TVkCommandPoolCreateInfo;
   cinfo: TVkCommandBufferAllocateInfo;
   finfo: TVkFenceCreateInfo;
+  exts: TVkExtensionPropertiesDynArray;
+  names: array[0..1] of PAnsiChar;
+  res: TVkResult;
 begin
   fLib := LibraryOpen(VULKAN_LIBRARY);
+  {$ifdef OSDARWIN}
+  if fLib = TLibHandle(0) then
+    fLib := LibraryOpen(VULKAN_LIBRARY_HOMEBREW);
+  {$endif OSDARWIN}
   if fLib = TLibHandle(0) then
     raise EInferVulkan.CreateUtf8('Vulkan: no % loader', [VULKAN_LIBRARY]);
   PPointer(@@fApi.GetInstanceProcAddr)^ := LibraryResolve(fLib, 'vkGetInstanceProcAddr');
@@ -981,6 +1042,35 @@ begin
   FillCharFast(info, SizeOf(info), 0);
   info.sType := VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   info.pApplicationInfo := @app;
+  // a portability implementation (MoltenVK) is listed only on request
+  PPointer(@@fApi.EnumerateInstanceExtensionProperties)^ :=
+    fApi.GetInstanceProcAddr(nil, 'vkEnumerateInstanceExtensionProperties');
+  if Assigned(fApi.EnumerateInstanceExtensionProperties) then
+  begin
+    repeat // again on VK_INCOMPLETE: the list grew between both calls
+      count := 0;
+      Check(fApi.EnumerateInstanceExtensionProperties(nil, count, nil),
+        'vkEnumerateInstanceExtensionProperties');
+      SetLength(exts, count);
+      res := fApi.EnumerateInstanceExtensionProperties(nil, count, pointer(exts));
+      if res <> VK_INCOMPLETE then
+        Check(res, 'vkEnumerateInstanceExtensionProperties');
+    until res = VK_SUCCESS;
+    SetLength(exts, count); // count = the entries written
+  end;
+  if VkHasExtension(exts, VK_KHR_PORTABILITY_ENUMERATION) then
+  begin
+    names[0] := VK_KHR_PORTABILITY_ENUMERATION;
+    info.enabledExtensionCount := 1;
+    if (fApiVersion < VK_API_VERSION_1_1) and
+       VkHasExtension(exts, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2) then
+    begin
+      names[1] := VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2;
+      info.enabledExtensionCount := 2;
+    end;
+    info.ppEnabledExtensionNames := @names;
+    info.flags := VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+  end;
   CheckNew(fApi.CreateInstance(@info, nil, fInstance), fInstance,
     'vkCreateInstance');
   Load(fApi.DestroyInstance, 'vkDestroyInstance', false);
@@ -992,6 +1082,8 @@ begin
     'vkGetPhysicalDeviceMemoryProperties', false);
   Load(fApi.CreateDevice, 'vkCreateDevice', false);
   Load(fApi.GetDeviceProcAddr, 'vkGetDeviceProcAddr', false);
+  Load(fApi.EnumerateDeviceExtensionProperties,
+    'vkEnumerateDeviceExtensionProperties', false);
   // the physical device: the best ranked one with a compute queue
   count := 0;
   Check(fApi.EnumeratePhysicalDevices(fInstance, count, nil),
@@ -1091,6 +1183,25 @@ begin
   dinfo.sType := VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dinfo.queueCreateInfoCount := 1;
   dinfo.pQueueCreateInfos := @qinfo;
+  // a portability implementation must have VK_KHR_portability_subset enabled
+  repeat
+    count := 0;
+    Check(fApi.EnumerateDeviceExtensionProperties(fPhysical, nil, count, nil),
+      'vkEnumerateDeviceExtensionProperties');
+    SetLength(exts, count);
+    res := fApi.EnumerateDeviceExtensionProperties(fPhysical, nil, count,
+      pointer(exts));
+    if res <> VK_INCOMPLETE then
+      Check(res, 'vkEnumerateDeviceExtensionProperties');
+  until res = VK_SUCCESS;
+  SetLength(exts, count);
+  fPortability := VkHasExtension(exts, VK_KHR_PORTABILITY_SUBSET);
+  if fPortability then
+  begin
+    names[0] := VK_KHR_PORTABILITY_SUBSET;
+    dinfo.enabledExtensionCount := 1;
+    dinfo.ppEnabledExtensionNames := @names;
+  end;
   CheckNew(fApi.CreateDevice(fPhysical, @dinfo, nil, fDevice), fDevice,
     'vkCreateDevice');
   Load(fApi.DestroyDevice, 'vkDestroyDevice', true);
@@ -1495,7 +1606,7 @@ begin
     // no batch is pending (each waited): its sets may go
     Check(fApi.ResetDescriptorPool(fDevice, fBatchPool, 0), 'vkResetDescriptorPool');
   fBatchSets := 0;
-  fProfiling := fProfile and (fTimestampBits > 0);
+  fProfiling := fProfile and HasTimestamps;
   if fProfiling and (fQueryPool = 0) then
   begin
     FillCharFast(qinfo, SizeOf(qinfo), 0);
@@ -1544,6 +1655,17 @@ begin
   Check(fApi.GetQueryPoolResults(fDevice, fQueryPool, 0, fQueries, fQueries * 8,
     pointer(ticks), 8, VK_QUERY_RESULT_64_BIT or VK_QUERY_RESULT_WAIT_BIT),
     'vkGetQueryPoolResults');
+  // a portability implementation which writes the same tick twice in a row
+  // samples per Metal encoder, not per operation (MoltenVK on Apple GPUs, also
+  // across the command buffers of BatchFlush): its times are meaningless, so
+  // profiling stops - a native device never decides so (a tick may be long)
+  if fPortability then
+    for i := 1 to fQueries - 1 do
+      if ticks[i] = ticks[i - 1] then
+      begin
+        fTimestampsFlat := true;
+        exit;
+      end;
   if fTimestampBits >= 64 then
     mask := -1
   else
@@ -1568,7 +1690,8 @@ end;
 
 function TInferVulkan.HasTimestamps: boolean;
 begin
-  result := (fTimestampBits > 0) and (fTimestampPeriod > 0);
+  result := (fTimestampBits > 0) and (fTimestampPeriod > 0) and
+    not fTimestampsFlat;
 end;
 
 procedure TInferVulkan.ProfileReset;

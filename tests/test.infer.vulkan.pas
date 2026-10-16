@@ -254,7 +254,17 @@ begin
     fVk.BatchDispatch(pipe, [a, a, a], @n, 512);
     fVk.BatchSubmit;
     text := fVk.ProfileText;
-    CheckUtf8(PosEx('add ', text) > 0, 'profile: %', [text]);
+    if fVk.HasTimestamps then
+      CheckUtf8(PosEx('add ', text) > 0, 'profile: %', [text])
+    else
+    begin
+      // MoltenVK on Apple GPUs: one timestamp value for the whole batch -
+      // accepted only from a portability implementation
+      CheckUtf8(fVk.Portability, 'one timestamp for a whole batch on %',
+        [fVk.DeviceName]);
+      AddConsole('SKIP Vulkan profiling: % stamps a batch, not a dispatch',
+        [fVk.DeviceName]);
+    end;
   finally
     fVk.Profile := false;
     a.Free;

@@ -132,24 +132,33 @@ Nutzers, keine Umsetzung vorab.
 
 ---
 
-## B8 — Vulkan auf macOS (MoltenVK)
+## B8 — Vulkan auf macOS: Leistung unter MoltenVK
 
-**Ziel:** `TInferVulkan` auch auf dem Mac (M2 Pro), über MoltenVK. Roadmap: Phase 4 in
-`docs/native-inference.md` („Apple-GPU“); ein natives Metal-Backend folgt nur, wenn MoltenVK
-spürbar bremst.
+**Ziel:** Auf dem M2 Pro soll die GPU schneller sein als der NEON-Pfad der CPU, auch bei
+kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
+(Roadmap: „Apple-GPU“ in `docs/native-inference.md`).
 
-**Ausgangslage:** `src/infer/mormot.ai.infer.vulkan.pas` fordert die Instanz-Erweiterung
-`VK_KHR_portability_enumeration` nicht an und setzt nicht
-`VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`; MoltenVK meldet sein Gerät dann
-nicht, `Available` ist false (Tests: SKIP). Auf dem Mac ist kein Vulkan-Loader
-installiert (`libvulkan.1.dylib` fehlt; Vulkan SDK oder Homebrew `molten-vk` +
-`vulkan-loader`).
+**Ausgangslage:** Seit 2026-10-16 läuft das Vulkan-Backend auf dem Mac über MoltenVK.
+- **Korrektheit:** Die Suite ist grün mit `LAI_REQUIRE_VULKAN=1`.
+- **Prefill:** Qwen3-0.6B Q8_0 schafft auf der GPU 305 Tokens/s bei 200 Tokens, die CPU 563.
+  Bei 4000 Tokens ist die GPU mit 194 gegen 145 vorn.
+- **Decode:** 63 Tokens/s auf der GPU gegen 73 auf der CPU bei 200 Tokens, 34 gegen 21 bei
+  4000 Tokens.
+- **Profil:** `Profile` misst unter MoltenVK nichts, weil alle Zeitstempel eines Batches
+  gleich sind.
 
-**Vorgehen:** Erweiterung per `vkEnumerateInstanceExtensionProperties` prüfen und nur
-dann anfordern; auf dem Gerät `VK_KHR_portability_subset` aktivieren, wenn gemeldet.
-Werte und Strukturen aus dem gepinnten `vulkan_core.h` (Tag in `UPSTREAM_BASE`).
+**Vorgehen:**
+1. Per Dispatch messen: Batches mit nur einer Operation, also Wanduhr um `BatchSubmit`.
+2. Prüfen, ob Barrieren oder Dispatch-Overhead in MoltenVK die Zeit kosten (etwa 340
+   Dispatches je Token) oder die Kernel selbst. Die Kernel sind auf die RTX abgestimmt:
+   Kachelgrößen, Shared Memory, Subgroup-Nutzung.
+3. Erst danach über ein Metal-Backend entscheiden.
 
-**Fertig, wenn:** `TTestInferVulkan` auf dem Mac mit `LAI_REQUIRE_VULKAN=1` grün.
+Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;
+Vorgehen wie in `docs/native-inference.md` (Plattformtabelle).
+
+**Fertig, wenn:** Prefill und Decode bei 200 Tokens auf der GPU schneller sind als auf
+der CPU, oder belegt ist, dass MoltenVK die Grenze setzt.
 
 ---
 

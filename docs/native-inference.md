@@ -889,16 +889,47 @@ Laufzeit wird nur der Loader des Treibers geladen (`vulkan-1.dll`, `libvulkan.so
 - **Shader:** GLSL-Compute-Shader unter `tools/vk/`, beim Bauen mit `glslangValidator`
   nach SPIR-V übersetzt und als Pascal-Konstanten eingecheckt (generierte `.inc`). Der
   Compiler wird nur zum Erzeugen gebraucht, nicht zur Laufzeit und nicht für den Build.
-- **Tests:** lavapipe unter WSL (Korrektheit ohne GPU, läuft in jeder FPC-Suite mit), RTX
-  5090 auf dem RTX-Rechner (Leistung); ohne Vulkan-Loader überspringen die Tests.
-- **Apple-GPU (M2, auf der Roadmap seit 2026-10-16):** Apple bietet nativ nur Metal, kein
-  Vulkan.
-  - *Erster Schritt:* dasselbe Vulkan-Backend über MoltenVK (Vulkan auf Metal, Apache-2.0),
-    Backlog B8. Dafür muss die Instanz `VK_KHR_portability_enumeration` anfordern und das
-    Gerät `VK_KHR_portability_subset` aktivieren. Der Loader kommt wie unter Windows und Linux
-    vom System (Vulkan SDK oder Homebrew), nicht aus dem Repo.
-  - *Prüfen:* Subgroup-Größe auf Apple-GPUs (32) und die Leistung gegen den NEON-Pfad der
-    CPU. Durch den gemeinsamen Speicher (Unified Memory) entfällt das Hochladen über PCIe.
+- **Tests:**
+  - lavapipe unter WSL: Korrektheit ohne GPU, läuft in jeder FPC-Suite mit.
+  - RTX 5090 auf dem RTX-Rechner: Leistung.
+  - Apple M2 Pro über MoltenVK.
+  - Ohne Vulkan-Loader überspringen die Tests.
+- **Apple-GPU (M2):** Apple bietet nativ nur Metal, kein Vulkan.
+  - *Erster Schritt, erledigt 2026-10-16:* dasselbe Vulkan-Backend über MoltenVK (Vulkan
+    auf Metal, Apache-2.0).
+    - *Instanz:* Sie fordert `VK_KHR_portability_enumeration` an, wenn der Loader die
+      Erweiterung meldet, und setzt dazu `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`.
+    - *Gerät:* Es aktiviert `VK_KHR_portability_subset`, wenn es die Erweiterung meldet
+      (`TInferVulkan.Portability`).
+    - *Loader:* Er kommt vom System, nicht aus dem Repo: Vulkan SDK oder Homebrew
+      (`brew install molten-vk vulkan-loader`). `dlopen` mit bloßem Namen durchsucht
+      `/opt/homebrew/lib` nicht, daher versucht `TInferVulkan` auf macOS diesen Pfad als
+      Zweites.
+    - *Getestet:* auf dem M2 Pro mit MoltenVK 1.4.2 und Loader 1.4.363.0. Die
+      Vulkan-Suite ist mit `LAI_REQUIRE_VULKAN=1` grün (181 Assertions, auch Qwen3-0.6B
+      und `TNativeLlmClient` auf dem Gerät). Die Subgroups haben 32 Lanes, der
+      Subgroup-Pfad von `linear8` läuft also.
+  - *Zeitstempel:* MoltenVK setzt auf Apple-GPUs nur zwischen Metal-Encodern einen
+    Zeitstempel. Alle Stempel eines Batches tragen deshalb denselben Wert.
+    - `TInferVulkan` erkennt das nur auf einem Portability-Gerät: Zwei aufeinanderfolgende
+      Stempel mit demselben Wert genügen, auch über die Command Buffer von `BatchFlush`
+      hinweg. Danach meldet `HasTimestamps` false, und `Profile` misst nichts mehr.
+    - Ein natives Gerät entscheidet das nie, weil ein Tick dort lang sein kann
+      (Codex-Review).
+    - Der Test akzeptiert das nur auf einem Portability-Gerät.
+  - *Leistung (Qwen3-0.6B Q8_0, `llm-bench`, 64 neue Tokens, Tokens/s):*
+
+    | Kontext | Prefill GPU | Prefill CPU | Decode GPU | Decode CPU |
+    |---|---|---|---|---|
+    | 200 | 305 | 563 | 63 | 73 |
+    | 1000 | 275 | 409 | 53 | 46 |
+    | 4000 | 194 | 145 | 34 | 21 |
+
+    GPU heißt MoltenVK auf dem M2 Pro, CPU heißt NEON-SDOT mit 7 Threads.
+    - Bei kurzem Kontext ist die GPU langsamer als die CPU.
+    - Ab etwa 1000 Tokens dekodiert sie schneller, bei 4000 Tokens auch der Prefill.
+    - Der Prefill liegt weit unter dem, was die GPU rechnen könnte. Die Kernel sind auf
+      die RTX abgestimmt; die Ursache auf Apple ist noch nicht untersucht (Backlog B8).
   - *Zweiter Schritt, nur wenn MoltenVK spürbar bremst:* ein eigenes Metal-Backend. Das wäre
     ein Objective-C-Laufzeit-Aufruf über `objc_msgSend` (kein Xcode-Projekt, keine
     mitgelieferte Bibliothek), mit Shadern in MSL statt GLSL.
@@ -1135,7 +1166,7 @@ Eine eigene Spur daneben ist die Verteilung großer Jobs auf ungenutzte Rechner:
 |---|---|---|
 | WSL Linux aarch64 | FPC 3.2.4 (Baseline) + 3.2.2 | grün (MCP 1257, LLM 656, Inferenz 1215, alle Demos) |
 | WSL2 Linux x86_64 auf dem RTX-Rechner (Ubuntu 24.04) | FPC 3.2.2 (wie Docker) | grün aus einem sauberen `git archive`: MCP 1257, LLM 656, Inferenz 828 mit Korpus-Gate |
-| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. |
+| macOS M2, aarch64-darwin | FPC 3.2.4-rc2 per SSH | grün: MCP 1257, LLM 647 (der vec0-Test wird mangels Extension übersprungen); am 2026-10-15 Inferenz 1597 mit allen Modellen (BGE-M3, Qwen3-0.6B), mit Korpus-Gate 1604, nDCG@10 0.9004 wie auf dem Snapdragon. Dabei gefunden: mORMot füllt `CpuFeatures` auf aarch64 nur unter Linux, unter macOS liefen deshalb die Pascal- statt der SDOT-Kernel; `HasArmDotProd` fragt dort `hw.optional.arm.FEAT_DotProd` per sysctl ab. Am 2026-10-16 Inferenz 2450 einschließlich der Vulkan-Suite auf der M2-Pro-GPU über MoltenVK (Homebrew `molten-vk` 1.4.2, `vulkan-loader` 1.4.363.0, `LAI_REQUIRE_VULKAN=1`). |
 | Windows ARM, aarch64-win64 | FPC 3.3.1 (fpcupdeluxe, `D:\bin\fpc`) | grün: MCP 1257 und LLM, **aber** nur mit einer ARM64-`sqlite3-64.dll` (sqlite.org 3.51.2) neben dem Binary. mORMot2 hat für dieses Ziel kein statisches SQLite. Ein Skript gibt es noch nicht. |
 | Windows x64 | Delphi 13 | grün (MCP 1257, LLM 659, Inferenz 1205) |
 | Windows x64 unter Prism | FPC 3.2.2 | nur Kompatibilitätsprobe, nicht für Leistungsaussagen |

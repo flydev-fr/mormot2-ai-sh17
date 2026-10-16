@@ -39,7 +39,7 @@ Number of assertions per suite, every one passing; each row with numbers ran bet
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
 | Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2265 ⁷ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2450 ⁷ |
 | Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
 
@@ -53,9 +53,10 @@ that target.
 client: about 540 assertions with the model, about 300 without it).
 ⁶ The Qwen3-0.6B tests skip in a 32-bit process (2.4 GB of FP32 weights); the tiny
 model, the tokenizer and the chat template run.
-⁷ With all models, NEON dot-product kernels. The BGE-M3 corpus gate passed there in an
-earlier run of the same day (nDCG@10 0.9004, the same as on the Snapdragon); it is not
-part of this count.
+⁷ With all models, NEON dot-product kernels, and the Vulkan suite on the M2 Pro GPU
+through MoltenVK (`LAI_REQUIRE_VULKAN=1`, 2026-10-16). The BGE-M3 corpus gate passed there
+in an earlier run (nDCG@10 0.9004, the same as on the Snapdragon); it is not part of this
+count.
 ⁸ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
 (without the model).
 
@@ -575,7 +576,9 @@ Next, in this order:
 2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
    at about 9800 and decodes at about 360 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
    flash attention still about 330 tokens/s at 4000 tokens of context; `TNativeLlmClient`
-   decodes there with `client.Device := TQwen3Vulkan.Create(client.Model, gpu)`. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
+   decodes there with `client.Device := TQwen3Vulkan.Create(client.Model, gpu)`. On a Mac
+   the same backend runs through MoltenVK (Homebrew `molten-vk` and `vulkan-loader`); on
+   the M2 Pro it beats the NEON CPU path only from about 1000 tokens of context. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
