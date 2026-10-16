@@ -1,0 +1,200 @@
+// LandrixAI - y[r, o] = bias[o] + sum_i w[o, i] * x[r, i], the fast form of
+// linear.comp (phase 4e of docs/native-inference.md)
+// - same bindings, push constants and arithmetic contract as linear.comp: w in
+//   its storage type (F32, Q8_0, Q4_K, Q6_K), dequantized as InferRowToF32,
+//   times F32 activations - only the summation order differs
+// - a work group of 128 = 4 output features x 32 invocations; each invocation
+//   dequantizes 8 consecutive weights per step of 256 inputs (whole words
+//   loaded, bytes taken from registers) and multiplies them with up to ROWS
+//   token rows, so prefill reuses every dequantized weight ROWS times
+// - needs nin to be a multiple of 8 (F32) / 32 (Q8_0) / 256 (K-quants): the
+//   backend falls back to linear.comp otherwise
+#version 450
+
+#define ROWS 8
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufW { uint w[]; };
+layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
+layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
+layout(push_constant) uniform Push {
+  uint rows, nin, nout, dtype, hasBias;
+} p;
+
+shared float partial[ROWS * 128];
+
+uint byteAt(uint a)
+{
+  return (w[a >> 2] >> ((a & 3u) * 8u)) & 255u;
+}
+
+// 8 bytes from byte address a (any alignment) into two words, little-endian
+uvec2 bytes8(uint a)
+{
+  uint s = (a & 3u) * 8u;
+  uint i = a >> 2;
+  uint w0 = w[i];
+  uint w1 = w[i + 1u];
+  if (s == 0u)
+    return uvec2(w0, w1);
+  uint w2 = w[i + 2u];
+  return uvec2((w0 >> s) | (w1 << (32u - s)), (w1 >> s) | (w2 << (32u - s)));
+}
+
+float halfAt(uint a)
+{
+  return unpackHalf2x16(byteAt(a) | (byteAt(a + 1u) << 8)).x;
+}
+
+// signed byte k (0..3) of v
+float s8(uint v, uint k)
+{
+  return float(bitfieldExtract(int(v), int(k * 8u), 8));
+}
+
+// unsigned byte k (0..3) of v
+uint u8(uint v, uint k)
+{
+  return (v >> (k * 8u)) & 255u;
+}
+
+// the 8 weights e .. e + 7 of the row that starts at byte rowBase
+void weights8(uint rowBase, uint e, out float wv[8])
+{
+  if (p.dtype == 1u)
+  {
+    uint i = (rowBase >> 2) + e;
+    for (uint k = 0u; k < 8u; k++)
+      wv[k] = uintBitsToFloat(w[i + k]);
+  }
+  else if (p.dtype == 2u)
+  {
+    // Q8_0: 34 bytes per 32 values, value = d * qs[j]; 8 values in one block
+    uint base = rowBase + (e >> 5) * 34u;
+    float d = halfAt(base);
+    uvec2 q = bytes8(base + 2u + (e & 31u));
+    for (uint k = 0u; k < 4u; k++)
+    {
+      wv[k] = d * s8(q.x, k);
+      wv[k + 4u] = d * s8(q.y, k);
+    }
+  }
+  else if (p.dtype == 3u)
+  {
+    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); the 8
+    // values lie in sub-block j
+    uint base = rowBase + (e >> 8) * 144u;
+    uint k8 = e & 255u;
+    uint j = k8 >> 5;
+    uint sc, m;
+    if (j < 4u)
+    {
+      sc = byteAt(base + 4u + j) & 63u;
+      m = byteAt(base + 8u + j) & 63u;
+    }
+    else
+    {
+      sc = (byteAt(base + 8u + j) & 15u) | ((byteAt(base + j) >> 6) << 4);
+      m = (byteAt(base + 8u + j) >> 4) | ((byteAt(base + 4u + j) >> 6) << 4);
+    }
+    float d1 = halfAt(base) * float(sc);
+    float m1 = halfAt(base + 2u) * float(m);
+    // 16 + 32 * (j / 2) + (k8 & 31): a multiple of 8, the block 4-aligned
+    uint qi = (base + 16u + 32u * (j >> 1) + (k8 & 31u)) >> 2;
+    uint q0 = w[qi];
+    uint q1 = w[qi + 1u];
+    uint sh = (j & 1u) * 4u;
+    for (uint k = 0u; k < 4u; k++)
+    {
+      wv[k] = d1 * float((u8(q0, k) >> sh) & 15u) - m1;
+      wv[k + 4u] = d1 * float((u8(q1, k) >> sh) & 15u) - m1;
+    }
+  }
+  else
+  {
+    // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
+    // (Q6KValue); the 8 values share one scale (a group of 16)
+    uint base = rowBase + (e >> 8) * 210u;
+    uint k8 = e & 255u;
+    uint n = k8 >> 7;
+    uint ii = k8 & 127u;
+    uint l = ii & 31u;
+    uint quarter = ii >> 5;
+    uvec2 ql = bytes8(base + 64u * n + l + ((quarter & 1u) != 0u ? 32u : 0u));
+    uvec2 qh = bytes8(base + 128u + 32u * n + l);
+    uint lsh = quarter >= 2u ? 4u : 0u;
+    uint hsh = 2u * quarter;
+    float t = halfAt(base + 208u) * float(bitfieldExtract(int(byteAt(base + 192u +
+      (k8 >> 4))), 0, 8));
+    for (uint k = 0u; k < 4u; k++)
+    {
+      int a = int(((u8(ql.x, k) >> lsh) & 15u) | (((u8(qh.x, k) >> hsh) & 3u) << 4)) - 32;
+      int b = int(((u8(ql.y, k) >> lsh) & 15u) | (((u8(qh.y, k) >> hsh) & 3u) << 4)) - 32;
+      wv[k] = t * float(a);
+      wv[k + 4u] = t * float(b);
+    }
+  }
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint lane = t & 31u;
+  uint group = t >> 5;
+  uint r0 = gl_WorkGroupID.y * ROWS;
+  uint nr = min(uint(ROWS), p.rows - r0);
+  uint rowBytes;
+  if (p.dtype == 1u)
+    rowBytes = p.nin * 4u;
+  else if (p.dtype == 2u)
+    rowBytes = (p.nin >> 5) * 34u;
+  else if (p.dtype == 3u)
+    rowBytes = (p.nin >> 8) * 144u;
+  else
+    rowBytes = (p.nin >> 8) * 210u;
+  for (uint ob = gl_WorkGroupID.x * 4u; ob < p.nout; ob += gl_NumWorkGroups.x * 4u)
+  {
+    uint o = ob + group;
+    float acc[ROWS];
+    for (uint r = 0u; r < uint(ROWS); r++)
+      acc[r] = 0.0;
+    if (o < p.nout)
+      for (uint e = lane * 8u; e < p.nin; e += 256u)
+      {
+        float wv[8];
+        weights8(o * rowBytes, e, wv);
+        for (uint r = 0u; r < nr; r++)
+        {
+          uint xi = ((r0 + r) * p.nin + e) >> 2;
+          vec4 xa = x[xi];
+          vec4 xb = x[xi + 1u];
+          acc[r] += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w +
+                    wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+        }
+      }
+    for (uint r = 0u; r < uint(ROWS); r++)
+      partial[r * 128u + t] = acc[r];
+    barrier();
+    // 32 partial sums per feature and row
+    for (uint h = 16u; h > 0u; h >>= 1)
+    {
+      if (lane < h)
+        for (uint r = 0u; r < nr; r++)
+          partial[r * 128u + t] += partial[r * 128u + t + h];
+      barrier();
+    }
+    if ((lane == 0u) && (o < p.nout))
+    {
+      float b = 0.0;
+      if (p.hasBias != 0u)
+        b = bias[o];
+      for (uint r = 0u; r < nr; r++)
+        y[(r0 + r) * p.nout + o] = partial[r * 128u + t] + b;
+    }
+    barrier(); // partial[] is reused for the next features
+  }
+}

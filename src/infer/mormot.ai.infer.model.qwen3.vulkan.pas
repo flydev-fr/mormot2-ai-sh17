@@ -53,7 +53,7 @@ type
     fIds: TIntegerDynArray;
     fKeys, fValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
     // device scratch for up to fRows token rows
-    fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp, fCos, fSin: TInferVkBuffer;
+    fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp, fCos: TInferVkBuffer;
     fScores, fLogits: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
@@ -78,7 +78,7 @@ type
     fModel: TQwen3Model;
     fBackend: TInferVulkanBackend;
     fVk: TInferVulkan;
-    fNorm, fRope, fSwiGlu, fAttention, fAdd: TInferVkPipeline;
+    fNorm, fSwiGlu, fAttention, fAdd, fQkRope, fAddNorm: TInferVkPipeline;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
@@ -123,12 +123,13 @@ type
     Eps: single;
   end;
 
-  TRopePush = record
-    Rows, Heads, HeadDim: cardinal;
-  end;
-
   TAttentionPush = record
     Rows, Heads, HeadDim, KvHeads, Past: cardinal;
+  end;
+
+  TQkRopePush = record
+    Rows, Heads, KvHeads, HeadDim, Past: cardinal;
+    Eps: single;
   end;
 
 const
@@ -170,7 +171,6 @@ begin
   FreeAndNil(fGate);
   FreeAndNil(fUp);
   FreeAndNil(fCos);
-  FreeAndNil(fSin);
   FreeAndNil(fIn);
   fRows := 0;
 end;
@@ -221,17 +221,30 @@ begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
+  // qkrope.comp keeps one normalized head in shared memory
+  // and attention.comp reads it as vec4
+  if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
+    EInferError.RaiseUtf8('%: head dimension % not supported', [self,
+      aModel.Config.HeadDim]);
   fModel := aModel;
   fBackend := aBackend;
   fVk := aBackend.Vulkan;
   fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
     SizeOf(TNormPush));
-  fRope := TInferVkPipeline.Create(fVk, @SPV_ROPE, length(SPV_ROPE), 3,
-    SizeOf(TRopePush));
   fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2, 4);
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
     5, SizeOf(TAttentionPush));
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
+  fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
+    SizeOf(TQkRopePush));
+  fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM, length(SPV_ADDNORM), 4,
+    SizeOf(TNormPush));
+  fQkRope.Name := 'qkrope';
+  fAddNorm.Name := 'addnorm';
+  fNorm.Name := 'rmsnorm';
+  fSwiGlu.Name := 'swiglu';
+  fAttention.Name := 'attention';
+  fAdd.Name := 'add';
   fBackend.GpuLock;
   try
     UploadWeights;
@@ -242,10 +255,11 @@ end;
 
 destructor TQwen3Vulkan.Destroy;
 begin
+  fAddNorm.Free;
+  fQkRope.Free;
   fAdd.Free;
   fAttention.Free;
   fSwiGlu.Free;
-  fRope.Free;
   fNorm.Free;
   inherited Destroy;
 end;
@@ -429,8 +443,7 @@ begin
     NeedDevice(fVk, aCtx.fV, Int64(aRows) * kvw * 4);
     NeedDevice(fVk, aCtx.fGate, Int64(aRows) * c.Intermediate * 4);
     NeedDevice(fVk, aCtx.fUp, Int64(aRows) * c.Intermediate * 4);
-    NeedDevice(fVk, aCtx.fCos, Int64(aRows) * half * 4);
-    NeedDevice(fVk, aCtx.fSin, Int64(aRows) * half * 4);
+    NeedDevice(fVk, aCtx.fCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     // host-visible: embeddings, then cos, then sin
     aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
     aCtx.fRows := aRows;
@@ -442,7 +455,7 @@ begin
     if (aCtx.fOut = nil) or (aCtx.fOut.Size < Int64(aOutRows) * c.VocabSize * 4) then
     begin
       FreeAndNil(aCtx.fOut);
-      aCtx.fOut := TInferVkBuffer.Create(fVk, Int64(aOutRows) * c.VocabSize * 4);
+      aCtx.fOut := TInferVkBuffer.CreateReadback(fVk, Int64(aOutRows) * c.VocabSize * 4);
     end;
   end;
 end;
@@ -474,7 +487,8 @@ var
   n, h, f, qw, kvw, half, past, l, outRows: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
-  rope: TRopePush;
+  qk: TQkRopePush;
+  norm: TNormPush;
   att: TAttentionPush;
 begin
   c := fModel.Config;
@@ -499,47 +513,53 @@ begin
   fVk.BatchBegin;
   try
     fVk.BatchCopy(aCtx.fIn, 0, aCtx.fX, 0, Int64(n) * h * 4);
-    fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fCos, 0, Int64(n) * half * 4);
-    fVk.BatchCopy(aCtx.fIn, Int64(n) * (h + half) * 4, aCtx.fSin, 0,
-      Int64(n) * half * 4);
-    rope.Rows := n;
-    rope.HeadDim := c.HeadDim;
+    fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fCos, 0, Int64(n) * half * 2 * 4);
+    qk.Rows := n;
+    qk.Heads := c.Heads;
+    qk.KvHeads := c.KvHeads;
+    qk.HeadDim := c.HeadDim;
+    qk.Past := past;
+    qk.Eps := c.RmsEps;
+    norm.Rows := n;
+    norm.Cols := h;
+    norm.Eps := c.RmsEps;
     att.Rows := n;
     att.Heads := c.Heads;
     att.HeadDim := c.HeadDim;
     att.KvHeads := c.KvHeads;
     att.Past := past;
+    // the input norm of layer 0; every later one comes with the residual of
+    // the layer before (addnorm)
+    RecordNorm(aCtx.fX, n, h, fModel.Layers[0].InputNorm, aCtx.fH);
     for l := 0 to c.Layers - 1 do
     begin
       ly := @fModel.Layers[l];
-      // attention block: pre-norm, projections, per-head norms, rotary positions
-      RecordNorm(aCtx.fX, n, h, ly^.InputNorm, aCtx.fH);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Q, qw, aCtx.fQ);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.K, kvw, aCtx.fK);
+      // attention block: the three projections side by side (no barrier
+      // between them: they only read fH), then per head the norms, rotary
+      // positions and the store of k and v into the cache
+      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Q, qw, aCtx.fQ, false);
+      fBackend.RecordLinear(aCtx.fH, n, h, ly^.K, kvw, aCtx.fK, false);
       fBackend.RecordLinear(aCtx.fH, n, h, ly^.V, kvw, aCtx.fV);
-      RecordNorm(aCtx.fQ, n * c.Heads, c.HeadDim, ly^.QNorm, aCtx.fQ);
-      RecordNorm(aCtx.fK, n * c.KvHeads, c.HeadDim, ly^.KNorm, aCtx.fK);
-      rope.Heads := c.Heads;
-      fVk.BatchDispatch(fRope, [aCtx.fQ, aCtx.fCos, aCtx.fSin], @rope,
-        (n * c.Heads * half + 127) div 128);
-      rope.Heads := c.KvHeads;
-      fVk.BatchDispatch(fRope, [aCtx.fK, aCtx.fCos, aCtx.fSin], @rope,
-        (n * c.KvHeads * half + 127) div 128);
-      fVk.BatchCopy(aCtx.fK, 0, aCtx.fKeys[l], Int64(past) * kvw * 4,
-        Int64(n) * kvw * 4);
-      fVk.BatchCopy(aCtx.fV, 0, aCtx.fValues[l], Int64(past) * kvw * 4,
-        Int64(n) * kvw * 4);
+      fVk.BatchDispatch(fQkRope, [aCtx.fQ, aCtx.fK, aCtx.fV,
+        Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fCos,
+        aCtx.fKeys[l], aCtx.fValues[l]], @qk, c.Heads + c.KvHeads, n);
       fVk.BatchDispatch(fAttention, [aCtx.fQ, aCtx.fKeys[l], aCtx.fValues[l],
         aCtx.fAttn, aCtx.fScores], @att, c.Heads, n);
       fBackend.RecordLinear(aCtx.fAttn, n, qw, ly^.O, h, aCtx.fTmp);
-      RecordElementwise(fAdd, [aCtx.fX, aCtx.fTmp, aCtx.fX], n * h);
-      // feed-forward block: pre-norm, SwiGLU, residual
-      RecordNorm(aCtx.fX, n, h, ly^.PostNorm, aCtx.fH);
-      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Gate, f, aCtx.fGate);
+      // residual and the feed-forward pre-norm, gate and up side by side,
+      // SwiGLU, down
+      fVk.BatchDispatch(fAddNorm, [aCtx.fX, aCtx.fTmp, Vector(ly^.PostNorm, h),
+        aCtx.fH], @norm, n);
+      fBackend.RecordLinear(aCtx.fH, n, h, ly^.Gate, f, aCtx.fGate, false);
       fBackend.RecordLinear(aCtx.fH, n, h, ly^.Up, f, aCtx.fUp);
       RecordElementwise(fSwiGlu, [aCtx.fGate, aCtx.fUp], n * f);
       fBackend.RecordLinear(aCtx.fGate, n, f, ly^.Down, h, aCtx.fTmp);
-      RecordElementwise(fAdd, [aCtx.fX, aCtx.fTmp, aCtx.fX], n * h);
+      // the residual, and the input norm of the next layer
+      if l < c.Layers - 1 then
+        fVk.BatchDispatch(fAddNorm, [aCtx.fX, aCtx.fTmp,
+          Vector(fModel.Layers[l + 1].InputNorm, h), aCtx.fH], @norm, n)
+      else
+        RecordElementwise(fAdd, [aCtx.fX, aCtx.fTmp, aCtx.fX], n * h);
     end;
     if outRows > 0 then
     begin

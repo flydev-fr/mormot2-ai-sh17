@@ -372,15 +372,20 @@ begin
           [gpu.Vulkan.DeviceName, gpu.Vulkan.DeviceType, (t1 - t0) div 1000,
            PeakRssMB]);
         vctx := vk.NewContext;
+        gpu.Vulkan.Profile := GetEnvironmentVariable('LAI_VULKAN_PROFILE') = '1';
         // warm-up: pipelines, buffers sized for the prompt
         vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
         vctx.Reset;
+        gpu.Vulkan.ProfileReset;
         QueryPerformanceMicroSeconds(t0);
         vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
         QueryPerformanceMicroSeconds(t1);
         prefillUs := t1 - t0;
         ConsoleWrite('prefill: % tokens in % ms = % tokens/s',
           [promptLen, prefillUs div 1000, promptLen * 1000000 / prefillUs]);
+        if gpu.Vulkan.Profile then
+          ConsoleWrite('  %', [gpu.Vulkan.ProfileText]);
+        gpu.Vulkan.ProfileReset;
         n := 0;
         QueryPerformanceMicroSeconds(t0);
         for i := 1 to newTokens do
@@ -393,6 +398,8 @@ begin
         decodeUs := t1 - t0;
         ConsoleWrite('decode: % tokens in % ms = % tokens/s (% ms/token)',
           [n, decodeUs div 1000, n * 1000000 / decodeUs, decodeUs / 1000 / n]);
+        if gpu.Vulkan.Profile then
+          ConsoleWrite('  %', [gpu.Vulkan.ProfileText]);
         ConsoleWrite('context: % tokens, peak % MB', [vctx.Length, PeakRssMB]);
       finally
         vctx.Free;

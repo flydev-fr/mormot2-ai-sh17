@@ -47,6 +47,10 @@ type
     procedure RefusesMisuse;
     /// device memory: what goes up comes down, at an offset, also in pieces
     procedure UploadDownload;
+    /// a batch with Profile on reports its GPU time (where the queue has
+    // timestamps); the tick period is read from the device limits at the
+    // offset of this bitness
+    procedure ProfilesBatches;
     /// phase 4b: TInferVulkanBackend.Linear for F32, Q8_0, Q4_K and Q6_K
     // weights against the reference's F32 product of the dequantized weights
     // (a tolerance: another summation order), with and without bias, more
@@ -212,6 +216,40 @@ begin
   end;
 end;
 
+procedure TTestInferVulkan.ProfilesBatches;
+var
+  pipe: TInferVkPipeline;
+  a: TInferVkBuffer;
+  n: cardinal;
+  text: RawUtf8;
+begin
+  if not HasDevice then
+    exit;
+  if not fVk.HasTimestamps then
+  begin
+    AddConsole('SKIP Vulkan profiling: no timestamps on % ', [fVk.DeviceName]);
+    exit;
+  end;
+  pipe := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
+  a := TInferVkBuffer.Create(fVk, 4 * 65536, true);
+  try
+    pipe.Name := 'add';
+    n := 65536;
+    fVk.Profile := true;
+    fVk.ProfileReset;
+    fVk.BatchBegin;
+    fVk.BatchDispatch(pipe, [a, a, a], @n, 512);
+    fVk.BatchDispatch(pipe, [a, a, a], @n, 512);
+    fVk.BatchSubmit;
+    text := fVk.ProfileText;
+    CheckUtf8(PosEx('add ', text) > 0, 'profile: %', [text]);
+  finally
+    fVk.Profile := false;
+    a.Free;
+    pipe.Free;
+  end;
+end;
+
 procedure TTestInferVulkan.LinearMatchesReference;
 const
   // rows, in, out: one row, partial work, many rows, odd outputs, and more
@@ -290,6 +328,17 @@ begin
           '% cached weights', [INFER_DTYPE_NAME[kind]]);
       end;
     end;
+    // F32 with inputs no multiple of 8: linear.comp instead of linear8.comp
+    Fill(x, 3 * 36, 61, 2);
+    Fill(wf, 5 * 36, 62, 0.5);
+    SetLength(y1, 3 * 5);
+    SetLength(y2, 3 * 5);
+    ref.Linear(pointer(x), 3, 36, InferWeight(pointer(wf), idtF32), 5, nil, pointer(y1));
+    calls := gpu.GpuLinears;
+    gpu.Linear(pointer(x), 3, 36, InferWeight(pointer(wf), idtF32), 5, nil, pointer(y2));
+    Check(gpu.GpuLinears = calls + 1, 'F32 x 36 on the device');
+    e := RelError(pointer(y2), pointer(y1), 3 * 5);
+    CheckUtf8(e <= 1e-5, 'F32 3 x 36 x 5: relative error %', [e]);
     // a weight type without a shader: the CPU, bit for bit as the fast backend
     wq := RandomQ4(8, 64, 5);
     Fill(x, 2 * 64, 3, 2);

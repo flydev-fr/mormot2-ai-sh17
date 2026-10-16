@@ -297,6 +297,15 @@ type
     flags: TVkFlags;
   end;
 
+  TVkQueryPoolCreateInfo = record
+    sType: integer;
+    pNext: pointer;
+    flags: TVkFlags;
+    queryType: integer;
+    queryCount: cardinal;
+    pipelineStatistics: TVkFlags;
+  end;
+
   TVkBufferCopy = record
     srcOffset: TVkDeviceSize;
     dstOffset: TVkDeviceSize;
@@ -321,6 +330,7 @@ const
   VK_STRUCTURE_TYPE_SUBMIT_INFO = 4;
   VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5;
   VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8;
+  VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO = 11;
   VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12;
   VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16;
   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO = 18;
@@ -345,6 +355,7 @@ const
   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1;
   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2;
   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 4;
+  VK_MEMORY_PROPERTY_HOST_CACHED_BIT = 8;
   VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 1;
   VK_BUFFER_USAGE_TRANSFER_DST_BIT = 2;
   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = $20;
@@ -357,6 +368,10 @@ const
   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 1;
   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = $800;
   VK_PIPELINE_STAGE_HOST_BIT = $4000;
+  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT = $2000;
+  VK_QUERY_TYPE_TIMESTAMP = 2;
+  VK_QUERY_RESULT_64_BIT = 1;
+  VK_QUERY_RESULT_WAIT_BIT = 2;
   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = $10000;
   VK_ACCESS_SHADER_WRITE_BIT = $40;
   VK_ACCESS_HOST_READ_BIT = $2000;
@@ -380,6 +395,7 @@ type
     fBuffer, fMemory: TVkHandle;
     fSize: TVkDeviceSize;
     fMapped: pointer;
+    fReadback: boolean;
     procedure Open(aSize: TVkDeviceSize; aDevice: boolean);
     procedure Close;
   public
@@ -387,6 +403,9 @@ type
     // in device memory when aDevice is true
     constructor Create(aOwner: TInferVulkan; aSize: TVkDeviceSize;
       aDevice: boolean = false);
+    /// a host-visible buffer the host reads from: cached host memory where the
+    // device has it (uncached memory - write-combined - reads very slowly)
+    constructor CreateReadback(aOwner: TInferVulkan; aSize: TVkDeviceSize);
     destructor Destroy; override;
     /// the host address of the buffer contents, nil for device memory the host
     // cannot see (use TInferVulkan.Upload / Download)
@@ -402,6 +421,7 @@ type
     fOwner: TInferVulkan;
     fModule, fSetLayout, fLayout, fPipeline, fPool, fSet: TVkHandle;
     fBuffers, fPushSize: integer;
+    fName: RawUtf8;
     procedure Open(aSpirv: PCardinal; aWords: PtrInt);
     procedure Close;
   public
@@ -410,6 +430,8 @@ type
     destructor Destroy; override;
     property Buffers: integer read fBuffers;
     property PushSize: integer read fPushSize;
+    /// the label of its dispatches in TInferVulkan.ProfileText
+    property Name: RawUtf8 read fName write fName;
   end;
 
   /// the Vulkan entry points used here (loaded at run time)
@@ -538,6 +560,22 @@ type
       aBufferCount: cardinal; aBuffers: pointer; aImageCount: cardinal;
       aImages: pointer);
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    CreateQueryPool: function(aDevice: TVkDispatch; aInfo: pointer; aAlloc: pointer;
+      var aPool: TVkHandle): TVkResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    DestroyQueryPool: procedure(aDevice: TVkDispatch; aPool: TVkHandle;
+      aAlloc: pointer);
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GetQueryPoolResults: function(aDevice: TVkDispatch; aPool: TVkHandle;
+      aFirst, aCount: cardinal; aDataSize: PtrUInt; aData: pointer;
+      aStride: TVkDeviceSize; aFlags: TVkFlags): TVkResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    CmdResetQueryPool: procedure(aBuffer: TVkDispatch; aPool: TVkHandle;
+      aFirst, aCount: cardinal);
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    CmdWriteTimestamp: procedure(aBuffer: TVkDispatch; aStage: TVkFlags;
+      aPool: TVkHandle; aQuery: cardinal);
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     QueueSubmit: function(aQueue: TVkDispatch; aCount: cardinal; aSubmits: pointer;
       aFence: TVkHandle): TVkResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
@@ -582,6 +620,19 @@ type
     fBatchPool: TVkHandle;
     fBatchSets: integer;
     fBatching: boolean;
+    // profiling: a timestamp after every operation of a batch, summed per name
+    fProfile, fProfiling: boolean;
+    fTimestampBits: cardinal;
+    fTimestampPeriod: single;
+    fQueryPool: TVkHandle;
+    fQueries: integer;
+    fQueryTag: TRawUtf8DynArray;
+    fProfName: TRawUtf8DynArray;
+    fRecordStart: Int64;
+    fRecordUs, fWaitUs, fBatches: Int64;
+    fProfNs, fProfCount: TInt64DynArray;
+    procedure Stamp(const aTag: RawUtf8);
+    procedure Collect;
     procedure Check(aResult: TVkResult; const aCall: RawUtf8);
     // a failed vkCreate*/vkAllocate*/vkMap* leaves its output undefined: reset
     // it, so that the destructor does not release what was never created
@@ -610,7 +661,7 @@ type
     procedure DoBatchBegin;
     procedure DoBatchDispatch(aPipeline: TInferVkPipeline;
       const aBuffers: array of TInferVkBuffer; aPush: pointer;
-      aX, aY, aZ: cardinal);
+      aX, aY, aZ: cardinal; aBarrier: boolean);
   public
     /// load the loader, create an instance and a device; raises EInferVulkan
     // when any step fails (no loader, no device, no compute queue)
@@ -637,9 +688,11 @@ type
     // buffers made before BatchSubmit are seen by the batch
     procedure BatchBegin;
     /// record aPipeline on aBuffers (see Run) into the batch
+    // - aBarrier = false: the next operation may run alongside this one - only
+    // when it neither reads what this one writes nor writes what it touches
     procedure BatchDispatch(aPipeline: TInferVkPipeline;
       const aBuffers: array of TInferVkBuffer; aPush: pointer;
-      aX: cardinal; aY: cardinal = 1; aZ: cardinal = 1);
+      aX: cardinal; aY: cardinal = 1; aZ: cardinal = 1; aBarrier: boolean = true);
     /// record a copy of aBytes from aSrc at aSrcOffset to aDst at aDstOffset
     procedure BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
       aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
@@ -657,6 +710,15 @@ type
     property MaxStorageRange: cardinal read fMaxStorageRange;
     /// VkPhysicalDeviceLimits.maxComputeWorkGroupInvocations (at least 128)
     property MaxInvocations: cardinal read fMaxInvocations;
+    /// true: every batch writes a GPU timestamp after each operation and sums
+    // the time per pipeline name (needs timestamp support on the queue)
+    property Profile: boolean read fProfile write fProfile;
+    /// the summed GPU time per name since ProfileReset, longest first
+    function ProfileText: RawUtf8;
+    /// forget the summed times
+    procedure ProfileReset;
+    /// true when the compute queue writes timestamps (Profile can measure)
+    function HasTimestamps: boolean;
   end;
 
 const
@@ -909,13 +971,22 @@ begin
       '(LAI_VULKAN_DEVICE=%)', [GetEnvironmentVariable('LAI_VULKAN_DEVICE')]);
   fPhysical := phys[best];
   fFamily := family;
+  families := 0;
+  fApi.GetPhysicalDeviceQueueFamilyProperties(fPhysical, families, nil);
+  SetLength(fam, families);
+  fApi.GetPhysicalDeviceQueueFamilyProperties(fPhysical, families, pointer(fam));
+  fTimestampBits := fam[family].timestampValidBits;
   fApi.GetPhysicalDeviceProperties(fPhysical, @props);
   fVendorId := PInteger(@props[8])^;
   fDeviceType := PInteger(@props[16])^;
   fDeviceName := PAnsiChar(@props[20]); // deviceName[256], zero-terminated
-  // VkPhysicalDeviceLimits starts at byte 296 (offsets from vulkan_core.h)
+  // VkPhysicalDeviceLimits starts at byte 296 (offsets from vulkan_core.h, the
+  // same for 32 and 64 bits up to the first size_t member)
   fMaxStorageRange := PCardinal(@props[296 + 28])^;
   fMaxInvocations := PCardinal(@props[296 + 232])^;
+  // nanoseconds per tick; behind minMemoryMapAlignment, a size_t: the offset
+  // differs between 32 and 64 bits (vulkan_core.h)
+  fTimestampPeriod := PSingle(@props[296 + {$ifdef CPU64} 424 {$else} 416 {$endif}])^;
   fApi.GetPhysicalDeviceMemoryProperties(fPhysical, @fMemory);
   // the device with one compute queue
   priority := 1;
@@ -964,6 +1035,11 @@ begin
   Load(fApi.CmdPushConstants, 'vkCmdPushConstants', true);
   Load(fApi.CmdDispatch, 'vkCmdDispatch', true);
   Load(fApi.CmdCopyBuffer, 'vkCmdCopyBuffer', true);
+  Load(fApi.CreateQueryPool, 'vkCreateQueryPool', true);
+  Load(fApi.DestroyQueryPool, 'vkDestroyQueryPool', true);
+  Load(fApi.GetQueryPoolResults, 'vkGetQueryPoolResults', true);
+  Load(fApi.CmdResetQueryPool, 'vkCmdResetQueryPool', true);
+  Load(fApi.CmdWriteTimestamp, 'vkCmdWriteTimestamp', true);
   Load(fApi.CmdPipelineBarrier, 'vkCmdPipelineBarrier', true);
   Load(fApi.QueueSubmit, 'vkQueueSubmit', true);
   Load(fApi.CreateFence, 'vkCreateFence', true);
@@ -1020,6 +1096,8 @@ begin
       fApi.DeviceWaitIdle(fDevice);
     if (fBatchPool <> 0) and Assigned(fApi.DestroyDescriptorPool) then
       fApi.DestroyDescriptorPool(fDevice, fBatchPool, nil);
+    if (fQueryPool <> 0) and Assigned(fApi.DestroyQueryPool) then
+      fApi.DestroyQueryPool(fDevice, fQueryPool, nil);
     if (fFence <> 0) and Assigned(fApi.DestroyFence) then
       fApi.DestroyFence(fDevice, fFence, nil);
     if (fCmdPool <> 0) and Assigned(fApi.DestroyCommandPool) then
@@ -1227,7 +1305,7 @@ begin
       n := aBytes;
       if n > VK_STAGING_MAX then
         n := VK_STAGING_MAX;
-      fStaging := TInferVkBuffer.Create(self, n);
+      fStaging := TInferVkBuffer.CreateReadback(self, n); // both ways
     end;
   while aBytes > 0 do
   begin
@@ -1296,6 +1374,7 @@ procedure TInferVulkan.DoBatchBegin;
 var
   size: TVkDescriptorPoolSize;
   info: TVkDescriptorPoolCreateInfo;
+  qinfo: TVkQueryPoolCreateInfo;
 begin
   if fBroken then
     raise EInferVulkan.Create('Vulkan: an earlier Run did not finish');
@@ -1317,25 +1396,138 @@ begin
     // no batch is pending (each waited): its sets may go
     Check(fApi.ResetDescriptorPool(fDevice, fBatchPool, 0), 'vkResetDescriptorPool');
   fBatchSets := 0;
+  fProfiling := fProfile and (fTimestampBits > 0);
+  if fProfiling and (fQueryPool = 0) then
+  begin
+    FillCharFast(qinfo, SizeOf(qinfo), 0);
+    qinfo.sType := VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qinfo.queryType := VK_QUERY_TYPE_TIMESTAMP;
+    qinfo.queryCount := VK_BATCH_SETS * 2;
+    CheckNew(fApi.CreateQueryPool(fDevice, @qinfo, nil, fQueryPool), fQueryPool,
+      'vkCreateQueryPool');
+  end;
+  QueryPerformanceMicroSeconds(fRecordStart);
   CmdBegin;
   fBatching := true;
+  fQueries := 0;
+  if fProfiling then
+  begin
+    fApi.CmdResetQueryPool(fCmd, fQueryPool, 0, VK_BATCH_SETS * 2);
+    Stamp('');
+  end;
+end;
+
+procedure TInferVulkan.Stamp(const aTag: RawUtf8);
+begin
+  if not fProfiling or (fQueries >= VK_BATCH_SETS * 2) then
+    exit;
+  fApi.CmdWriteTimestamp(fCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fQueryPool,
+    fQueries);
+  if fQueries >= length(fQueryTag) then
+    SetLength(fQueryTag, VK_BATCH_SETS * 2);
+  fQueryTag[fQueries] := aTag;
+  inc(fQueries);
+end;
+
+procedure TInferVulkan.Collect;
+var
+  ticks: TInt64DynArray;
+  i, j: PtrInt;
+  mask: Int64;
+  ns: Int64;
+begin
+  if not fProfiling or (fQueries < 2) then
+    exit;
+  SetLength(ticks, fQueries);
+  Check(fApi.GetQueryPoolResults(fDevice, fQueryPool, 0, fQueries, fQueries * 8,
+    pointer(ticks), 8, VK_QUERY_RESULT_64_BIT or VK_QUERY_RESULT_WAIT_BIT),
+    'vkGetQueryPoolResults');
+  if fTimestampBits >= 64 then
+    mask := -1
+  else
+    mask := (Int64(1) shl fTimestampBits) - 1;
+  for i := 1 to fQueries - 1 do
+  begin
+    ns := Round(((ticks[i] - ticks[i - 1]) and mask) * fTimestampPeriod);
+    j := 0;
+    while (j < length(fProfName)) and (fProfName[j] <> fQueryTag[i]) do
+      inc(j);
+    if j = length(fProfName) then
+    begin
+      SetLength(fProfName, j + 1);
+      SetLength(fProfNs, j + 1);
+      SetLength(fProfCount, j + 1);
+      fProfName[j] := fQueryTag[i];
+    end;
+    inc(fProfNs[j], ns);
+    inc(fProfCount[j]);
+  end;
+end;
+
+function TInferVulkan.HasTimestamps: boolean;
+begin
+  result := (fTimestampBits > 0) and (fTimestampPeriod > 0);
+end;
+
+procedure TInferVulkan.ProfileReset;
+begin
+  fRecordUs := 0;
+  fWaitUs := 0;
+  fBatches := 0;
+  fProfName := nil;
+  fProfNs := nil;
+  fProfCount := nil;
+end;
+
+function TInferVulkan.ProfileText: RawUtf8;
+var
+  i, j, best: PtrInt;
+  total: Int64;
+  done: array of boolean;
+  list: RawUtf8;
+begin
+  result := '';
+  list := '';
+  total := 0;
+  for i := 0 to high(fProfNs) do
+    inc(total, fProfNs[i]);
+  if total = 0 then
+    exit;
+  SetLength(done, length(fProfNs));
+  for i := 0 to high(fProfNs) do
+  begin
+    best := -1;
+    for j := 0 to high(fProfNs) do
+      if not done[j] and ((best < 0) or (fProfNs[j] > fProfNs[best])) then
+        best := j;
+    done[best] := true;
+    if list <> '' then
+      list := list + ', ';
+    list := list + FormatUtf8('% % ms (% pct, % x)', [fProfName[best],
+      fProfNs[best] div 1000 / 1000, fProfNs[best] * 100 div total, fProfCount[best]]);
+  end;
+  result := FormatUtf8('% batches, host recording % ms, submit and wait % ms; ' +
+    'GPU % ms: %', [fBatches, fRecordUs / 1000, fWaitUs / 1000,
+    total div 1000 / 1000, list]);
 end;
 
 procedure TInferVulkan.BatchDispatch(aPipeline: TInferVkPipeline;
-  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal);
+  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal;
+  aBarrier: boolean);
 var
   fpu: TDriverFpu;
 begin
   fpu := DriverFpuEnter;
   try
-    DoBatchDispatch(aPipeline, aBuffers, aPush, aX, aY, aZ);
+    DoBatchDispatch(aPipeline, aBuffers, aPush, aX, aY, aZ, aBarrier);
   finally
     DriverFpuLeave(fpu);
   end;
 end;
 
 procedure TInferVulkan.DoBatchDispatch(aPipeline: TInferVkPipeline;
-  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal);
+  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal;
+  aBarrier: boolean);
 var
   ainfo: TVkDescriptorSetAllocateInfo;
   dset: TVkHandle;
@@ -1362,7 +1554,11 @@ begin
     fApi.CmdPushConstants(fCmd, aPipeline.fLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
       aPipeline.PushSize, aPush);
   fApi.CmdDispatch(fCmd, aX, aY, aZ);
-  Barrier;
+  if aBarrier then
+  begin
+    Barrier;
+    Stamp(aPipeline.Name);
+  end;
 end;
 
 procedure TInferVulkan.BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
@@ -1384,6 +1580,7 @@ begin
     region.size := aBytes;
     fApi.CmdCopyBuffer(fCmd, aSrc.Handle, aDst.Handle, 1, @region);
     Barrier;
+    Stamp('copy');
   finally
     DriverFpuLeave(fpu);
   end;
@@ -1392,13 +1589,20 @@ end;
 procedure TInferVulkan.BatchSubmit;
 var
   fpu: TDriverFpu;
+  t1, t2: Int64;
 begin
   if not fBatching then
     raise EInferVulkan.Create('Vulkan.BatchSubmit: no BatchBegin');
   fBatching := false;
   fpu := DriverFpuEnter;
   try
+    QueryPerformanceMicroSeconds(t1);
     CmdSubmit;
+    QueryPerformanceMicroSeconds(t2);
+    inc(fRecordUs, t1 - fRecordStart);
+    inc(fWaitUs, t2 - t1);
+    inc(fBatches);
+    Collect;
   finally
     DriverFpuLeave(fpu);
   end;
@@ -1438,6 +1642,22 @@ begin
   end;
 end;
 
+constructor TInferVkBuffer.CreateReadback(aOwner: TInferVulkan;
+  aSize: TVkDeviceSize);
+var
+  fpu: TDriverFpu;
+begin
+  inherited Create;
+  fOwner := aOwner;
+  fReadback := true;
+  fpu := DriverFpuEnter;
+  try
+    Open(aSize, false);
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
 procedure TInferVkBuffer.Open(aSize: TVkDeviceSize; aDevice: boolean);
 const
   HOST = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -1467,7 +1687,13 @@ begin
   FillCharFast(alloc, SizeOf(alloc), 0);
   alloc.sType := VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   alloc.allocationSize := req.size;
-  if not aDevice then
+  kind := -1;
+  if fReadback then
+    kind := aOwner.TryMemoryType(req.memoryTypeBits,
+      HOST or VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  if kind >= 0 then
+    // cached host memory
+  else if not aDevice then
     kind := aOwner.MemoryType(req.memoryTypeBits, HOST)
   else
   begin

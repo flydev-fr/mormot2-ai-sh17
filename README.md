@@ -35,7 +35,7 @@ Number of assertions per suite, every one passing; each row with numbers ran bet
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2362 ⁸ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁸ |
 | Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
 | Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
 | Windows x86 | **Delphi 7** | 1253 | 714 | 1401 ⁶ |
@@ -570,8 +570,9 @@ Next, in this order:
    one .gguf file is a complete native `ILlmClient`, and Q4_K_M files load too (Q4_K
    and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
    decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md).
-2. **GPU** — the whole Qwen3 forward pass runs on Vulkan (an RTX 5090 decodes Qwen3-0.6B
-   at 121-126 tokens/s with first, naive shaders; faster shaders next). Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
+2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
+   at about 8700 and decodes at about 320 tokens/s (Q8_0; the i9 CPU: 757 and 72); long
+   contexts and the native client come next. Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
    no shipped DLLs), CUDA through the driver API as the second backend.
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.

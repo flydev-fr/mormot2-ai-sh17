@@ -1,0 +1,88 @@
+// LandrixAI - the per-head part of a Qwen3 attention block in one dispatch
+// (phase 4e of docs/native-inference.md): for every token row and head,
+// RMSNorm of q (QNorm) and k (KNorm), rotary positions on both, and k and v
+// stored into the KV cache at position past + row - what were six dispatches
+// (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
+// - one work group of 128 per (row, head): heads first, then the KV heads
+// (which also store v); headDim <= 256, even
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufQ { float q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float k[]; };
+layout(std430, binding = 2) readonly buffer BufV { float v[]; };
+layout(std430, binding = 3) readonly buffer BufQN { float qn[]; };
+layout(std430, binding = 4) readonly buffer BufKN { float kn[]; };
+layout(std430, binding = 5) readonly buffer BufCS { float cs[]; }; // cos, then sin
+layout(std430, binding = 6) writeonly buffer BufKC { float kc[]; };
+layout(std430, binding = 7) writeonly buffer BufVC { float vc[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, heads, kvHeads, headDim, past;
+  float eps;
+} p;
+
+shared float partial[128];
+shared float normed[256];
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint r = gl_WorkGroupID.y;
+  uint hh = gl_WorkGroupID.x; // 0 .. heads + kvHeads - 1
+  uint d = p.headDim;
+  uint half_ = d >> 1;
+  bool isQ = hh < p.heads;
+  uint h = isQ ? hh : hh - p.heads;
+  uint src = isQ ? (r * p.heads + h) * d : (r * p.kvHeads + h) * d;
+  // the sum of squares of the head
+  float s = 0.0;
+  for (uint c = t; c < d; c += 128u)
+  {
+    float a = isQ ? q[src + c] : k[src + c];
+    s += a * a;
+  }
+  partial[t] = s;
+  barrier();
+  for (uint w = 64u; w > 0u; w >>= 1)
+  {
+    if (t < w)
+      partial[t] += partial[t + w];
+    barrier();
+  }
+  float inv = inversesqrt(partial[0] / float(d) + p.eps);
+  for (uint c = t; c < d; c += 128u)
+  {
+    float a = isQ ? q[src + c] : k[src + c];
+    normed[c] = (isQ ? qn[c] : kn[c]) * (a * inv);
+  }
+  barrier();
+  // rotary positions: the halves rotated by the factors of the row
+  uint cbase = r * half_;
+  uint sbase = p.rows * half_ + r * half_;
+  uint kvw = p.kvHeads * d;
+  uint dst = (p.past + r) * kvw + h * d;
+  for (uint i = t; i < half_; i += 128u)
+  {
+    float c = cs[cbase + i];
+    float sn = cs[sbase + i];
+    float a = normed[i];
+    float b = normed[i + half_];
+    float x0 = a * c - b * sn;
+    float x1 = b * c + a * sn;
+    if (isQ)
+    {
+      q[src + i] = x0;
+      q[src + i + half_] = x1;
+    }
+    else
+    {
+      kc[dst + i] = x0;
+      kc[dst + i + half_] = x1;
+    }
+  }
+  if (!isQ)
+    for (uint c = t; c < d; c += 128u)
+      vc[dst + c] = v[src + c];
+}

@@ -45,7 +45,7 @@ type
   TInferVulkanBackend = class(TInferCpuFastBackend)
   protected
     fVk: TInferVulkan;
-    fLinear: TInferVkPipeline;
+    fLinear, fLinear8: TInferVkPipeline;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -60,6 +60,10 @@ type
     function Weight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
+    // the shader and work groups of a Linear: linear8.comp (4 features and 8
+    // rows per work group) when the inputs allow it, else linear.comp
+    function LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
+      out aX, aY: cardinal): TInferVkPipeline;
   public
     /// the CPU part as TInferCpuFastBackend.Create, plus the Vulkan device
     // (TInferVulkan.Create: raises EInferVulkan without one)
@@ -84,7 +88,8 @@ type
     // weights from the cache - GpuLock held, BatchBegin called; x and y are
     // [aRows, aIn] and [aRows, aOut] at offset 0
     procedure RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
-      const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer);
+      const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer;
+      aBarrier: boolean = true);
     /// the device context
     property Vulkan: TInferVulkan read fVk;
     /// how many Linear calls ran on the device
@@ -117,6 +122,10 @@ begin
   fVk := TInferVulkan.Create;
   fLinear := TInferVkPipeline.Create(fVk, @SPV_LINEAR, length(SPV_LINEAR), 4,
     SizeOf(TLinearPush));
+  fLinear.Name := 'linear';
+  fLinear8 := TInferVkPipeline.Create(fVk, @SPV_LINEAR8, length(SPV_LINEAR8), 4,
+    SizeOf(TLinearPush));
+  fLinear8.Name := 'linear';
   fNoBias := TInferVkBuffer.Create(fVk, 4, true);
 end;
 
@@ -128,6 +137,7 @@ begin
     FreeAndNil(fX);
     FreeAndNil(fY);
     FreeAndNil(fNoBias);
+    FreeAndNil(fLinear8);
     FreeAndNil(fLinear);
     FreeAndNil(fVk);
   end;
@@ -171,11 +181,35 @@ begin
     (aIn mod INFER_DTYPE_BLOCK[aType] = 0);
 end;
 
+function TInferVulkanBackend.LinearShape(aType: TInferDType; aIn, aRows,
+  aOut: PtrInt; out aX, aY: cardinal): TInferVkPipeline;
+var
+  n: PtrInt;
+begin
+  if (aType <> idtF32) or (aIn and 7 = 0) then
+  begin
+    // 8 weights per step: every block type qualifies, F32 when aIn allows
+    result := fLinear8;
+    n := (aOut + 3) shr 2;
+    aY := (aRows + 7) shr 3;
+  end
+  else
+  begin
+    result := fLinear;
+    n := aOut;
+    aY := aRows;
+  end;
+  if n > 65535 then
+    n := 65535; // both shaders loop over the features
+  aX := n;
+end;
+
 procedure TInferVulkanBackend.RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
-  const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer);
+  const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean);
 var
   push: TLinearPush;
-  groups: cardinal;
+  gx, gy: cardinal;
+  pipe: TInferVkPipeline;
 begin
   if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or (aOut < 1) then
     raise EInferVulkan.CreateUtf8('%.RecordLinear: % rows of % % into %',
@@ -185,12 +219,10 @@ begin
   push.OutCount := aOut;
   push.DType := LINEAR_DTYPE[w.DType];
   push.HasBias := 0;
-  groups := aOut;
-  if groups > 65535 then
-    groups := 65535;
-  fVk.BatchDispatch(fLinear, [DeviceWeight(w.Data, w.DType, Int64(aOut) *
+  pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);
+  fVk.BatchDispatch(pipe, [DeviceWeight(w.Data, w.DType, Int64(aOut) *
     (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]), x, fNoBias, y],
-    @push, groups, aRows);
+    @push, gx, gy, 1, aBarrier);
 end;
 
 function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;
@@ -251,7 +283,8 @@ var
   wbytes: Int64;
   wb, bb, xb, yb: TInferVkBuffer;
   push: TLinearPush;
-  groups: cardinal;
+  gx, gy: cardinal;
+  pipe: TInferVkPipeline;
 begin
   if (LINEAR_DTYPE[w.DType] = 0) or (aRows < 1) or (aRows > 65535) or
      (aIn < 1) or (aOut < 1) or (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0) then
@@ -284,10 +317,8 @@ begin
     push.OutCount := aOut;
     push.DType := LINEAR_DTYPE[w.DType];
     push.HasBias := ord(bias <> nil);
-    groups := aOut;
-    if groups > 65535 then
-      groups := 65535; // the shader loops over the outputs
-    fVk.Run(fLinear, [wb, xb, bb, yb], @push, groups, aRows);
+    pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);
+    fVk.Run(pipe, [wb, xb, bb, yb], @push, gx, gy);
     fVk.Download(yb, 0, y, Int64(aRows) * aOut * 4);
     inc(fGpuLinears);
   finally

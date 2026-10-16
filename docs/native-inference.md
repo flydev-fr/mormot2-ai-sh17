@@ -963,6 +963,32 @@ RTX 5090 (Treiber 616.64, Windows 11), `llm-bench … vulkan`, naive Shader:
 - Grenzen werden vorab geprüft: Chunk-Zeilen begrenzt durch Scores-Puffer, Logits aller Zeilen
   und die 65535 Arbeitsgruppen je Dimension; KV-Kapazität auf `maxStorageBufferRange` geklemmt.
 
+**4e, erster Teil (2026-10-16):** gemessen mit GPU-Zeitstempeln (`LAI_VULKAN_PROFILE=1` in
+`llm-bench … vulkan`: GPU-Zeit je Operation, Host-Zeit für Aufzeichnen und Warten), dann:
+
+- `tools/vk/linear8.comp`: 4 Ausgaben × 32 Lanes je Arbeitsgruppe, jede Lane entpackt 8
+  aufeinanderfolgende Gewichte aus ganzen Wörtern und rechnet sie gegen bis zu 8 Token-Zeilen
+  (Prefill nutzt jedes entpackte Gewicht 8-mal); `linear.comp` bleibt für F32 mit einer
+  Eingangsbreite, die kein Vielfaches von 8 ist.
+- Rücklese-Puffer (Logits, Staging) in `HOST_CACHED`-Speicher: Die Logits aus nicht
+  gecachtem (write-combined) Speicher zu lesen kostete auf der RTX 5090 rund 2 ms je Token.
+- Fusionen: `qkrope.comp` (Q/K-Norm, RoPE, K/V in den Cache - vorher sechs Dispatches),
+  `addnorm.comp` (Residual und folgende RMSNorm); Barrieren nur, wo ein Schritt vom vorigen
+  abhängt (Q/K/V und Gate/Up laufen nebeneinander). Rund 480 Dispatches mit Barriere je
+  Token wurden so zu rund 300, die meisten ohne eigene Wartezeit.
+- `attention.comp`: Anfrage-Kopf in Shared Memory, Schlüssel als `vec4`.
+
+| RTX 5090 | Prefill 200 | Decode 200 | Prefill 1000 | Decode 1000 |
+|---|---|---|---|---|
+| Q4_K_M | 8337 Tok/s | 303 Tok/s | 6335 Tok/s | 196 Tok/s |
+| Q8_0 | 8756 Tok/s | 320 Tok/s | 6581 Tok/s | 204 Tok/s |
+
+- Falle: `VkPhysicalDeviceLimits` enthält `size_t`-Felder - `timestampPeriod` liegt unter
+  32 Bit bei 416, unter 64 Bit bei 424 (gefunden von Codex; Test `ProfilesBatches`).
+- Offen in 4e: Attention bei langen Kontexten (eine Arbeitsgruppe je Kopf ist zu wenig:
+  Decode fällt bei 1000 Tokens auf rund 200 Tok/s), Subgroup-Reduktionen (Vulkan 1.1),
+  Matrix-Kacheln für Prefill; dann `TNativeLlmClient` über die GPU.
+
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 
