@@ -77,13 +77,15 @@ type
     // key (many ranges merged), against the CPU - also with a head dimension
     // of 256 (tiny-qwen3-hd256: the second accumulator of attention.comp);
     // with a KV cache of floats and of half floats (KvF16, a looser
-    // tolerance), the cache grown once with tokens in it
+    // tolerance), the cache grown once with tokens in it; decoding also
+    // through attndec.comp (UseDecodeAttention) where the device runs it
     procedure AttentionRangesMatchCpu;
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
     // compared at every step - skipped on a CPU implementation (lavapipe:
     // minutes), and without the model files; Q8_0 with its 165 MB head in
-    // parts of at most 48 MB (MaxLinearBytes), as a GPU binding 128 MB needs
+    // parts of at most 48 MB (MaxLinearBytes), as a GPU binding 128 MB needs;
+    // Q4_K_M decoding through attndec.comp where the device runs it
     procedure Qwen3GgufMatchesCpu;
     /// TNativeLlmClient on the device (Device := TQwen3Vulkan): the greedy
     // answer of Qwen3-0.6B Q8_0 as without it, the next turn from the prompt
@@ -728,17 +730,20 @@ begin
           [aName, f16, k and 1, vk.UseFlash, e]);
       end;
       vk.UseFlash := flash;
-      // decoding past the prompt, one range and many ranges in turn
+      // decoding past the prompt, one range and many ranges in turn; steps 2
+      // and 3 through attndec.comp where the device runs it
+      vk.DecodeKeys := 0;
       for i := 0 to 3 do
       begin
         vk.SplitKeys := i and 1;
+        vk.UseDecodeAttention := vk.HasDecodeAttention and (i >= 2);
         id := ids[i];
         model.Forward(c1, @id, 1, pointer(d1));
         vk.Forward(c2, @id, 1, pointer(d2));
         e := RelError(pointer(d2), pointer(d1), v);
         CheckUtf8(e <= TOL[f16],
-          '% KvF16=% SplitKeys=% decode step %: relative error %',
-          [aName, f16, i and 1, i, e]);
+          '% KvF16=% SplitKeys=% attndec=% decode step %: relative error %',
+          [aName, f16, i and 1, vk.UseDecodeAttention, i, e]);
       end;
       c1.Truncate(PROMPT);
     end;
@@ -813,6 +818,13 @@ begin
       if f = 1 then
         gpu.MaxLinearBytes := 48 shl 20;
       vk := TQwen3Vulkan.Create(model, gpu);
+      // Q4_K_M: the attention of every decoded token through attndec.comp,
+      // where the device runs it
+      if f = 0 then
+      begin
+        vk.UseDecodeAttention := vk.HasDecodeAttention;
+        vk.DecodeKeys := 0;
+      end;
       c1 := model.NewContext;
       c2 := vk.NewContext;
       SetLength(l1, v);
@@ -834,8 +846,9 @@ begin
         vk.Forward(c2, @id, 1, pointer(l2));
       end;
       AddConsole('% on %: lowest logits cosine %, argmax agrees % of %, ' +
-        'head in parts of % rows', [FILES[f], fVk.DeviceName, worst, agree, STEPS,
-        gpu.LinearPart(model.Head.DType, model.Config.Hidden, v)]);
+        'head in parts of % rows, attndec %', [FILES[f], fVk.DeviceName, worst,
+        agree, STEPS, gpu.LinearPart(model.Head.DType, model.Config.Hidden, v),
+        vk.UseDecodeAttention]);
       CheckUtf8(worst >= 0.99, '% logits cosine %', [FILES[f], worst]);
       CheckUtf8(agree >= STEPS - 2, '% argmax agrees % of %', [FILES[f], agree, STEPS]);
     finally

@@ -248,7 +248,10 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
    `TQwen3Cuda.KvF16`, Vorgabe an; `docs/native-inference.md`): auf der RTX 5090 Decode bei
    8000 Tokens +8 % unter Vulkan, +24 % unter CUDA. Auf dem M2 Pro dagegen +0 bis 2 %
    (4000 Tokens 43,4 statt 42,9): Dort begrenzt nicht die Bandbreite, sondern
-   `attention.comp` selbst; der nächste Hebel liegt im Kernel (Parallelität beim Dekodieren).
+   `attention.comp` selbst.
+   *Erledigt 2026-10-17:* `attndec.comp` (eine Subgroup je Arbeitsgruppe, ohne Shared Memory
+   und Barrieren), auf Apple-GPUs ab 512 Schlüsseln: Decode auf dem M2 Pro bei 1000 Tokens
+   101 statt 79, bei 4000 74 statt 43, bei 8000 57 statt 28 Tokens/s.
 5. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;

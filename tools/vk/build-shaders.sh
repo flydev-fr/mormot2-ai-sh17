@@ -13,8 +13,9 @@ trap 'rm -rf "$TMP"' EXIT
 ARGS=()
 for f in *.comp; do
   n=${f%.comp}
-  # matvec8.comp: only the per-type builds below
+  # matvec8.comp, attndec.comp: only the builds below
   [ "$n" = matvec8 ] && continue
+  [ "$n" = attndec ] && continue
   # Vulkan 1.0 SPIR-V: every driver takes it; -Os keeps the constants small
   "$GLSLANG" -V --target-env vulkan1.0 -Os -o "$TMP/$n.spv" "$f" > "$TMP/$n.log" ||
     { cat "$TMP/$n.log"; exit 1; }
@@ -23,6 +24,10 @@ done
 # variants: linear8.comp with subgroup reductions, for Vulkan 1.1 devices
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/linear8_sg.spv" linear8.comp   > "$TMP/linear8_sg.log" || { cat "$TMP/linear8_sg.log"; exit 1; }
 ARGS+=("SPV_LINEAR8_SG=$TMP/linear8_sg.spv")
+# attndec.comp: subgroup arithmetic (Vulkan 1.1), a float or a half-float cache
+"$GLSLANG" -V --target-env vulkan1.1 -Os -o "$TMP/attndec.spv" attndec.comp > "$TMP/attndec.log" || { cat "$TMP/attndec.log"; exit 1; }
+"$GLSLANG" -V --target-env vulkan1.1 -Os -DKVF16 -o "$TMP/attndec_f16.spv" attndec.comp > "$TMP/attndec_f16.log" || { cat "$TMP/attndec_f16.log"; exit 1; }
+ARGS+=("SPV_ATTNDEC=$TMP/attndec.spv" "SPV_ATTNDEC_F16=$TMP/attndec_f16.spv")
 # variants: the KV cache in half floats (TQwen3Vulkan.KvF16)
 for n in qkrope attention flash; do
   "$GLSLANG" -V --target-env vulkan1.0 -Os -DKVF16 -o "$TMP/${n}_f16.spv" $n.comp > "$TMP/${n}_f16.log" || { cat "$TMP/${n}_f16.log"; exit 1; }

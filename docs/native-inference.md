@@ -1312,6 +1312,58 @@ llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
   (bei 8000 Tokens 1,8 GB je Token in F32, bei 200 GB/s rund 9 ms von 36), sondern von der
   Attention selbst; die Vorgabe bleibt an (dort neutral, auf der RTX schneller, halber
   Speicher).
+
+**Decode-Attention auf Apple-GPUs: `attndec.comp` (2026-10-17):**
+
+- *Befund:* Eine Probe, die die Attention einer Schicht allein misst (Qwen3-0.6B, 1 Zeile,
+  F16-Cache), zeigte auf dem M2 Pro rund 490 us je Schicht bei 4000 Tokens, 33 GB/s statt
+  der rund 200 der Karte. Bei nur 63 Schlüsseln kosteten 512 Arbeitsgruppen schon 283 us:
+  Eine Arbeitsgruppe von `attention.comp` (128 Invocations, 16 KB Shared Memory, rund 10 Barrieren
+  je Kachel) dauert dort lange, vermutlich läuft je GPU-Kern nur eine gleichzeitig, und jede
+  Speicherlatenz schlägt durch. Eine Variante mit gemeinsam geladenen Kacheln (zusammenhängend
+  gelesen, gepolstert gegen Bankkonflikte) änderte daran wenig (40 GB/s).
+- *Kernel:* `attndec.comp` braucht weder Shared Memory noch Barrieren. Eine Arbeitsgruppe ist
+  eine Subgroup von 32; Lane l hält Slot l (4 Dimensionen) der bis zu 8 Queries in Registern
+  und liest Slot l jeder Schlüssel- und Wertzeile (eine Zeile von 128 Halbwerten: 256 Byte am
+  Stück über die 32 Lanes). Der Score ist die `subgroupAdd` der Teilprodukte, die Softmax
+  läuft online je Schlüssel in Registern. Bindungen, Push-Konstanten und Ausgabe wie
+  `attention.comp`, `attnmerge.comp` fügt die Bereiche zusammen. Vulkan 1.1 mit
+  Subgroup-Arithmetik (`SubgroupLinear`), Kopfdimension bis 128, F32- und F16-Build.
+- *Eine Arbeitsgruppe, eine Subgroup:* Vulkan garantiert ohne `requireFullSubgroups` nicht,
+  dass 32 Invocations eine einzige Subgroup bilden (Codex-Fund); die Hardware tut es bei Apple
+  (SIMD-Gruppen von 32) und NVIDIA (Warps von 32). `HasDecodeAttention` gilt deshalb nur dort,
+  bei Subgroup-Größe 32. Zerfällt eine Gruppe trotzdem, speichert der Kernel NaN statt
+  Teilsummen, ohne Rechenschritt danach: In `y` bleibt es sicher stehen; durch `attnmerge.comp`
+  ist es nicht garantiert, denn Vulkan erlaubt Compilern, bei Arithmetik NaN-freie Operanden
+  anzunehmen (Codex). Der eigentliche Schutz ist die Freigabe nur für Apple und NVIDIA. Ein
+  Ausweichpfad über Shared Memory im selben Kernel kostete auf dem M2 Pro 17
+  bis 32 %, auch wenn er nicht genommen wurde (schon das Shared-Memory-Array bremst), und
+  entfiel.
+- *Aufteilung:* Am schnellsten waren auf dem M2 Pro 256 Arbeitsgruppen (bei Qwen3-0.6B 32
+  Bereiche je KV-Kopf), bei 4000 wie bei 8000 Tokens (188 statt 489 us je Schicht bei 4000,
+  351 statt 916 bei 8000, 88 bis 93 GB/s). Mit 2 oder 4 Schlüsseln vorab geladen lief er
+  langsamer (Register). Bei 200 Tokens ist `attention.comp` etwas schneller (52 gegen 60 us),
+  deshalb erst ab `DecodeKeys` (512) Schlüsseln.
+- *RTX 5090:* dort ist `attention.comp` doppelt so schnell (18 gegen 37 us bei 4000 Tokens
+  und 64 Bereichen; der neue Kernel bräuchte tausende Arbeitsgruppen).
+  `TQwen3Vulkan.UseDecodeAttention` ist deshalb nur auf Apple-GPUs voreingestellt, wie
+  `UseFlash` und `UseMatvec`.
+- *Ergebnis*, Qwen3-0.6B Q8_0 auf dem M2 Pro, Decode in Tokens/s (zwei Läufe im Wechsel,
+  gleich bis auf 1 %):
+
+  | Kontext | 200 | 1000 | 4000 | 8000 |
+  |---|---|---|---|---|
+  | `attention.comp` | 107,2 | 78,6 | 43,4 | 28,0 |
+  | `attndec.comp` | 107,1 | 101,0 | 74,3 | 56,6 |
+
+- *Tests:* `AttentionRangesMatchCpu` dekodiert die Schritte 2 und 3 über `attndec.comp`, mit
+  einem Bereich und mit vielen, beide Cache-Formate; `Qwen3GgufMatchesCpu` dekodiert Q4_K_M
+  darüber, jeweils wo das Gerät ihn hat (M2 Pro, RTX 5090; nicht Adreno und lavapipe).
+  Gegenprobe: ohne `subgroupAdd`, alle Lanes aus Slot 0, Summen nicht umskaliert, Queries
+  nicht skaliert, Maximum und Summe im `part[]` vertauscht, der F32-Kernel für einen
+  F16-Cache: alle sechs scheitern. Ohne die Begrenzung der Bereiche auf die Zahl der
+  Schlüssel bleibt der Test grün - zu Recht: leere Bereiche schreiben Summe 0, und
+  `attnmerge.comp` übergeht sie; die Begrenzung spart nur leere Arbeitsgruppen.
 - *CUDA (2026-10-17):* `TQwen3Cuda.KvF16`, ebenfalls Vorgabe an. CUDA adressiert 16-Bit-Werte
   direkt, deshalb ohne Wortpaare: `qkrope` und `attention` in `tools/cuda/ops.cu` sind
   Templates über den Typ des Caches (`qkrope16`, `attention16`), umgerechnet per PTX-`cvt`

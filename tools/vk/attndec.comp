@@ -1,0 +1,160 @@
+// LandrixAI - causal attention for a decoded token in one subgroup per work
+// group: no shared memory, no barrier - the same bindings, push constants and
+// output as attention.comp (y, or the part[] ranges of attnmerge.comp), for a
+// head dimension up to 128
+// - a work group of 32 per (head block, row block, split); lane l keeps the
+//   vec4 slot l of up to MAXQ queries in registers and reads slot l of each
+//   key and value row (a key row of 128 half floats: 256 consecutive bytes
+//   over the 32 lanes); a score is the subgroupAdd of the lanes' partial dot
+//   products, the softmax runs online per key in registers
+// - Vulkan 1.1 with subgroup arithmetic, and a work group of 32 must be one
+//   subgroup: Vulkan does not promise it without requireFullSubgroups, the
+//   hardware does on Apple (SIMD groups of 32) and NVIDIA (warps of 32) -
+//   TQwen3Vulkan offers the kernel there only; a work group split into
+//   several subgroups anyway stores NaN instead of partial sums - kept in y,
+//   while the arithmetic of attnmerge.comp may lose it (Vulkan lets it assume
+//   operands without NaN); a sum through shared memory as fallback made the
+//   kernel a sixth to a third slower on an M2 Pro, even when not taken
+// - TQwen3Vulkan takes it on Apple GPUs only (UseDecodeAttention), from
+//   DecodeKeys cached keys on, in 256 work groups: there a work group of
+//   attention.comp (128 invocations, 16 KB of shared memory, about 10
+//   barriers per tile) reads 33 GB/s, this kernel 88 GB/s (M2 Pro,
+//   Qwen3-0.6B, 4000 keys: 188 instead of 489 us per layer); an RTX 5090 is
+//   twice as fast with attention.comp
+// - unrolled by 2 or 4 keys (loads first) it ran slower: registers
+// - -DKVF16: keys and values as half floats, two to a word (qkrope.comp)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MAXQ 8
+#define NEG -3.402823e38
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
+#ifdef KVF16
+layout(std430, binding = 1) readonly buffer BufK { uvec2 keys4[]; };
+layout(std430, binding = 2) readonly buffer BufV { uvec2 vals4[]; };
+#define kv4(a) vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y))
+#else
+layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
+layout(std430, binding = 2) readonly buffer BufV { vec4 vals4[]; };
+#define kv4(a) (a)
+#endif
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+// [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
+layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
+
+// headBlock divides heads / kvHeads, headBlock * rowBlock <= MAXQ
+layout(push_constant) uniform Push {
+  uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
+} p;
+
+void main()
+{
+  uint lane = gl_LocalInvocationID.x;
+  uint hb = p.headBlock;
+  uint h0 = gl_WorkGroupID.x * hb;
+  uint r0 = gl_WorkGroupID.y * p.rowBlock;
+  uint s = gl_WorkGroupID.z;
+  uint d = p.headDim;
+  uint d4 = d >> 2;
+  uint kvw4 = p.kvHeads * d4;
+  uint qw = p.heads * d;
+  uint g = h0 / (p.heads / p.kvHeads);
+  uint nq = hb * min(p.rowBlock, p.rows - r0);
+  bool own = lane < d4;
+  bool one = gl_NumSubgroups == 1u;
+  float scale = 1.0 / sqrt(float(d));
+  vec4 qv[MAXQ];
+  vec4 acc[MAXQ];
+  float m[MAXQ], l[MAXQ];
+  uint j0[MAXQ], j1[MAXQ];
+  uint lo = 0xffffffffu;
+  uint hi = 0u;
+  for (uint i = 0u; i < MAXQ; i++)
+  {
+    qv[i] = vec4(0.0);
+    acc[i] = vec4(0.0);
+    m[i] = NEG;
+    l[i] = 0.0;
+    j0[i] = 0u;
+    j1[i] = 0u;
+    if (i < nq)
+    {
+      if (own)
+      {
+        uint qb = (r0 + i / hb) * qw + (h0 + i % hb) * d + 4u * lane;
+        qv[i] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]) * scale;
+      }
+      uint total = p.past + r0 + i / hb + 1u;
+      uint chunk = (total + p.splits - 1u) / p.splits;
+      j0[i] = min(total, s * chunk);
+      j1[i] = min(total, j0[i] + chunk);
+      lo = min(lo, j0[i]);
+      hi = max(hi, j1[i]);
+    }
+  }
+  uint kb = g * d4 + lane;
+  for (uint j = lo; j < hi; j++)
+  {
+    vec4 kv = vec4(0.0);
+    vec4 vv = vec4(0.0);
+    if (own)
+    {
+      kv = kv4(keys4[j * kvw4 + kb]);
+      vv = kv4(vals4[j * kvw4 + kb]);
+    }
+    for (uint i = 0u; i < MAXQ; i++)
+      if (i < nq)
+      {
+        float sc = subgroupAdd(dot(qv[i], kv));
+        if ((j >= j0[i]) && (j < j1[i]))
+        {
+          float mn = max(m[i], sc);
+          float f = exp(m[i] - mn);
+          float w = exp(sc - mn);
+          l[i] = l[i] * f + w;
+          acc[i] = acc[i] * f + w * vv;
+          m[i] = mn;
+        }
+      }
+  }
+  if (own)
+    for (uint i = 0u; i < MAXQ; i++)
+      if (i < nq)
+      {
+        vec4 a = acc[i];
+        uint h = h0 + i % hb;
+        uint r = r0 + i / hb;
+        if (p.splits == 1u)
+        {
+          uint yb = r * qw + h * d + 4u * lane;
+          a /= l[i];
+          // not one subgroup: the sums are partial - NaN stored as is, no
+          // arithmetic after it (Vulkan may assume operands without NaN)
+          if (!one)
+            a = vec4(uintBitsToFloat(0x7fc00000u));
+          y[yb] = a.x;
+          y[yb + 1u] = a.y;
+          y[yb + 2u] = a.z;
+          y[yb + 3u] = a.w;
+        }
+        else
+        {
+          uint pb = ((h * p.rows + r) * p.splits + s) * (d + 2u);
+          if (!one)
+            a = vec4(uintBitsToFloat(0x7fc00000u)); // attnmerge.comp may lose it
+          part[pb + 4u * lane] = a.x;
+          part[pb + 4u * lane + 1u] = a.y;
+          part[pb + 4u * lane + 2u] = a.z;
+          part[pb + 4u * lane + 3u] = a.w;
+          if (lane == 0u)
+          {
+            part[pb + d] = m[i];
+            part[pb + d + 1u] = l[i];
+          }
+        }
+      }
+}

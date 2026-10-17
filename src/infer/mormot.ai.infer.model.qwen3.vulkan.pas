@@ -83,7 +83,10 @@ type
       fFlash: TInferVkPipeline;
     // the same for a KV cache of half floats
     fQkRope16, fAttention16, fFlash16: TInferVkPipeline;
-    fUseFlash, fKvF16: boolean;
+    // attndec.comp, for a float or a half-float cache
+    fDecode, fDecode16: TInferVkPipeline;
+    fUseFlash, fKvF16, fUseDecode: boolean;
+    fDecodeKeys: integer;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     // the vocabulary rows of the head per binding (LinearPart): below
     // VocabSize, the head runs in parts
@@ -137,6 +140,22 @@ type
       read fUseFlash write fUseFlash;
     /// true when the device runs flash.comp (UseFlash can take it)
     function HasFlash: boolean;
+    /// the attention of a decoded token (one row) from DecodeKeys cached keys
+    // on through attndec.comp - one subgroup per work group, no shared memory,
+    // 256 work groups - instead of attention.comp: by default on an Apple GPU
+    // (VendorId $106B) only, where Qwen3-0.6B decodes with 4000 tokens of
+    // context 2.6 times as fast in the attention, while an RTX 5090 is twice
+    // as fast with attention.comp; needs HasDecodeAttention
+    property UseDecodeAttention: boolean
+      read fUseDecode write fUseDecode;
+    /// UseDecodeAttention from this many keys (default 512: below, both
+    // kernels take about as long) - 0: always, for tests
+    property DecodeKeys: integer
+      read fDecodeKeys write fDecodeKeys;
+    /// true when the device runs attndec.comp: an Apple or NVIDIA GPU (a work
+    // group of 32 is one subgroup there), subgroups of 32 with arithmetic
+    // (TInferVulkanBackend.SubgroupLinear), a head dimension up to 128
+    function HasDecodeAttention: boolean;
     /// the KV cache in half floats (default) instead of floats: half the
     // memory, and half the bytes the attention reads per decoded token -
     // the keys and values rounded to 11 significant bits, the logits then
@@ -185,6 +204,10 @@ const
   FLASH_QUERIES = 32;
   /// from this many token rows on the attention runs flash.comp (UseFlash)
   FLASH_ROWS = 16;
+  /// attndec.comp: the work groups of a decoded token's attention (head
+  // blocks times key ranges), and the keys from which it is taken
+  DECODE_GROUPS = 256;
+  DECODE_KEYS = 512;
   /// the shared memory of flash.comp in bytes: queries, a tile of keys or
   // values, the scores and three floats per query
   FLASH_SHARED = 32 * 32 * 16 + 16 * 32 * 16 + 32 * 16 * 4 + 3 * 32 * 4;
@@ -281,6 +304,21 @@ begin
     fFlash16.Name := 'flash';
     fUseFlash := fVk.VendorId = $106B; // Apple
   end;
+  // attndec.comp needs a work group of 32 to be one subgroup: the hardware
+  // makes it so on Apple and NVIDIA GPUs
+  if fBackend.SubgroupLinear and (fVk.SubgroupSize = 32) and
+     ((fVk.VendorId = $106B) or (fVk.VendorId = $10DE)) and
+     (aModel.Config.HeadDim <= 128) then
+  begin
+    fDecode := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC, length(SPV_ATTNDEC), 5,
+      SizeOf(TAttentionPush));
+    fDecode.Name := 'attndec';
+    fDecode16 := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC_F16,
+      length(SPV_ATTNDEC_F16), 5, SizeOf(TAttentionPush));
+    fDecode16.Name := 'attndec';
+    fUseDecode := fVk.VendorId = $106B; // Apple
+  end;
+  fDecodeKeys := DECODE_KEYS;
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
   fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
     SizeOf(TQkRopePush));
@@ -310,6 +348,11 @@ begin
   result := fFlash <> nil;
 end;
 
+function TQwen3Vulkan.HasDecodeAttention: boolean;
+begin
+  result := fDecode <> nil;
+end;
+
 destructor TQwen3Vulkan.Destroy;
 begin
   // the model no longer hands out contexts of this device
@@ -321,6 +364,8 @@ begin
   fAdd.Free;
   fFlash16.Free;
   fFlash.Free;
+  fDecode16.Free;
+  fDecode.Free;
   fMerge.Free;
   fAttention16.Free;
   fAttention.Free;
@@ -610,6 +655,17 @@ begin
   most := SPLIT_GROUPS div ((c.Heads div hb) * blocks);
   if splits > most then
     splits := most;
+  // a decoded token: attndec.comp in DECODE_GROUPS work groups
+  if fUseDecode and (fDecode <> nil) and (n = 1) and (past + n >= fDecodeKeys) then
+  begin
+    attention := fDecode;
+    if aCtx.fKvF16 then
+      attention := fDecode16;
+    if fSplitKeys > 0 then // else one range, as attention.comp
+      splits := DECODE_GROUPS div (c.Heads div hb);
+    if splits > past + n then
+      splits := past + n;
+  end;
   if splits < 1 then
     splits := 1;
   if splits > 1 then
