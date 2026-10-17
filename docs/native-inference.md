@@ -1304,9 +1304,14 @@ llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
   | F32-Cache | 351 | 373 | 325 | 265 |
   | F16-Cache | 361 | 383 | 346 | 287 |
 
-  Auf der RTX bremst die Bandbreite wenig (1,8 TB/s). Auf dem M2 Pro, wo der Decode von 90
-  (200 Tokens) auf 40 Tokens/s (4000) fällt, steht die Messung noch aus. `llm-bench` schaltet
-  mit `LAI_KV_F32=1` auf den F32-Cache zurück.
+  Auf der RTX bremst die Bandbreite wenig (1,8 TB/s). `llm-bench` schaltet mit `LAI_KV_F32=1`
+  auf den F32-Cache zurück.
+- *M2 Pro (MoltenVK, 2026-10-17):* kaum Wirkung. Decode mit F32- und F16-Cache: 107,6/107,2
+  (200 Tokens), 77,7/78,3 (1000), 42,9/43,4 (4000), 27,6/28,0 (8000), der Prefill
+  unverändert. Der Einbruch bei langem Kontext kommt dort also nicht von der Bandbreite
+  (bei 8000 Tokens 1,8 GB je Token in F32, bei 200 GB/s rund 9 ms von 36), sondern von der
+  Attention selbst; die Vorgabe bleibt an (dort neutral, auf der RTX schneller, halber
+  Speicher).
 - *CUDA (2026-10-17):* `TQwen3Cuda.KvF16`, ebenfalls Vorgabe an. CUDA adressiert 16-Bit-Werte
   direkt, deshalb ohne Wortpaare: `qkrope` und `attention` in `tools/cuda/ops.cu` sind
   Templates über den Typ des Caches (`qkrope16`, `attention16`), umgerechnet per PTX-`cvt`

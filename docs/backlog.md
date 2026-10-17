@@ -241,7 +241,9 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
    90 Tokens/s (200 Tokens Kontext) auf 40 (4000). `attention.comp` erreicht dort 63 GFLOPS.
    *Erster Schritt, 2026-10-17:* KV-Cache in Halbgenauigkeit (`TQwen3Vulkan.KvF16` und
    `TQwen3Cuda.KvF16`, Vorgabe an; `docs/native-inference.md`): auf der RTX 5090 Decode bei
-   8000 Tokens +8 % unter Vulkan, +24 % unter CUDA. Die Messung auf dem M2 Pro steht aus.
+   8000 Tokens +8 % unter Vulkan, +24 % unter CUDA. Auf dem M2 Pro dagegen +0 bis 2 %
+   (4000 Tokens 43,4 statt 42,9): Dort begrenzt nicht die Bandbreite, sondern
+   `attention.comp` selbst; der nächste Hebel liegt im Kernel (Parallelität beim Dekodieren).
 5. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;
@@ -312,5 +314,6 @@ nicht das Zusammensetzen. Q8_0 rechnet den Index jetzt ohne diesen Übertrag
 (`(a >> 2) + ((a >> 1) & 1)`, Bitlage `16 - (a & 2) * 8`, Helfer `wordAt`). Adreno: die
 Probe über Eingänge, Zeilen, Ausgänge und Bias komplett grün, `LinearMatchesReference`
 292/292; RTX 5090: Vulkan-Suite 360/360. Der SPIR-V-Code für Q4_K und Q6_K ist bis auf
-die Nummerierung gleich, der für Q8_0 hat zwei Befehle weniger; ein A/B-Lauf auf dem Mac
-steht noch aus.
+die Nummerierung gleich, der für Q8_0 hat zwei Befehle weniger. A/B auf dem M2 Pro (Q8_0, 200
+Tokens, drei Läufe im Wechsel): Decode 98,1 vorher, 107,5 Tokens/s nachher - der neue
+Wortindex ist dort auch schneller.
