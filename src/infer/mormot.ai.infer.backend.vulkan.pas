@@ -61,6 +61,7 @@ type
     fX, fY, fNoBias: TInferVkBuffer;
     fGpuLinears: Int64;
     fWeightEpoch: integer;
+    fMaxLinearBytes: Int64;
     function Weight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferVkBuffer;
     function Scratch(var aBuffer: TInferVkBuffer; aBytes: Int64): TInferVkBuffer;
@@ -94,9 +95,21 @@ type
     /// record y = x * w^T (no bias) into the running batch of Vulkan, the
     // weights from the cache - GpuLock held, BatchBegin called; x and y are
     // [aRows, aIn] and [aRows, aOut] at offset 0
+    // - a matrix larger than one binding (LinearPart < aOut) goes part by
+    // part into aTemp - at least [aRows, LinearPart] floats, given by the
+    // caller (no buffer is made or freed while a batch is recorded) - whose
+    // rows are then copied into y; the weights uploaded by UploadLinear
     procedure RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
       const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer;
-      aBarrier: boolean = true);
+      aBarrier: boolean = true; aTemp: TInferVkBuffer = nil);
+    /// the output features of one part of an aOut x aIn matrix of aType on
+    // the device: aOut when its bytes fit one binding (maxStorageBufferRange,
+    // or MaxLinearBytes), else as many as do - e.g. the 165 MB head of
+    // Qwen3-0.6B Q8_0 on a GPU binding 128 MB (Adreno X1-85)
+    function LinearPart(aType: TInferDType; aIn, aOut: PtrInt): PtrInt;
+    /// upload the weights of an aOut x aIn matrix, in the parts of
+    // LinearPart - GpuLock held, outside a batch
+    procedure UploadLinear(const w: TInferWeight; aIn, aOut: PtrInt);
     /// the device context
     property Vulkan: TInferVulkan read fVk;
     /// true when the device runs the subgroup build of linear8.comp: Vulkan
@@ -117,6 +130,10 @@ type
     property UseGemm: boolean read fUseGemm write fUseGemm;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
+    /// the bytes of a weight binding at most, below maxStorageBufferRange -
+    // 0 (default): the device limit; for tests of LinearPart - change it,
+    // then ClearWeights (a TQwen3Vulkan uploads in the new parts)
+    property MaxLinearBytes: Int64 read fMaxLinearBytes write fMaxLinearBytes;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
     property WeightEpoch: integer read fWeightEpoch;
   end;
@@ -307,25 +324,88 @@ begin
   aX := n;
 end;
 
+function TInferVulkanBackend.LinearPart(aType: TInferDType; aIn, aOut: PtrInt): PtrInt;
+var
+  rowBytes, most: Int64;
+begin
+  rowBytes := Int64(aIn div INFER_DTYPE_BLOCK[aType]) * INFER_DTYPE_SIZE[aType];
+  most := fVk.MaxStorageRange;
+  if (fMaxLinearBytes > 0) and (fMaxLinearBytes < most) then
+    most := fMaxLinearBytes;
+  most := most and not Int64(3); // allocated in whole 4-byte words
+  if rowBytes * aOut <= most then
+    result := aOut
+  else
+    result := most div rowBytes;
+  if result < 1 then
+    raise EInferVulkan.CreateUtf8('%.LinearPart: one row of % % binds more than % bytes',
+      [self, aIn, INFER_DTYPE_NAME[aType], most]);
+end;
+
+procedure TInferVulkanBackend.UploadLinear(const w: TInferWeight; aIn, aOut: PtrInt);
+var
+  rowBytes: Int64;
+  part, o, n: PtrInt;
+begin
+  rowBytes := Int64(aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType];
+  part := LinearPart(w.DType, aIn, aOut);
+  o := 0;
+  while o < aOut do
+  begin
+    n := aOut - o;
+    if n > part then
+      n := part;
+    DeviceWeight(PAnsiChar(w.Data) + Int64(o) * rowBytes, w.DType, n * rowBytes);
+    inc(o, n);
+  end;
+end;
+
 procedure TInferVulkanBackend.RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
-  const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean);
+  const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean;
+  aTemp: TInferVkBuffer);
 var
   push: TLinearPush;
   gx, gy: cardinal;
   pipe: TInferVkPipeline;
+  rowBytes: Int64;
+  part, o, n: PtrInt;
 begin
   if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or (aOut < 1) then
     raise EInferVulkan.CreateUtf8('%.RecordLinear: % rows of % % into %',
       [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
+  rowBytes := Int64(aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType];
   push.Rows := aRows;
   push.InCount := aIn;
-  push.OutCount := aOut;
   push.DType := LINEAR_DTYPE[w.DType];
   push.HasBias := 0;
-  pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);
-  fVk.BatchDispatch(pipe, [DeviceWeight(w.Data, w.DType, Int64(aOut) *
-    (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]), x, fNoBias, y],
-    @push, gx, gy, 1, aBarrier);
+  part := LinearPart(w.DType, aIn, aOut);
+  if part >= aOut then
+  begin
+    push.OutCount := aOut;
+    pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);
+    fVk.BatchDispatch(pipe, [DeviceWeight(w.Data, w.DType, aOut * rowBytes), x,
+      fNoBias, y], @push, gx, gy, 1, aBarrier);
+    exit;
+  end;
+  // part by part into aTemp, its rows copied to their columns of y
+  if (aTemp = nil) or (aTemp.Size < Int64(aRows) * part * 4) then
+    raise EInferVulkan.CreateUtf8('%.RecordLinear: % % x % in parts of % ' +
+      'needs a buffer of % x % floats', [self, INFER_DTYPE_NAME[w.DType], aOut,
+      aIn, part, aRows, part]);
+  o := 0;
+  while o < aOut do
+  begin
+    n := aOut - o;
+    if n > part then
+      n := part;
+    push.OutCount := n;
+    pipe := LinearShape(w.DType, aIn, aRows, n, gx, gy);
+    fVk.BatchDispatch(pipe, [DeviceWeight(PAnsiChar(w.Data) + Int64(o) * rowBytes,
+      w.DType, n * rowBytes), x, fNoBias, aTemp], @push, gx, gy, 1, true);
+    fVk.BatchCopyRows(aTemp, 0, Int64(n) * 4, y, Int64(o) * 4, Int64(aOut) * 4,
+      Int64(n) * 4, aRows);
+    inc(o, n);
+  end;
 end;
 
 function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;

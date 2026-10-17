@@ -317,3 +317,28 @@ Probe über Eingänge, Zeilen, Ausgänge und Bias komplett grün, `LinearMatches
 die Nummerierung gleich, der für Q8_0 hat zwei Befehle weniger. A/B auf dem M2 Pro (Q8_0, 200
 Tokens, drei Läufe im Wechsel): Decode 98,1 vorher, 107,5 Tokens/s nachher - der neue
 Wortindex ist dort auch schneller.
+
+## B11 — Qwen3 auf GPUs mit kleiner Puffergrenze (erledigt 2026-10-17)
+
+**Befund:** Die Adreno X1-85 bindet höchstens 128 MB je Speicherpuffer
+(`maxStorageBufferRange`). Der Kopf von Qwen3-0.6B Q8_0 (die Einbettung, 151936 x 1024) hat
+165 MB, `TQwen3Vulkan.Create` brach ab: Auf Windows ARM scheiterten `Qwen3GgufMatchesCpu` und
+`NativeClientOnDevice` mit einer Exception, in allen Läufen seit dem ersten.
+
+**Lösung:** `TInferVulkanBackend.RecordLinear` rechnet eine Matrix, die nicht in eine Bindung
+passt, in Teilen nach Ausgabe-Merkmalen (`LinearPart`: so viele Zeilen, wie in eine Bindung
+passen). Jeder Teil schreibt in einen Zwischenpuffer, dessen Zeilen `TInferVulkan.BatchCopyRows`
+mit einem einzigen Kopierbefehl an ihre Spalten im Ergebnis setzt; die Shader bleiben
+unverändert. Den Zwischenpuffer stellt der Aufrufer (der Kontext, angelegt in `Prepare`), damit
+nie ein Puffer entsteht oder freigegeben wird, während ein Batch aufgezeichnet ist;
+`UploadLinear` lädt die Teile vorab in den Gewichts-Cache. Geteilt wird nur der Kopf, eine zu
+große Schicht-Matrix wird wie bisher abgewiesen. `MaxLinearBytes` senkt die Grenze für Tests.
+
+**Tests:** `LinearInParts` (F32, Q8_0, Q6_K; 1, 3 und 20 Zeilen, also `matvec8`, `linear8`,
+`gemm8`; Teile 10, 10, 10, 7) gegen die Referenz, ohne Zwischenpuffer eine Exception;
+`Qwen3GgufMatchesCpu` rechnet Q8_0 auf jeder GPU mit dem Kopf in Teilen von höchstens 48 MB.
+Adreno: Q8_0 Kosinus 0,9991, Argmax 16 von 16 (Kopf in zwei Teilen, natürliche Grenze),
+`NativeClientOnDevice` grün; RTX 5090, lavapipe, Delphi 13 und 7 grün. Gegenprobe:
+falscher Zeilenabstand beim Kopieren (Ziel und Quelle), alle Teile in Spalte 0 oder aus den
+ersten Gewichten, `MaxLinearBytes` übergangen, Kopf am Stück geladen, kein Zwischenpuffer, der
+letzte Teil zu groß - alle acht scheitern.

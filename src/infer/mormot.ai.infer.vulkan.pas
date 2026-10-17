@@ -794,6 +794,12 @@ type
     /// record a copy of aBytes from aSrc at aSrcOffset to aDst at aDstOffset
     procedure BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
       aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
+    /// record a copy of aRows rows of aBytes: row i from aSrc at aSrcOffset +
+    // i * aSrcStride to aDst at aDstOffset + i * aDstStride - one command,
+    // one barrier
+    procedure BatchCopyRows(aSrc: TInferVkBuffer; aSrcOffset, aSrcStride: TVkDeviceSize;
+      aDst: TInferVkBuffer; aDstOffset, aDstStride: TVkDeviceSize;
+      aBytes: TVkDeviceSize; aRows: PtrInt);
     /// submit what the batch recorded so far, without waiting, and go on
     // recording: the device works while the host records the rest (one forward
     // pass of a decoded token: the device would otherwise idle while all of it
@@ -1862,6 +1868,40 @@ begin
     region.dstOffset := aDstOffset;
     region.size := aBytes;
     fApi.CmdCopyBuffer(fCmd, aSrc.Handle, aDst.Handle, 1, @region);
+    Barrier;
+    Stamp('copy');
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.BatchCopyRows(aSrc: TInferVkBuffer; aSrcOffset,
+  aSrcStride: TVkDeviceSize; aDst: TInferVkBuffer; aDstOffset,
+  aDstStride: TVkDeviceSize; aBytes: TVkDeviceSize; aRows: PtrInt);
+var
+  fpu: TDriverFpu;
+  regions: array of TVkBufferCopy;
+  i: PtrInt;
+begin
+  if not fBatching then
+    raise EInferVulkan.Create('Vulkan.BatchCopyRows: no BatchBegin');
+  if (aSrcOffset < 0) or (aDstOffset < 0) or (aSrcStride < 0) or
+     (aDstStride < 0) or (aBytes <= 0) or (aRows < 1) or
+     (aSrcOffset + (aRows - 1) * aSrcStride + aBytes > aSrc.Size) or
+     (aDstOffset + (aRows - 1) * aDstStride + aBytes > aDst.Size) then
+    raise EInferVulkan.CreateUtf8('Vulkan.BatchCopyRows: % rows of % bytes ' +
+      'from % (stride %) of % to % (stride %) of %', [aRows, aBytes, aSrcOffset,
+      aSrcStride, aSrc.Size, aDstOffset, aDstStride, aDst.Size]);
+  SetLength(regions, aRows);
+  for i := 0 to aRows - 1 do
+  begin
+    regions[i].srcOffset := aSrcOffset + i * aSrcStride;
+    regions[i].dstOffset := aDstOffset + i * aDstStride;
+    regions[i].size := aBytes;
+  end;
+  fpu := DriverFpuEnter;
+  try
+    fApi.CmdCopyBuffer(fCmd, aSrc.Handle, aDst.Handle, aRows, pointer(regions));
     Barrier;
     Stamp('copy');
   finally

@@ -61,6 +61,12 @@ type
     // (a tolerance: another summation order), with and without bias, more
     // than 65535 outputs, the weight cache, and the CPU for other types
     procedure LinearMatchesReference;
+    /// backlog B11: RecordLinear of a matrix larger than one binding
+    // (MaxLinearBytes) in parts of 10 features - 10, 10, 10 and 7 - for F32,
+    // Q8_0 and Q6_K, one row (matvec8.comp), 3 (linear8.comp) and 20
+    // (gemm8.comp), against the reference; without a buffer for the parts
+    // it raises
+    procedure LinearInParts;
     /// phases 4c/4d: the tiny Qwen3 forward on the device against the CPU
     // reference - every row of a prompt longer than one chunk, decoding, a
     // reused prefix; F32 from safetensors (relative error), Q8_0 from GGUF
@@ -76,7 +82,8 @@ type
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
     // compared at every step - skipped on a CPU implementation (lavapipe:
-    // minutes), and without the model files
+    // minutes), and without the model files; Q8_0 with its 165 MB head in
+    // parts of at most 48 MB (MaxLinearBytes), as a GPU binding 128 MB needs
     procedure Qwen3GgufMatchesCpu;
     /// TNativeLlmClient on the device (Device := TQwen3Vulkan): the greedy
     // answer of Qwen3-0.6B Q8_0 as without it, the next turn from the prompt
@@ -406,6 +413,118 @@ begin
   end;
 end;
 
+procedure TTestInferVulkan.LinearInParts;
+const
+  NIN = 256;
+  NOUT = 37;
+  PART = 10;
+  ROW_COUNTS: array[0..2] of integer = (1, 3, 20);
+  TYPES: array[0..2] of TInferDType = (idtF32, idtQ8_0, idtQ6_K);
+var
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  vk: TInferVulkan;
+  t, r, o, rows: PtrInt;
+  kind: TInferDType;
+  rowBytes: Int64;
+  x, wf, wd, y1, y2: TSingleDynArray;
+  wq: RawByteString;
+  data: pointer;
+  xb, yb, tb: TInferVkBuffer;
+  e: double;
+  raised: boolean;
+begin
+  if not HasDevice then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  ref := TInferCpuBackend.Create;
+  try
+    vk := gpu.Vulkan;
+    gpu.UseMatvec := true; // one row of Q8_0 / Q6_K: matvec8.comp
+    for t := 0 to high(TYPES) do
+    begin
+      kind := TYPES[t];
+      case kind of
+        idtF32:
+          begin
+            Fill(wf, NOUT * NIN, 71, 0.1);
+            data := pointer(wf);
+          end;
+        idtQ8_0:
+          begin
+            wq := RandomQ8(NOUT, NIN, 72);
+            data := pointer(wq);
+          end;
+      else
+        begin
+          wq := RandomK(kind, NOUT, NIN, 73);
+          data := pointer(wq);
+        end;
+      end;
+      SetLength(wd, NOUT * NIN);
+      for o := 0 to NOUT - 1 do
+        InferRowToF32(data, kind, o, NIN, @wd[o * NIN]);
+      rowBytes := Int64(NIN div INFER_DTYPE_BLOCK[kind]) * INFER_DTYPE_SIZE[kind];
+      // a limit no multiple of a row: it rounds down to PART rows
+      gpu.MaxLinearBytes := PART * rowBytes + 2;
+      CheckUtf8(gpu.LinearPart(kind, NIN, NOUT) = PART, '% parts of %',
+        [INFER_DTYPE_NAME[kind], gpu.LinearPart(kind, NIN, NOUT)]);
+      for r := 0 to high(ROW_COUNTS) do
+      begin
+        rows := ROW_COUNTS[r];
+        Fill(x, rows * NIN, 74 + r, 2);
+        SetLength(y1, rows * NOUT);
+        SetLength(y2, rows * NOUT);
+        ref.Linear(pointer(x), rows, NIN, InferWeight(pointer(wd), idtF32), NOUT,
+          nil, pointer(y1));
+        xb := nil;
+        yb := nil;
+        tb := nil;
+        gpu.GpuLock;
+        try
+          gpu.UploadLinear(InferWeight(data, kind), NIN, NOUT);
+          xb := TInferVkBuffer.Create(vk, rows * NIN * 4, true);
+          yb := TInferVkBuffer.Create(vk, rows * NOUT * 4, true);
+          tb := TInferVkBuffer.Create(vk, rows * PART * 4, true);
+          vk.Upload(xb, 0, pointer(x), rows * NIN * 4);
+          vk.BatchBegin;
+          try
+            gpu.RecordLinear(xb, rows, NIN, InferWeight(data, kind), NOUT, yb,
+              true, tb);
+          except
+            vk.BatchAbort;
+            raise;
+          end;
+          vk.BatchSubmit;
+          vk.Download(yb, 0, pointer(y2), rows * NOUT * 4);
+          // no buffer for the parts: refused while recording
+          raised := false;
+          vk.BatchBegin;
+          try
+            gpu.RecordLinear(xb, rows, NIN, InferWeight(data, kind), NOUT, yb);
+          except
+            on EInferVulkan do
+              raised := true;
+          end;
+          vk.BatchAbort;
+          Check(raised, 'parts need a buffer');
+        finally
+          tb.Free;
+          yb.Free;
+          xb.Free;
+          gpu.GpuUnLock;
+        end;
+        e := RelError(pointer(y2), pointer(y1), rows * NOUT);
+        CheckUtf8(e <= 1e-5, '% % rows in parts: relative error %',
+          [INFER_DTYPE_NAME[kind], rows, e]);
+      end;
+    end;
+  finally
+    ref.Free;
+    gpu.Free;
+  end;
+end;
+
 procedure TTestInferVulkan.TinyQwen3MatchesCpu;
 const
   PROMPT = 300; // more than one chunk of the device forward pass (256)
@@ -689,6 +808,10 @@ begin
     try
       model := TQwen3Model.CreateFromGguf(gguf, cpu);
       v := model.Config.VocabSize;
+      // Q8_0: the head (165 MB) in parts on every device, the layer matrices
+      // (3.3 MB at most) whole
+      if f = 1 then
+        gpu.MaxLinearBytes := 48 shl 20;
       vk := TQwen3Vulkan.Create(model, gpu);
       c1 := model.NewContext;
       c2 := vk.NewContext;
@@ -710,8 +833,9 @@ begin
         model.Forward(c1, @id, 1, pointer(l1));
         vk.Forward(c2, @id, 1, pointer(l2));
       end;
-      AddConsole('% on %: lowest logits cosine %, argmax agrees % of %',
-        [FILES[f], fVk.DeviceName, worst, agree, STEPS]);
+      AddConsole('% on %: lowest logits cosine %, argmax agrees % of %, ' +
+        'head in parts of % rows', [FILES[f], fVk.DeviceName, worst, agree, STEPS,
+        gpu.LinearPart(model.Head.DType, model.Config.Hidden, v)]);
       CheckUtf8(worst >= 0.99, '% logits cosine %', [FILES[f], worst]);
       CheckUtf8(agree >= STEPS - 2, '% argmax agrees % of %', [FILES[f], agree, STEPS]);
     finally

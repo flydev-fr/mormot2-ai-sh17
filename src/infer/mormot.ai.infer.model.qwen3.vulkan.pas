@@ -58,6 +58,8 @@ type
     // device scratch for up to fRows token rows
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp, fDevCos: TInferVkBuffer;
     fPart, fLogits: TInferVkBuffer;
+    // the head in parts (TQwen3Vulkan.fHeadPart < VocabSize): one part's logits
+    fHeadTemp: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
     procedure FreeScratch;
@@ -83,6 +85,9 @@ type
     fQkRope16, fAttention16, fFlash16: TInferVkPipeline;
     fUseFlash, fKvF16: boolean;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
+    // the vocabulary rows of the head per binding (LinearPart): below
+    // VocabSize, the head runs in parts
+    fHeadPart: PtrInt;
     fSplitKeys: integer;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
@@ -233,6 +238,7 @@ begin
   fDevValues := nil;
   FreeAndNil(fPart);
   FreeAndNil(fLogits);
+  FreeAndNil(fHeadTemp);
   FreeAndNil(fOut);
   fCapacity := 0;
 end;
@@ -334,20 +340,18 @@ var
   l, qw, kvw: PtrInt;
   ly: ^TQwen3Layer;
 
-  procedure Matrix(const w: TInferWeight; aRows, aCols: PtrInt);
-  var
-    bytes: Int64;
+  // a layer matrix in one binding; the head (aParts) also in several
+  function Matrix(const w: TInferWeight; aRows, aCols: PtrInt;
+    aParts: boolean = false): PtrInt;
   begin
     if not fBackend.GpuLinear(w.DType, aCols) then
       EInferError.RaiseUtf8('%: no shader for a % matrix of % columns',
         [self, INFER_DTYPE_NAME[w.DType], aCols]);
-    bytes := Int64(aRows) * (aCols div INFER_DTYPE_BLOCK[w.DType]) *
-      INFER_DTYPE_SIZE[w.DType];
-    // as allocated: whole 4-byte words (TInferVkBuffer)
-    if (bytes + 3) and not Int64(3) > fVk.MaxStorageRange then
-      EInferError.RaiseUtf8('%: a matrix of % bytes, the device binds at most %',
-        [self, bytes, fVk.MaxStorageRange]);
-    fBackend.DeviceWeight(w.Data, w.DType, bytes);
+    result := fBackend.LinearPart(w.DType, aCols, aRows);
+    if (result < aRows) and not aParts then
+      EInferError.RaiseUtf8('%: a % x % % matrix exceeds what the device binds',
+        [self, aRows, aCols, INFER_DTYPE_NAME[w.DType]]);
+    fBackend.UploadLinear(w, aCols, aRows);
   end;
 
 begin
@@ -373,7 +377,8 @@ begin
     Vector(ly^.KNorm, c.HeadDim);
   end;
   Vector(fModel.FinalNorm, c.Hidden);
-  Matrix(fModel.Head, c.VocabSize, c.Hidden);
+  // the head: 165 MB in Qwen3-0.6B Q8_0, more than some GPUs bind at once
+  fHeadPart := Matrix(fModel.Head, c.VocabSize, c.Hidden, true);
   fEpoch := fBackend.WeightEpoch;
 end;
 
@@ -514,6 +519,8 @@ begin
   if aOutRows > 0 then
   begin
     NeedDevice(fVk, aCtx.fLogits, Int64(aOutRows) * c.VocabSize * 4);
+    if fHeadPart < c.VocabSize then
+      NeedDevice(fVk, aCtx.fHeadTemp, Int64(aOutRows) * fHeadPart * 4);
     if (aCtx.fOut = nil) or (aCtx.fOut.Size < Int64(aOutRows) * c.VocabSize * 4) then
     begin
       FreeAndNil(aCtx.fOut);
@@ -691,7 +698,7 @@ begin
       else
         RecordNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
       fBackend.RecordLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
-        aCtx.fLogits);
+        aCtx.fLogits, true, aCtx.fHeadTemp);
       fVk.BatchCopy(aCtx.fLogits, 0, aCtx.fOut, 0,
         Int64(outRows) * c.VocabSize * 4);
     end;
