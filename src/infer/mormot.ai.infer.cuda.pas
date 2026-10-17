@@ -97,6 +97,8 @@ type
     MemcpyDtoH: function(aDst: pointer; aSrc: TCuDevicePtr;
       aBytes: PtrUInt): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    MemcpyDtoD: function(aDst, aSrc: TCuDevicePtr; aBytes: PtrUInt): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     LaunchKernel: function(aFunction: TCuHandle;
       aGridX, aGridY, aGridZ, aBlockX, aBlockY, aBlockZ, aSharedBytes: cardinal;
       aStream: TCuHandle; aParams, aExtra: PPointer): TCuResult;
@@ -136,6 +138,10 @@ type
     procedure Upload(aOffset: Int64; aSource: pointer; aBytes: Int64);
     /// copy aBytes of the buffer at aOffset to aDest, waiting until done
     procedure Download(aOffset: Int64; aDest: pointer; aBytes: Int64);
+    /// copy aBytes of the buffer at aOffset into aDest at aDestOffset on the
+    // device, in order with the kernels enqueued before and after (no wait)
+    procedure CopyTo(aOffset: Int64; aDest: TInferCuBuffer; aDestOffset,
+      aBytes: Int64);
     /// the device address, as a kernel parameter takes it
     property Ptr: TCuDevicePtr read fPtr;
     property Size: Int64 read fSize;
@@ -175,6 +181,15 @@ type
     procedure Launch(aKernel: TCuHandle; const aParams: array of pointer;
       aGridX, aBlockX: cardinal; aGridY: cardinal = 1; aGridZ: cardinal = 1;
       aBlockY: cardinal = 1; aBlockZ: cardinal = 1; aSharedBytes: cardinal = 0);
+    /// as Launch, without waiting: the kernels run in the order enqueued, after
+    // every copy made before (one stream) - Synchronize waits for them
+    // - aParams are read by the call itself: their values may change after it
+    procedure Enqueue(aKernel: TCuHandle; const aParams: array of pointer;
+      aGridX, aBlockX: cardinal; aGridY: cardinal = 1; aGridZ: cardinal = 1;
+      aBlockY: cardinal = 1; aBlockZ: cardinal = 1; aSharedBytes: cardinal = 0);
+    /// wait for every kernel and copy enqueued; raises the error of one that
+    // failed
+    procedure Synchronize;
     property Api: TInferCuApi read fApi;
     property Device: TCuDevice read fDevice;
     property DeviceName: RawUtf8 read fDeviceName;
@@ -364,6 +379,28 @@ begin
 end;
 
 
+procedure TInferCuBuffer.CopyTo(aOffset: Int64; aDest: TInferCuBuffer;
+  aDestOffset, aBytes: Int64);
+var
+  fpu: TCudaFpu;
+begin
+  if (aDest = nil) or (aOffset < 0) or (aDestOffset < 0) or (aBytes < 0) or
+     (aBytes > fSize - aOffset) or (aBytes > aDest.fSize - aDestOffset) then
+    raise EInferCuda.CreateUtf8('%.CopyTo: % bytes at % to % of %',
+      [self, aBytes, aOffset, aDestOffset, aDest]);
+  if aBytes = 0 then
+    exit;
+  fpu := CudaFpuEnter;
+  try
+    fCuda.Use;
+    fCuda.Check(fCuda.fApi.MemcpyDtoD(aDest.fPtr + aDestOffset, fPtr + aOffset,
+      aBytes), 'cuMemcpyDtoD');
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+
 { TInferCuda }
 
 procedure TInferCuda.Load(var aProc; aName: PAnsiChar);
@@ -425,6 +462,7 @@ begin
   Load(fApi.MemFree, 'cuMemFree_v2');
   Load(fApi.MemcpyHtoD, 'cuMemcpyHtoD_v2');
   Load(fApi.MemcpyDtoH, 'cuMemcpyDtoH_v2');
+  Load(fApi.MemcpyDtoD, 'cuMemcpyDtoD_v2');
   Load(fApi.LaunchKernel, 'cuLaunchKernel');
   Load(fApi.GetErrorName, 'cuGetErrorName');
   fpu := CudaFpuEnter;
@@ -507,6 +545,40 @@ begin
     Check(fApi.LaunchKernel(aKernel, aGridX, aGridY, aGridZ, aBlockX, aBlockY,
       aBlockZ, aSharedBytes, nil, params, nil), 'cuLaunchKernel');
     // the launch is asynchronous: its errors surface here
+    Check(fApi.CtxSynchronize(), 'cuCtxSynchronize');
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.Enqueue(aKernel: TCuHandle; const aParams: array of pointer;
+  aGridX, aBlockX, aGridY, aGridZ, aBlockY, aBlockZ, aSharedBytes: cardinal);
+var
+  fpu: TCudaFpu;
+  params: PPointer;
+begin
+  if (aKernel = nil) or (aGridX = 0) or (aBlockX = 0) then
+    raise EInferCuda.CreateUtf8('%.Enqueue: no kernel or an empty grid', [self]);
+  params := nil;
+  if length(aParams) > 0 then
+    params := @aParams[0];
+  fpu := CudaFpuEnter;
+  try
+    Use;
+    Check(fApi.LaunchKernel(aKernel, aGridX, aGridY, aGridZ, aBlockX, aBlockY,
+      aBlockZ, aSharedBytes, nil, params, nil), 'cuLaunchKernel');
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.Synchronize;
+var
+  fpu: TCudaFpu;
+begin
+  fpu := CudaFpuEnter;
+  try
+    Use;
     Check(fApi.CtxSynchronize(), 'cuCtxSynchronize');
   finally
     CudaFpuLeave(fpu);

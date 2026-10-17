@@ -1310,6 +1310,17 @@ Karte, C5 Tempo.
     (Windows) und unter FPC 3.2.2 in der WSL des RTX-Rechners (Linux, `libcuda.so.1` der
     WSL; die ganze Inferenz-Suite 2572 Assertions). Gegenprobe (je ein Fehler in Q8_0, Q4_K
     und Q6_K) lässt 18 scheitern, F32 bleibt grün.
+- *C3, erledigt 2026-10-17:* `tools/cuda/ops.cu` mit `rmsnorm`, `addnorm`, `swiglu`,
+  `qkrope` (Kopf-Norm, Rotation, KV-Speichern) und `attention` (kausal, GQA; zuerst
+  korrekt: die Scores in einem Scratch auf der Karte, Softmax, dann die Werte - Kacheln in
+  C5). `TInferCuda.Enqueue` startet ohne Warten (ein Stream, die Reihenfolge bleibt),
+  `Synchronize` wartet, `TInferCuBuffer.CopyTo` kopiert auf der Karte.
+  - *Test:* `OpsMatchCpu` gegen `RmsNorm`, `Add`, `SwiGlu`, `Rope` und `CausalAttention` der
+    CPU-Referenz (Prompt, Zeilen nach einem Präfix, Decode über 300 Schlüssel, Kopf 256,
+    der Cache außerhalb der neuen Zeilen unverändert), `qkrope` und `attention` direkt
+    hintereinander; `UploadDownload` prüft `CopyTo`. RTX 5090: 112 Assertions grün unter
+    FPC 3.2.2 und Delphi 13. Gegenprobe (Teiler der Norm, Vorzeichen der Rotation,
+    Kausalgrenze) lässt 14 von 23 scheitern.
 
 ### Danach — nach Bedarf
 
