@@ -170,7 +170,7 @@ begin
       // numbers only (VariantToInt64 would map true to 1), integral 1 or 2 -
       // JSON_FAST parses 2.0 as currency, so compare the numeric value
       if not (TVarData(aQueries[i].Rel.Values[j]).VType in [varByte, varShortInt,
-         varWord, varSmallInt, varLongWord, varInteger, varInt64, varQWord,
+         varWord, varSmallInt, varLongWord, varInteger, varInt64, varWord64,
          varCurrency, varDouble, varSingle]) or
          not VariantToDouble(aQueries[i].Rel.Values[j], d) then
         Fail('query %: grade of % is not a number', [aQueries[i].Id,

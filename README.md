@@ -428,6 +428,7 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 ```powershell
 # Delphi 13, on Windows:
 .\scripts\run-delphi-tests.ps1               # MCP, LLM and inference suites (-Suite mcp|llm|infer, -ShowAll)
+.\scripts\build-delphi-demos.ps1             # all demos (or -Demo infer\llm-bench.lpr)
 # logs and binaries land in bin\delphi\
 # Delphi 7 (Win32):
 .\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
@@ -513,7 +514,8 @@ mormot2-ai/
   docs/     native-inference.md · native-embeddings.md · specs/mcp-2026-07-28/
   vendor/   mormot.ext.os (adopted) · models, sqlite-ext (gitignored, not in git)
   scripts/  run-fpc-{tests,llm-tests,infer-tests}.sh · build-demo.sh · fpc-env.sh
-            run-delphi-tests.ps1 · run-delphi7-tests.ps1 · x64-ext-verify.sh
+            run-delphi-tests.ps1 · run-delphi7-tests.ps1 · build-delphi-demos.ps1
+            x64-ext-verify.sh
   CONCEPT.md  DESIGN.md  LICENSE  NOTICE  SECURITY.md  UPSTREAM_BASE
 ```
 
@@ -590,7 +592,7 @@ by idle machines on the network (task parallelism with leases, not model paralle
 embeddings in the LAN first, LLM batch jobs later), see
 [docs/distributed-execution.md](docs/distributed-execution.md) (German). Also alongside:
 the first real consumer of the load governor (a bulk indexing job in the backend), agent loop limits (cancellation, deadlines, context budget),
-token-based chunking, a Delphi build script for the demos. The German [CONCEPT.md](CONCEPT.md) §9 is
+token-based chunking, building the demos with Delphi 7. The German [CONCEPT.md](CONCEPT.md) §9 is
 the single source of truth for open points.
 
 ## Why a standalone extension

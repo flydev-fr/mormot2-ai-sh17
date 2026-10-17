@@ -146,7 +146,7 @@ begin
   begin
     t := GetTickCount64;
     istore.Search(queries[i], K);
-    Lat[i] := GetTickCount64 - t;
+    Lat[i] := Int64(GetTickCount64) - t;
   end;
 end;
 

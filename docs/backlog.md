@@ -155,6 +155,16 @@ Die README-Tabelle „Where it runs" hat veraltete Zellen:
 `demos/infer/llm-bench.lpr` und `embed-bench.lpr` werden nur mit FPC gebaut. Ein
 `scripts/build-delphi-demos.ps1` (Delphi 13 Win64, analog `run-delphi-tests.ps1`) fehlt.
 
+**Erledigt (2026-10-17):** `scripts/build-delphi-demos.ps1` baut alle 18 Demos (dieselbe
+Liste wie `build-demo.sh`, `-Demo` für eine). Gefunden und behoben: `embed-reference`
+nutzte das FPC-only `varQWord` (jetzt mORMots `varWord64`), `vector-bench` mischte
+`GetTickCount64` (unter Delphi vorzeichenlos) mit Int64 (W1073); dcc findet Units neben
+dem Programm nicht von selbst, das Skript nimmt das Demo-Verzeichnis in den Suchpfad.
+Offen: Delphi 7.
+- *Fund dabei:* Die Delphi-13-`llm-bench` rechnet richtig, ist aber auf dem i9-14900K
+  viel langsamer als die FPC-Exe (Q4_K_M, 200 Tokens: Prefill 218 statt 577, Decode 12
+  statt 78 Tokens/s); Attention nimmt 83 % der Decode-Zeit. Ursache noch offen.
+
 ---
 
 ## B7 — Offene Entscheidung: Kontextlänge für Embeddings
