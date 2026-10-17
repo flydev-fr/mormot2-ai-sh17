@@ -342,3 +342,8 @@ Adreno: Q8_0 Kosinus 0,9991, Argmax 16 von 16 (Kopf in zwei Teilen, natürliche 
 falscher Zeilenabstand beim Kopieren (Ziel und Quelle), alle Teile in Spalte 0 oder aus den
 ersten Gewichten, `MaxLinearBytes` übergangen, Kopf am Stück geladen, kein Zwischenpuffer, der
 letzte Teil zu groß - alle acht scheitern.
+
+**Tempo (offen, kein Auftrag):** Qwen3-0.6B Q8_0, 200 Tokens, auf dem Snapdragon X: Adreno
+Prefill 368 und Decode 30 Tokens/s, die CPU desselben Rechners (8 Threads, NEON-Dotprod) 639
+und 68. Die Adreno rechnet richtig, lohnt sich aber nicht; die Shader sind nicht auf sie
+abgestimmt (`matvec8` dort aus, `gemm8` für RTX und M2 Pro gemessen).
