@@ -69,7 +69,9 @@ type
     /// the tiny Qwen3 with the attention keys in one range per row (several
     // tiles of 128 keys, the online softmax rescaled) and in ranges of one
     // key (many ranges merged), against the CPU - also with a head dimension
-    // of 256 (tiny-qwen3-hd256: the second accumulator of attention.comp)
+    // of 256 (tiny-qwen3-hd256: the second accumulator of attention.comp);
+    // with a KV cache of floats and of half floats (KvF16, a looser
+    // tolerance), the cache grown once with tokens in it
     procedure AttentionRangesMatchCpu;
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced: the CPU's greedy tokens fed to both, logits
@@ -452,6 +454,7 @@ begin
           'q8_0.gguf', ref);
       v := model.Config.VocabSize;
       vk := TQwen3Vulkan.Create(model, gpu);
+      vk.KvF16 := false; // the float cache: F32 within 1e-4
       c1 := model.NewContext;
       c2 := vk.NewContext;
       // the prompt: every row's logits
@@ -530,6 +533,10 @@ end;
 procedure TTestInferVulkan.CheckAttentionRanges(const aName: RawUtf8);
 const
   PROMPT = 400; // two chunks; a row sees up to 400 keys: 4 tiles
+  FIRST = 10;   // a first forward: the cache grows with them in it
+  /// the relative error of the logits: a cache of floats, of half floats
+  // (measured on an Adreno X1-85: at most 1.1e-3, the rounding of 11 bits)
+  TOL: array[boolean] of double = (1e-4, 4e-3);
 var
   dir: TFileName;
   gpu: TInferVulkanBackend;
@@ -539,12 +546,12 @@ var
   c1: TQwen3Context;
   c2: TQwen3VkContext;
   ids: TIntegerDynArray;
-  l1, l2: TSingleDynArray;
+  l1, l2, d1, d2: TSingleDynArray;
   i, k, v: PtrInt;
   seed: cardinal;
   e: double;
   id: integer;
-  flash: boolean;
+  flash, f16: boolean;
 begin
   if not HasDevice then
     exit;
@@ -572,30 +579,49 @@ begin
     c2 := vk.NewContext;
     SetLength(l1, PROMPT * v);
     SetLength(l2, PROMPT * v);
+    SetLength(d1, v);
+    SetLength(d2, v);
     model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
-    // flash.comp (where the device runs it) and attention.comp for the prompt
     flash := vk.UseFlash;
-    for k := 0 to 3 do
+    for f16 := false to true do
     begin
-      vk.SplitKeys := k and 1; // 0: one range per row, 1: a range per key
-      vk.UseFlash := vk.HasFlash and (k < 2);
-      c2.Reset;
-      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
-      e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-      CheckUtf8(e <= 1e-4, '% SplitKeys=% UseFlash=% prompt: relative error %',
-        [aName, k and 1, vk.UseFlash, e]);
-    end;
-    vk.UseFlash := flash;
-    // decoding past the prompt, one range and many ranges in turn
-    for i := 0 to 3 do
-    begin
-      vk.SplitKeys := i and 1;
-      id := ids[i];
-      model.Forward(c1, @id, 1, pointer(l1));
-      vk.Forward(c2, @id, 1, pointer(l2));
-      e := RelError(pointer(l2), pointer(l1), v);
-      CheckUtf8(e <= 1e-4, '% SplitKeys=% decode step %: relative error %',
-        [aName, i and 1, i, e]);
+      vk.KvF16 := f16;
+      // flash.comp (where the device runs it) and attention.comp for the
+      // prompt; a Reset context takes the cache format of KvF16
+      for k := 0 to 3 do
+      begin
+        vk.SplitKeys := k and 1; // 0: one range per row, 1: a range per key
+        vk.UseFlash := vk.HasFlash and (k < 2);
+        c2.Reset;
+        if k = 0 then
+        begin
+          // a new cache (64 tokens: c2 is new, or its cache dropped for the
+          // other format), grown to the prompt with FIRST in it
+          vk.Forward(c2, pointer(ids), FIRST, pointer(l2), true);
+          vk.Forward(c2, @ids[FIRST], PROMPT - FIRST, @l2[FIRST * v], true);
+        end
+        else
+          vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+        Check(c2.KvF16 = f16, 'the cache format of KvF16');
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[f16],
+          '% KvF16=% SplitKeys=% UseFlash=% prompt: relative error %',
+          [aName, f16, k and 1, vk.UseFlash, e]);
+      end;
+      vk.UseFlash := flash;
+      // decoding past the prompt, one range and many ranges in turn
+      for i := 0 to 3 do
+      begin
+        vk.SplitKeys := i and 1;
+        id := ids[i];
+        model.Forward(c1, @id, 1, pointer(d1));
+        vk.Forward(c2, @id, 1, pointer(d2));
+        e := RelError(pointer(d2), pointer(d1), v);
+        CheckUtf8(e <= TOL[f16],
+          '% KvF16=% SplitKeys=% decode step %: relative error %',
+          [aName, f16, i and 1, i, e]);
+      end;
+      c1.Truncate(PROMPT);
     end;
   finally
     c2.Free;
@@ -751,6 +777,10 @@ begin
     r1 := llm.ChatComplete(first);
     Check(gpu.GpuLinears > calls, 'the backend computed the first answer');
     client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+    // the float cache: the same words as the backend over a whole answer (the
+    // half floats of KvF16 may flip a close greedy choice; Qwen3GgufMatchesCpu
+    // checks them)
+    TQwen3Vulkan(client.Device).KvF16 := false;
     Check(client.Model.Device = client.Device, 'the model computes on the device');
     ctx := client.Model.NewContext;
     try

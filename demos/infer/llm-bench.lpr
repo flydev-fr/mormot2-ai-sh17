@@ -12,6 +12,8 @@
 //     Exact = true; vulkan: the whole forward pass on the Vulkan device
 //     (TQwen3Vulkan, phase 4d); cuda: the same on the CUDA device (TQwen3Cuda,
 //     backlog B3); otherwise TInferCpuFastBackend in its float mode
+//   - LAI_KV_F32=1: vulkan keeps its KV cache in floats instead of half
+//     floats (TQwen3Vulkan.KvF16)
 //   e.g.   llm-bench vendor/models/qwen3-0.6b 200 32
 program llm.bench;
 
@@ -379,6 +381,8 @@ begin
           gpu := TInferVulkanBackend.Create;
           backend := gpu;
           dev := TQwen3Vulkan.Create(model, gpu);
+          TQwen3Vulkan(dev).KvF16 := GetEnvironmentVariable('LAI_KV_F32') <> '1';
+          ConsoleWrite('KV cache in half floats: %', [TQwen3Vulkan(dev).KvF16]);
         end
         else
         begin

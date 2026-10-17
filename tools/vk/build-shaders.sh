@@ -23,6 +23,11 @@ done
 # variants: linear8.comp with subgroup reductions, for Vulkan 1.1 devices
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/linear8_sg.spv" linear8.comp   > "$TMP/linear8_sg.log" || { cat "$TMP/linear8_sg.log"; exit 1; }
 ARGS+=("SPV_LINEAR8_SG=$TMP/linear8_sg.spv")
+# variants: the KV cache in half floats (TQwen3Vulkan.KvF16)
+for n in qkrope attention flash; do
+  "$GLSLANG" -V --target-env vulkan1.0 -Os -DKVF16 -o "$TMP/${n}_f16.spv" $n.comp > "$TMP/${n}_f16.log" || { cat "$TMP/${n}_f16.log"; exit 1; }
+  ARGS+=("SPV_$(echo "$n" | tr a-z A-Z)_F16=$TMP/${n}_f16.spv")
+done
 # matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K), with and without
 # subgroup reductions
 for t in 2:Q8 3:Q4K 4:Q6K; do

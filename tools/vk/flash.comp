@@ -17,6 +17,8 @@
 //   (TQwen3Vulkan checks the limit and keeps attention.comp otherwise)
 // - TQwen3Vulkan takes it on Apple GPUs only (UseFlash): an M2 Pro prefills
 //   4000 tokens 1.9 times as fast with it, an RTX 5090 1.7 times as slow
+// - -DKVF16 (SPV_FLASH_F16): keys and values as half floats, two to a word
+//   (qkrope.comp -DKVF16), read through kv4()
 #version 450
 
 #define QN 32
@@ -26,8 +28,15 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer BufQ { vec4 q4[]; };
+#ifdef KVF16
+layout(std430, binding = 1) readonly buffer BufK { uvec2 keys4[]; };
+layout(std430, binding = 2) readonly buffer BufV { uvec2 vals4[]; };
+#define kv4(a) vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y))
+#else
 layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
 layout(std430, binding = 2) readonly buffer BufV { vec4 vals4[]; };
+#define kv4(a) (a)
+#endif
 layout(std430, binding = 3) writeonly buffer BufY { vec4 y4[]; };
 // [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
 layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
@@ -107,7 +116,7 @@ void main()
       uint k = i & 31u;
       vec4 v = vec4(0.0);
       if ((j < hi) && (k < d4))
-        v = keys4[j * kvw4 + g * d4 + k];
+        v = kv4(keys4[j * kvw4 + g * d4 + k]);
       kv[i] = v;
     }
     barrier();
@@ -154,7 +163,7 @@ void main()
       uint k = i & 31u;
       vec4 v = vec4(0.0);
       if ((j < hi) && (k < d4))
-        v = vals4[j * kvw4 + g * d4 + k];
+        v = kv4(vals4[j * kvw4 + g * d4 + k]);
       kv[i] = v;
     }
     barrier();

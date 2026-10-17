@@ -239,6 +239,9 @@ kurzem Kontext. Ein natives Metal-Backend folgt nur, wenn MoltenVK selbst bremst
    Tokens steigt von 381 auf 708 Tokens/s; auf der RTX ist der Kernel langsamer.
 4. **Offen:** die Decode-Attention bei langem Kontext. Der Decode fällt auf dem M2 Pro von
    90 Tokens/s (200 Tokens Kontext) auf 40 (4000). `attention.comp` erreicht dort 63 GFLOPS.
+   *Erster Schritt, 2026-10-17:* KV-Cache in Halbgenauigkeit (`TQwen3Vulkan.KvF16`, Vorgabe
+   an; `docs/native-inference.md`): auf der RTX 5090 Decode +6 % bei 4000, +8 % bei 8000
+   Tokens. Die Messung auf dem M2 Pro steht aus.
 5. Erst danach über ein Metal-Backend entscheiden.
 
 Mac-Lauf: Homebrew `molten-vk` und `vulkan-loader` sind auf `macos-tests` installiert;

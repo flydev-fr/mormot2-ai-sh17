@@ -5,6 +5,9 @@
 // (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
 // - one work group of 128 per (row, head): heads first, then the KV heads
 // (which also store v); headDim <= 256, even
+// - -DKVF16 (SPV_QKROPE_F16): the cache holds k and v as half floats, two to
+//   a word (packHalf2x16: core GLSL, no 16-bit storage extension), each
+//   invocation storing whole words; headDim then a multiple of 4
 #version 450
 
 layout(local_size_x = 128) in;
@@ -15,8 +18,13 @@ layout(std430, binding = 2) readonly buffer BufV { float v[]; };
 layout(std430, binding = 3) readonly buffer BufQN { float qn[]; };
 layout(std430, binding = 4) readonly buffer BufKN { float kn[]; };
 layout(std430, binding = 5) readonly buffer BufCS { float cs[]; }; // cos, then sin
+#ifdef KVF16
+layout(std430, binding = 6) writeonly buffer BufKC { uint kc[]; };
+layout(std430, binding = 7) writeonly buffer BufVC { uint vc[]; };
+#else
 layout(std430, binding = 6) writeonly buffer BufKC { float kc[]; };
 layout(std430, binding = 7) writeonly buffer BufVC { float vc[]; };
+#endif
 
 layout(push_constant) uniform Push {
   uint rows, heads, kvHeads, headDim, past;
@@ -63,6 +71,24 @@ void main()
   uint sbase = p.rows * half_ + r * half_;
   uint kvw = p.kvHeads * d;
   uint dst = (p.past + r) * kvw + h * d;
+#ifdef KVF16
+  if (!isQ)
+  {
+    // the dimensions i and i + 1 of both halves, each pair one word
+    for (uint i = 2u * t; i < half_; i += 256u)
+    {
+      vec2 c = vec2(cs[cbase + i], cs[cbase + i + 1u]);
+      vec2 sn = vec2(cs[sbase + i], cs[sbase + i + 1u]);
+      vec2 a = vec2(normed[i], normed[i + 1u]);
+      vec2 b = vec2(normed[i + half_], normed[i + half_ + 1u]);
+      kc[(dst + i) >> 1] = packHalf2x16(a * c - b * sn);
+      kc[(dst + i + half_) >> 1] = packHalf2x16(b * c + a * sn);
+    }
+    for (uint c = 2u * t; c < d; c += 256u)
+      vc[(dst + c) >> 1] = packHalf2x16(vec2(v[src + c], v[src + c + 1u]));
+    return;
+  }
+#endif
   for (uint i = t; i < half_; i += 128u)
   {
     float c = cs[cbase + i];
@@ -76,13 +102,17 @@ void main()
       q[src + i] = x0;
       q[src + i + half_] = x1;
     }
+#ifndef KVF16
     else
     {
       kc[dst + i] = x0;
       kc[dst + i + half_] = x1;
     }
+#endif
   }
+#ifndef KVF16
   if (!isQ)
     for (uint c = t; c < d; c += 128u)
       vc[dst + c] = v[src + c];
+#endif
 }

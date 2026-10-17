@@ -9,6 +9,8 @@
 //   up, the logits come down, and the host waits once
 // - the arithmetic is float throughout (the weights dequantized as
 //   InferRowToF32 does): logits match the CPU within a tolerance, not in bits
+// - the KV cache holds half floats by default (KvF16): decoding a long
+//   context reads every cached key and value per token, half the bytes
 // - the model's weights are uploaded once, at Create; the model and the
 //   backend must outlive the TQwen3Vulkan and its contexts
 unit mormot.ai.infer.model.qwen3.vulkan;
@@ -52,6 +54,7 @@ type
   protected
     fRows: PtrInt;
     fDevKeys, fDevValues: TInferVkBufferDynArray; // per layer [capacity, kvWidth]
+    fKvF16: boolean; // the cache holds half floats (TQwen3Vulkan.KvF16)
     // device scratch for up to fRows token rows
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp, fDevCos: TInferVkBuffer;
     fPart, fLogits: TInferVkBuffer;
@@ -61,6 +64,10 @@ type
     procedure FreeCache;
   public
     destructor Destroy; override;
+    /// true when the cache holds half floats (TQwen3Vulkan.KvF16 when it was
+    // allocated)
+    property KvF16: boolean
+      read fKvF16;
   end;
 
   /// the forward pass of a TQwen3Model on the device of a TInferVulkanBackend
@@ -72,7 +79,9 @@ type
     fVk: TInferVulkan;
     fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm,
       fFlash: TInferVkPipeline;
-    fUseFlash: boolean;
+    // the same for a KV cache of half floats
+    fQkRope16, fAttention16, fFlash16: TInferVkPipeline;
+    fUseFlash, fKvF16: boolean;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
     procedure UploadWeights;
@@ -123,6 +132,14 @@ type
       read fUseFlash write fUseFlash;
     /// true when the device runs flash.comp (UseFlash can take it)
     function HasFlash: boolean;
+    /// the KV cache in half floats (default) instead of floats: half the
+    // memory, and half the bytes the attention reads per decoded token -
+    // the keys and values rounded to 11 significant bits, the logits then
+    // within a looser tolerance of the CPU's
+    // - a context takes it when its cache is allocated, and again on its
+    // next Forward while it is empty (after Reset)
+    property KvF16: boolean
+      read fKvF16 write fKvF16;
   end;
 
 
@@ -236,12 +253,15 @@ begin
   fModel := aModel;
   fBackend := aBackend;
   fSplitKeys := SPLIT_KEYS;
+  fKvF16 := true;
   fVk := aBackend.Vulkan;
   fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
     SizeOf(TNormPush));
   fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2, 4);
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
     5, SizeOf(TAttentionPush));
+  fAttention16 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION_F16,
+    length(SPV_ATTENTION_F16), 5, SizeOf(TAttentionPush));
   fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 2,
     SizeOf(TMergePush));
   if (aModel.Config.HeadDim <= 128) and (fVk.MaxInvocations >= 256) and
@@ -250,18 +270,25 @@ begin
     fFlash := TInferVkPipeline.Create(fVk, @SPV_FLASH, length(SPV_FLASH), 5,
       SizeOf(TAttentionPush));
     fFlash.Name := 'flash';
+    fFlash16 := TInferVkPipeline.Create(fVk, @SPV_FLASH_F16,
+      length(SPV_FLASH_F16), 5, SizeOf(TAttentionPush));
+    fFlash16.Name := 'flash';
     fUseFlash := fVk.VendorId = $106B; // Apple
   end;
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
   fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
     SizeOf(TQkRopePush));
+  fQkRope16 := TInferVkPipeline.Create(fVk, @SPV_QKROPE_F16,
+    length(SPV_QKROPE_F16), 8, SizeOf(TQkRopePush));
   fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM, length(SPV_ADDNORM), 4,
     SizeOf(TNormPush));
   fQkRope.Name := 'qkrope';
+  fQkRope16.Name := 'qkrope';
   fAddNorm.Name := 'addnorm';
   fNorm.Name := 'rmsnorm';
   fSwiGlu.Name := 'swiglu';
   fAttention.Name := 'attention';
+  fAttention16.Name := 'attention';
   fMerge.Name := 'attnmerge';
   fAdd.Name := 'add';
   fBackend.GpuLock;
@@ -283,10 +310,13 @@ begin
   if (fModel <> nil) and (fModel.Device = self) then
     fModel.Device := nil;
   fAddNorm.Free;
+  fQkRope16.Free;
   fQkRope.Free;
   fAdd.Free;
+  fFlash16.Free;
   fFlash.Free;
   fMerge.Free;
+  fAttention16.Free;
   fAttention.Free;
   fSwiGlu.Free;
   fNorm.Free;
@@ -389,12 +419,20 @@ procedure TQwen3Vulkan.Prepare(aCtx: TQwen3VkContext; aTokens, aRows,
   aOutRows: PtrInt);
 var
   c: TQwen3Config;
-  cap, kvw, l, half: PtrInt;
+  cap, kvw, l, half, es: PtrInt;
   keys, values: TInferVkBufferDynArray;
 begin
   c := fModel.Config;
   kvw := c.KvHeads * c.HeadDim;
   half := c.HeadDim shr 1;
+  // an empty context takes the cache format of KvF16
+  if (aCtx.fLength = 0) and (aCtx.fCapacity > 0) and (aCtx.fKvF16 <> fKvF16) then
+    aCtx.FreeCache;
+  if aCtx.fCapacity = 0 then
+    aCtx.fKvF16 := fKvF16;
+  es := 4; // bytes per cached value
+  if aCtx.fKvF16 then
+    es := 2;
   // the KV cache: doubled, a quarter beyond the tokens wanted (as on the CPU),
   // the cached tokens copied into the new buffers
   if aTokens > aCtx.fCapacity then
@@ -407,8 +445,8 @@ begin
     if cap > c.MaxPositions then
       cap := c.MaxPositions;
     // no more than one layer's buffer the device can bind
-    if Int64(cap) * kvw * 4 > fVk.MaxStorageRange then
-      cap := fVk.MaxStorageRange div (Int64(kvw) * 4);
+    if Int64(cap) * kvw * es > fVk.MaxStorageRange then
+      cap := fVk.MaxStorageRange div (Int64(kvw) * es);
     if cap < aTokens then
       EInferError.RaiseUtf8('%: a KV cache of % tokens is too large for this device',
         [self, aTokens]);
@@ -417,8 +455,8 @@ begin
     try
       for l := 0 to c.Layers - 1 do
       begin
-        keys[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * 4, true);
-        values[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * 4, true);
+        keys[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
+        values[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
       end;
       if aCtx.fLength > 0 then
       begin
@@ -426,9 +464,10 @@ begin
         try
           for l := 0 to c.Layers - 1 do
           begin
-            fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0, Int64(aCtx.fLength) * kvw * 4);
+            fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0,
+              Int64(aCtx.fLength) * kvw * es);
             fVk.BatchCopy(aCtx.fDevValues[l], 0, values[l], 0,
-              Int64(aCtx.fLength) * kvw * 4);
+              Int64(aCtx.fLength) * kvw * es);
           end;
         except
           fVk.BatchAbort;
@@ -509,7 +548,7 @@ var
   c: TQwen3Config;
   n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
     queries: PtrInt;
-  attention: TInferVkPipeline;
+  attention, qkrope: TInferVkPipeline;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
@@ -537,11 +576,20 @@ begin
   // group) times rb rows, the keys of a row cut into splits ranges unless
   // there are enough work groups without
   // - flash.comp for FLASH_ROWS rows or more
+  // - the shaders of the cache format of aCtx (set by Prepare)
   attention := fAttention;
+  qkrope := fQkRope;
+  if aCtx.fKvF16 then
+  begin
+    attention := fAttention16;
+    qkrope := fQkRope16;
+  end;
   queries := ATTENTION_QUERIES;
   if fUseFlash and (fFlash <> nil) and (n >= FLASH_ROWS) then
   begin
     attention := fFlash;
+    if aCtx.fKvF16 then
+      attention := fFlash16;
     queries := FLASH_QUERIES;
   end;
   hb := c.Heads div c.KvHeads;
@@ -605,7 +653,7 @@ begin
       fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false);
       fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false);
       fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
-      fVk.BatchDispatch(fQkRope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV,
+      fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV,
         Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fDevCos,
         aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.KvHeads, n);
       fVk.BatchDispatch(attention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],

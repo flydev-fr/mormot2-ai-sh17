@@ -1272,6 +1272,42 @@ llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
   - `Device := nil` führt zurück aufs Backend.
   - Gegenprobe: Mit reinen CPU-Kontexten scheitert der Test.
 
+**KV-Cache in Halbgenauigkeit (2026-10-17):**
+
+- Beim Dekodieren liest die Attention für jedes neue Token den ganzen KV-Cache. Bei
+  Qwen3-0.6B sind das in F32 rund 115 KB je Token Kontext für K und noch einmal so viel für
+  V, bei 4000 Tokens knapp 1 GB je Schritt. `TQwen3Vulkan.KvF16` (Vorgabe an) hält K und V
+  als Halbgenauigkeit, zwei Werte in einem Wort (`packHalf2x16`/`unpackHalf2x16`, Kern-GLSL,
+  keine 16-Bit-Erweiterung nötig). Gebaut als Varianten `-DKVF16` von `qkrope.comp`,
+  `attention.comp` und `flash.comp` (`SPV_*_F16`); in `qkrope` schreibt jede Invocation
+  ganze Wörter, also zwei Dimensionen, daher Kopfdimension durch 4 teilbar (wie bisher
+  verlangt). Das F32-SPIR-V der Attention ist dabei bis auf die Nummerierung gleich
+  geblieben.
+- Ein Kontext übernimmt das Format, wenn sein Cache angelegt wird, und wieder bei seinem
+  nächsten `Forward`, solange er leer ist (nach `Reset`); `TQwen3VkContext.KvF16` zeigt es.
+  Halb so viel Speicher heißt auch: doppelt so viele Tokens unter `maxStorageBufferRange`.
+- Genauigkeit: Die Logits weichen mit F16 bis 1,1e-3 relativ von der CPU ab (F32-Cache: unter
+  1e-4). `AttentionRangesMatchCpu` prüft beide Formate mit eigener Toleranz (1e-4 bzw. 4e-3),
+  über `attention.comp` und `flash.comp`, mit und ohne Splits, Kopfdimension 32 und 256, und
+  lässt den Cache einmal mit Inhalt wachsen. Qwen3-0.6B gegen die CPU unverändert
+  (Kosinus 0,9990 bei Q8_0, 0,9972 bei Q4_K_M; Argmax 16 von 16).
+- Gegenprobe, alle acht scheitern: vertauschte Halbwerte in `qkrope` (V), in `attention`
+  (K und V getrennt) und in `flash`, die zweite Hälfte der Rotation an der falschen Stelle,
+  der F32-`flash` für einen F16-Cache, das Umkopieren beim Wachsen mit 2 Byte je Wert und ein
+  leerer Kontext, der sein altes Format behält. `NativeClientOnDevice` verlangt wortgleiche
+  Antworten über einen ganzen Text und bleibt deshalb beim F32-Cache.
+- RTX 5090, Qwen3-0.6B Q8_0, Decode in Tokens/s (zwei Läufe, gleich bis auf 1 %); der Prefill
+  bleibt unverändert:
+
+  | Kontext | 200 | 1000 | 4000 | 8000 |
+  |---|---|---|---|---|
+  | F32-Cache | 351 | 373 | 325 | 265 |
+  | F16-Cache | 361 | 383 | 346 | 287 |
+
+  Auf der RTX bremst die Bandbreite wenig (1,8 TB/s). Auf dem M2 Pro, wo der Decode von 90
+  (200 Tokens) auf 40 Tokens/s (4000) fällt, steht die Messung noch aus. `llm-bench` schaltet
+  mit `LAI_KV_F32=1` auf den F32-Cache zurück.
+
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 

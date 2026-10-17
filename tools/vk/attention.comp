@@ -15,6 +15,8 @@
 //   splits > 1: each range writes its unnormalized sums, its maximum and its
 //   sum of exponentials to part[], and attnmerge.comp combines them into y
 // - shared memory: 16 KB, the least every device offers
+// - -DKVF16 (SPV_ATTENTION_F16): keys and values as half floats, two to a
+//   word (qkrope.comp -DKVF16), read through key4() and val()
 #version 450
 
 #define MAXQ 8
@@ -23,8 +25,13 @@
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
+#ifdef KVF16
+layout(std430, binding = 1) readonly buffer BufK { uvec2 keys4[]; };
+layout(std430, binding = 2) readonly buffer BufV { uint vals[]; };
+#else
 layout(std430, binding = 1) readonly buffer BufK { vec4 keys4[]; };
 layout(std430, binding = 2) readonly buffer BufV { float vals[]; };
+#endif
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 // [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
 layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
@@ -37,6 +44,31 @@ layout(push_constant) uniform Push {
 shared vec4 qs[MAXQ * 64];      // the queries
 shared float ps[MAXQ * 128];    // the scores, then the weights of a tile
 shared float red[MAXQ * 128];   // the maximum of a tile
+
+// the 4 key values from vec4 slot i, value i
+#ifdef KVF16
+vec4 key4(uint i)
+{
+  uvec2 u = keys4[i];
+  return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
+}
+
+float val(uint i)
+{
+  vec2 v = unpackHalf2x16(vals[i >> 1]);
+  return (i & 1u) != 0u ? v.y : v.x;
+}
+#else
+vec4 key4(uint i)
+{
+  return keys4[i];
+}
+
+float val(uint i)
+{
+  return vals[i];
+}
+#endif
 
 void main()
 {
@@ -101,7 +133,7 @@ void main()
       uint kb = (j * kvw + g * d) >> 2;
       for (uint k = 0u; k < d4; k++)
       {
-        vec4 kv = keys4[kb + k];
+        vec4 kv = key4(kb + k);
         for (uint i = 0u; i < MAXQ; i++)
           if (i < nq)
             sv[i] += dot(qs[i * 64u + k], kv);
@@ -146,9 +178,9 @@ void main()
       float v0 = 0.0;
       float v1 = 0.0;
       if (t < d)
-        v0 = vals[vb];
+        v0 = val(vb);
       if (t + 128u < d)
-        v1 = vals[vb + 128u];
+        v1 = val(vb + 128u);
       for (uint i = 0u; i < MAXQ; i++)
       {
         float w = ps[i * 128u + jj];
