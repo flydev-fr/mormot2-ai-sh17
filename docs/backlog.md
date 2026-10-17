@@ -161,9 +161,13 @@ nutzte das FPC-only `varQWord` (jetzt mORMots `varWord64`), `vector-bench` misch
 `GetTickCount64` (unter Delphi vorzeichenlos) mit Int64 (W1073); dcc findet Units neben
 dem Programm nicht von selbst, das Skript nimmt das Demo-Verzeichnis in den Suchpfad.
 Offen: Delphi 7.
-- *Fund dabei:* Die Delphi-13-`llm-bench` rechnet richtig, ist aber auf dem i9-14900K
-  viel langsamer als die FPC-Exe (Q4_K_M, 200 Tokens: Prefill 218 statt 577, Decode 12
-  statt 78 Tokens/s); Attention nimmt 83 % der Decode-Zeit. Ursache noch offen.
+- *Fund dabei, behoben:* Die Delphi-13-`llm-bench` war auf dem i9-14900K viel langsamer
+  als die FPC-Exe (Q4_K_M, 200 Tokens: Prefill 216 statt 579, Decode 14 statt 78
+  Tokens/s), Attention 80 % der Decode-Zeit, mit 1 Thread aber gleichauf. Ursache:
+  `CausalRows` legte bei jedem Aufruf (je Kopf und Token, aus allen Workern zugleich)
+  dynamische Arrays an; FPC hat einen Heap je Thread, Delphis Speichermanager
+  serialisiert. Jetzt Stack-Puffer bis 4096 Schlüssel (Heap darüber, Tests an beiden
+  Grenzen): Delphi 468 / 68 Tokens/s, FPC unverändert.
 
 ---
 

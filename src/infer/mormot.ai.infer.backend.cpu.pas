@@ -949,6 +949,10 @@ begin
   end;
 end;
 
+const
+  /// CausalRows keeps its scores on the stack up to this many keys
+  CAUSAL_STACK = 4096;
+
 /// rows aFirst..aLast of head h of a causal attention job
 // - the reference: scores and sums in double, the softmax divided at the end;
 // with aJob.Fast and a float kernel for this CPU and head size, float lanes
@@ -957,9 +961,15 @@ var
   r, g, j, t, d, total, kvw, qw: PtrInt;
   scale, m, sum, acc, a: double;
   q, k, outp: PSingleArray;
-  sc: TDoubleDynArray;
-  sums: TDoubleDynArray;
-  s: TSingleDynArray;
+  sc, sums: PDoubleArray;
+  s: PSingleArray;
+  // no heap below CAUSAL_STACK keys: the workers call this for every head and
+  // token at once, and a shared memory manager (Delphi's) serializes them
+  sStack: array[0..CAUSAL_STACK - 1] of single;
+  scStack: array[0..CAUSAL_STACK - 1] of double;
+  sumsStack: array[0..255] of double;
+  sHeap: TSingleDynArray;
+  scHeap, sumsHeap: TDoubleDynArray;
 begin
   d := aJob.HeadDim;
   kvw := aJob.KvHeads * d;
@@ -968,29 +978,34 @@ begin
   scale := 1 / Sqrt(d);
   if aJob.Fast and Assigned(InferDotsF32) and (d and 15 = 0) then
   begin
-    SetLength(s, aJob.Past + aLast + 1);
+    s := @sStack;
+    if aJob.Past + aLast + 1 > CAUSAL_STACK then
+    begin
+      SetLength(sHeap, aJob.Past + aLast + 1);
+      s := pointer(sHeap);
+    end;
     for r := aFirst to aLast do
     begin
       total := aJob.Past + r + 1; // causal: up to and including this token
       InferDotsF32(@aJob.Q^[r * qw + h * d], @aJob.Keys^[g * d],
-        kvw * SizeOf(single), total, d, pointer(s));
-      m := s[0] * scale;
+        kvw * SizeOf(single), total, d, s);
+      m := s^[0] * scale;
       for j := 0 to total - 1 do
       begin
-        s[j] := s[j] * scale;
-        if s[j] > m then
-          m := s[j];
+        s^[j] := s^[j] * scale;
+        if s^[j] > m then
+          m := s^[j];
       end;
       sum := 0;
       for j := 0 to total - 1 do
       begin
-        a := Exp(s[j] - m);
-        s[j] := a;
+        a := Exp(s^[j] - m);
+        s^[j] := a;
         sum := sum + a;
       end;
       sum := 1 / sum;
       for j := 0 to total - 1 do
-        s[j] := s[j] * sum;
+        s^[j] := s^[j] * sum;
       outp := @aJob.Y^[r * qw + h * d];
       FillCharFast(outp^, d * SizeOf(single), 0);
       InferAxpyRowsF32(pointer(s), @aJob.Values^[g * d], kvw * SizeOf(single),
@@ -998,8 +1013,18 @@ begin
     end;
     exit;
   end;
-  SetLength(sc, aJob.Past + aLast + 1);
-  SetLength(sums, d);
+  sc := @scStack;
+  if aJob.Past + aLast + 1 > CAUSAL_STACK then
+  begin
+    SetLength(scHeap, aJob.Past + aLast + 1);
+    sc := pointer(scHeap);
+  end;
+  sums := @sumsStack;
+  if d > length(sumsStack) then
+  begin
+    SetLength(sumsHeap, d);
+    sums := pointer(sumsHeap);
+  end;
   for r := aFirst to aLast do
   begin
     total := aJob.Past + r + 1;
@@ -1015,29 +1040,29 @@ begin
         acc := acc + a * k^[t];
       end;
       acc := acc * scale;
-      sc[j] := acc;
+      sc^[j] := acc;
       if (j = 0) or (acc > m) then
         m := acc;
     end;
     sum := 0;
     for j := 0 to total - 1 do
     begin
-      sc[j] := Exp(sc[j] - m);
-      sum := sum + sc[j];
+      sc^[j] := Exp(sc^[j] - m);
+      sum := sum + sc^[j];
     end;
     for t := 0 to d - 1 do
-      sums[t] := 0;
+      sums^[t] := 0;
     for j := 0 to total - 1 do
     begin
       k := @aJob.Values^[j * kvw + g * d];
-      acc := sc[j];
+      acc := sc^[j];
       for t := 0 to d - 1 do
-        sums[t] := sums[t] + acc * k^[t];
+        sums^[t] := sums^[t] + acc * k^[t];
     end;
     outp := @aJob.Y^[r * qw + h * d];
     sum := 1 / sum;
     for t := 0 to d - 1 do
-      outp^[t] := sums[t] * sum;
+      outp^[t] := sums^[t] * sum;
   end;
 end;
 

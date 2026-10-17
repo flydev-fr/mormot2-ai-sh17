@@ -934,10 +934,13 @@ end;
 procedure TTestInferFast.DecoderOpsMatchReference;
 const
   // past tokens, new rows, heads, KV heads, head size
-  CASES: array[0..7, 0..4] of integer = (
+  // - 4094 + 2 keys: the scores just fit the stack of CausalRows, 4099 + 2 do
+  // not (its heap fallback), head size 272 has its sums on the heap
+  CASES: array[0..10, 0..4] of integer = (
     (0, 1, 16, 8, 128), (0, 20, 16, 8, 128), (50, 1, 16, 8, 128),
     (50, 20, 16, 8, 128), (3, 7, 4, 1, 32), (0, 9, 2, 2, 8), (130, 3, 8, 8, 64),
-    (5, 16, 4, 2, 32)); // 16 rows: exactly two blocks of 8
+    (5, 16, 4, 2, 32), // 16 rows: exactly two blocks of 8
+    (4094, 2, 2, 1, 32), (4099, 2, 2, 1, 32), (2, 3, 2, 1, 272));
   // rows, in, out: in 1000 has no whole lanes of 16 - the exact loop
   SHAPES: array[0..4, 0..2] of integer = (
     (1, 1024, 300), (7, 1024, 37), (3, 1000, 20), (64, 2048, 48), (2, 64, 16));
