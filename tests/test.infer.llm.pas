@@ -32,6 +32,7 @@ uses
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.chat,
   mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.sampler,
   test.infer.ref,
@@ -98,6 +99,8 @@ type
     procedure Qwen3Sampling;
     /// the native client from one GGUF file: model, tokenizer, a chat answer
     procedure Qwen3ChatClientGguf;
+    /// RegisterNativeFamily / NativeFamily: the classes of qwen3
+    procedure NativeFamilies;
   end;
 
 
@@ -1644,5 +1647,48 @@ begin
   Check(raised, 'the stream was cancelled');
   CheckEqual(client.Cache.Requests, n, 'a failed request is not given back');
 end;
+
+
+procedure TTestInferLlmNative.NativeFamilies;
+var
+  f: TNativeFamily;
+  p: TNativeOutputParser;
+  refused: boolean;
+begin
+  Check(NativeFamily(TQwen3Model, f), 'qwen3 registered');
+  Check(f.Model = TQwen3Model, 'model class');
+  Check(f.Tokenizer = TBpeTokenizer, 'tokenizer class');
+  Check(f.Template = TQwen3ChatTemplate, 'template class');
+  Check(f.Parser = TQwen3OutputParser, 'parser class');
+  // the classes create what the client uses
+  p := f.Parser.Create(fTokenizer);
+  try
+    Check(p is TQwen3OutputParser, 'a TQwen3OutputParser');
+    Check(p.Push(IM_END), 'its stop token');
+  finally
+    p.Free;
+  end;
+  // a class without a family, and registrations that change nothing
+  Check(not NativeFamily(TDecoderModel, f), 'TDecoderModel: none');
+  Check(f.Model = nil, 'cleared');
+  RegisterNativeFamily(TDecoderModel, nil, TQwen3ChatTemplate, TQwen3OutputParser);
+  RegisterNativeFamily(TDecoderModel, TBpeTokenizer, nil, TQwen3OutputParser);
+  RegisterNativeFamily(TDecoderModel, TBpeTokenizer, TQwen3ChatTemplate, nil);
+  Check(not NativeFamily(TDecoderModel, f), 'a class missing: not registered');
+  RegisterNativeFamily(nil, TBpeTokenizer, TQwen3ChatTemplate, TQwen3OutputParser);
+  Check(not NativeFamily(nil, f), 'no model class: not registered');
+  RegisterNativeFamily(TQwen3Model, TBpeTokenizer, TQwen3ChatTemplate, TNativeOutputParser);
+  Check(NativeFamily(TQwen3Model, f) and (f.Parser = TQwen3OutputParser),
+    'the first classes stay');
+  refused := false;
+  try
+    TQwen3OutputParser.Create(nil).Free;
+  except
+    on EInferError do
+      refused := true;
+  end;
+  Check(refused, 'a parser without a tokenizer');
+end;
+
 
 end.

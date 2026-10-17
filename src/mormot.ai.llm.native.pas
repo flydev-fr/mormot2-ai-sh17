@@ -1,13 +1,18 @@
 /// LandrixAI LLM Client - local ILlmClient on the native inference engine
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
-// - runs Qwen3 (src/infer, docs/native-inference.md phase 2) behind the same
-//   ILlmClient contract as the HTTP providers: the agent loop, the MCP tool
-//   bridge and RAG work unchanged against a model on this machine
-// - the prompt is the model's chat template (TQwen3ChatTemplate); the answer is
-//   parsed token by token: a leading <think> block becomes reasoning (returned
-//   like vLLM does, as reasoning_content in Raw, never in Content), every
-//   <tool_call> block a TLlmToolCall, the rest the content
+// - runs a decoder model (src/infer, docs/native-inference.md phase 2) behind
+//   the same ILlmClient contract as the HTTP providers: the agent loop, the MCP
+//   tool bridge and RAG work unchanged against a model on this machine
+// - a decoder family registers its model, tokenizer, chat template and output
+//   parser classes (RegisterNativeFamily); the client picks them by the
+//   model_type of config.json or the architecture of a GGUF file - Qwen3 is
+//   registered here
+// - the prompt is the model's chat template (TChatTemplate); the answer is
+//   parsed token by token (TNativeOutputParser) - for Qwen3 a leading <think>
+//   block becomes reasoning (returned like vLLM does, as reasoning_content in
+//   Raw, never in Content), every <tool_call> block a TLlmToolCall, the rest
+//   the content
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
 // - sampling (mormot.ai.infer.sampler): the defaults of the model's
@@ -21,9 +26,11 @@ unit mormot.ai.llm.native;
 {
   *****************************************************************************
 
-    - TQwen3OutputParser: generated token ids to content, reasoning, tool calls
+    - TNativeOutputParser: generated token ids to content, reasoning, tool calls
+    - TQwen3OutputParser: the parser of Qwen3
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
-    - TNativeLlmClient: ILlmClient over a Qwen3 model folder
+    - RegisterNativeFamily: the classes of a decoder family
+    - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
 
   *****************************************************************************
 }
@@ -46,10 +53,12 @@ uses
   mormot.ai.llm,
   mormot.ai.infer.tensor,
   mormot.ai.infer.unicode,
+  mormot.ai.infer.tokenizer,
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.chat,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.sampler;
 
@@ -82,6 +91,62 @@ type
     function Flush(aDropNewlines: boolean): RawUtf8;
   end;
 
+  /// turns the token ids a model generates into a TLlmChatResponse
+  // - Push one id after the other, then Finish; with aOnDelta assigned every
+  // piece is also given out as a TLlmStreamDelta as soon as it is known
+  // - a family overrides Token (and FlushOpen) for the grammar of its answers:
+  // which ids stop, open reasoning or a tool call; the response is assembled
+  // here - content, reasoning (as vLLM returns it: reasoning_content in Raw),
+  // tool calls, finish reason and usage
+  TNativeOutputParser = class
+  protected
+    fTokenizer: TInferTokenizer;
+    fOnDelta: TLlmStreamDeltaEvent;
+    fContent, fReasoning: TNativeTextChannel;
+    fCalls: TLlmToolCallDynArray;
+    fCount: integer;
+    fRoleSent, fFinished: boolean;
+    fResponse: TLlmChatResponse;
+    procedure Send(var aDelta: TLlmStreamDelta);
+    procedure SendContent(const aText: RawUtf8);
+    procedure SendReasoning(const aText: RawUtf8);
+    /// a tool call parsed from the answer: the content before it ends (its
+    // trailing newlines dropped), then the call gets an id and goes out
+    procedure AddToolCall(const aName, aArguments: RawUtf8);
+    /// the bytes of a token as RawUtf8 - copied, so no code page is involved
+    function Bytes(aId: integer): RawUtf8;
+    /// one generated id (inside the tokenizer, counted): true for a stop
+    // token, which adds no text
+    function Token(aId: integer): boolean; virtual; abstract;
+    /// the answer ends: give out what is still open (a cut reasoning or tool
+    // call) - nothing by default
+    procedure FlushOpen; virtual;
+  public
+    /// aTokenizer (not owned); a family looks up its control tokens here and
+    // raises EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer;
+      const aOnDelta: TLlmStreamDeltaEvent = nil); virtual;
+    /// one generated id; returns true for a stop token, which adds no text
+    // - raises ELlmClient for an id outside the tokenizer, or after Finish
+    function Push(aId: integer): boolean;
+    /// the answer is complete: aLength = true when it was cut by the token cap
+    // or the context, false when it stopped on a stop token
+    // - gives out the final delta (finish reason and usage), then the Done one
+    procedure Finish(aLength: boolean; aPromptTokens: integer);
+    /// the answer, after Finish
+    property Response: TLlmChatResponse
+      read fResponse;
+    /// the reasoning text (also in Response.Raw as reasoning_content)
+    property Reasoning: RawUtf8
+      read fReasoning.Text;
+    /// the ids pushed so far, stop token included
+    property Count: integer
+      read fCount;
+  end;
+
+  /// an output parser class, as a decoder family registers it
+  TNativeOutputParserClass = class of TNativeOutputParser;
+
   /// where the parser is inside the generated answer
   TQwen3ParserState = (
     qpsStart,
@@ -102,46 +167,20 @@ type
   // - newlines: dropped at the start of reasoning and content, at the end of
   // the reasoning and before a tool call (the template writes them itself);
   // kept at the end of a plain answer, which the template renders verbatim
-  TQwen3OutputParser = class
+  TQwen3OutputParser = class(TNativeOutputParser)
   protected
-    fTokenizer: TBpeTokenizer;
-    fOnDelta: TLlmStreamDeltaEvent;
     fStop, fEndOfText, fThink, fThinkEnd, fToolCall, fToolCallEnd: integer;
     fState: TQwen3ParserState;
-    fContent, fReasoning: TNativeTextChannel;
     fToolBody: RawUtf8;
-    fCalls: TLlmToolCallDynArray;
-    fCount: integer;
-    fRoleSent, fFinished: boolean;
-    fResponse: TLlmChatResponse;
-    procedure Send(var aDelta: TLlmStreamDelta);
-    procedure SendContent(const aText: RawUtf8);
-    procedure SendReasoning(const aText: RawUtf8);
     procedure EndToolCall;
-    /// the bytes of a token as RawUtf8 - copied, so no code page is involved
-    function Bytes(aId: integer): RawUtf8;
+    /// stop on <|im_end|> or <|endoftext|>
+    function Token(aId: integer): boolean; override;
+    procedure FlushOpen; override;
   public
     /// aTokenizer (not owned) must know <|im_end|>, <think>, </think>,
     // <tool_call> and </tool_call> - raises EInferError otherwise
-    constructor Create(aTokenizer: TBpeTokenizer;
-      const aOnDelta: TLlmStreamDeltaEvent = nil);
-    /// one generated id; returns true for a stop token (<|im_end|> or
-    // <|endoftext|>), which adds no text
-    // - raises ELlmClient for an id outside the tokenizer
-    function Push(aId: integer): boolean;
-    /// the answer is complete: aLength = true when it was cut by the token cap
-    // or the context, false when it stopped on a stop token
-    // - gives out the final delta (finish reason and usage), then the Done one
-    procedure Finish(aLength: boolean; aPromptTokens: integer);
-    /// the answer, after Finish
-    property Response: TLlmChatResponse
-      read fResponse;
-    /// the reasoning text (also in Response.Raw as reasoning_content)
-    property Reasoning: RawUtf8
-      read fReasoning.Text;
-    /// the ids pushed so far, stop token included
-    property Count: integer
-      read fCount;
+    constructor Create(aTokenizer: TInferTokenizer;
+      const aOnDelta: TLlmStreamDeltaEvent = nil); override;
   end;
 
 /// the enable_thinking switch of a request: Extra.chat_template_kwargs.
@@ -154,7 +193,7 @@ function NativeEnableThinking(const aRequest: TLlmChatRequest;
 // the assistant turn opened
 // - raises ELlmClient for what the engine cannot honour (no messages, images,
 // ResponseFormat) and for a tool the template refuses
-function NativeChatPrompt(aTemplate: TQwen3ChatTemplate;
+function NativeChatPrompt(aTemplate: TChatTemplate;
   const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
 
 /// parse the text between <tool_call> and </tool_call>
@@ -186,9 +225,9 @@ function NativeSampling(const aRequest: TLlmChatRequest;
 // holds the prompt and the drawn tokens afterwards (but the last one); after
 // an exception, free or Reset it
 // - returns how many prompt tokens came from aContext
-function NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling;
-  aContext: TQwen3Context = nil): PtrInt;
+function NativeDecode(aModel: TDecoderModel; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TNativeOutputParser; const aSampling: TInferSampling;
+  aContext: TDecoderContext = nil): PtrInt;
 
 const
   /// how many finished requests a TNativeLlmClient keeps the KV cache of
@@ -196,7 +235,9 @@ const
 
 type
   /// contexts of the prompt cache
-  TQwen3ContextDynArray = array of TQwen3Context;
+  TDecoderContextDynArray = array of TDecoderContext;
+  /// the former name of TDecoderContextDynArray
+  TQwen3ContextDynArray = TDecoderContextDynArray;
 
   /// the KV caches of finished requests, kept for the next request whose
   // prompt starts with the same tokens - an agent loop or a chat sends the
@@ -210,8 +251,8 @@ type
   TNativePromptCache = class
   protected
     fSafe: TLightLock;
-    fModel: TQwen3Model;
-    fIdle: TQwen3ContextDynArray; // the least recently used first
+    fModel: TDecoderModel;
+    fIdle: TDecoderContextDynArray; // the least recently used first
     fSlots: integer;
     fRequests, fHits, fReused: Int64;
     procedure SetSlots(aSlots: integer);
@@ -226,21 +267,21 @@ type
     /// a context for aPrompt, out of the cache: the idle one caching the most
     // of its first tokens; when none caches any, the least recently used one
     // if the cache is full, else a new one
-    function Acquire(const aPrompt: TIntegerDynArray): TQwen3Context;
+    function Acquire(const aPrompt: TIntegerDynArray): TDecoderContext;
     /// give back the context of a finished request, which took aReused prompt
     // tokens from it: kept as the most recently used, the least recently used
     // one freed beyond Slots
     // - the context of a failed request is freed instead, not given back
-    procedure Release(aContext: TQwen3Context; aReused: PtrInt);
+    procedure Release(aContext: TDecoderContext; aReused: PtrInt);
     /// forget every cached sequence
     procedure Clear;
     /// remove the idle contexts and return them, to be freed by the caller
     // (e.g. outside a lock of its own: freeing a large cache takes a while)
-    function Take: TQwen3ContextDynArray;
+    function Take: TDecoderContextDynArray;
     /// where Acquire makes a new context: Model.NewContext (on Model.Device
-    // when it has one), a TQwen3Context when nil (not owned)
+    // when it has one), a TDecoderContext when nil (not owned)
     // - set before the first Acquire, and Clear when Model.Device changes
-    property Model: TQwen3Model
+    property Model: TDecoderModel
       read fModel write fModel;
     /// how many idle contexts are kept
     property Slots: integer
@@ -256,7 +297,15 @@ type
       read GetReused;
   end;
 
-  /// a local ILlmClient: a Qwen3 model folder run by the native engine
+  /// the classes of a decoder family, as TNativeLlmClient creates them
+  TNativeFamily = record
+    Model: TDecoderModelClass;
+    Tokenizer: TInferTokenizerClass;
+    Template: TChatTemplateClass;
+    Parser: TNativeOutputParserClass;
+  end;
+
+  /// a local ILlmClient: a model folder or GGUF file run by the native engine
   // - thread-safe: the model is immutable, every request decodes in its own
   // context (KV cache) with its own parser
   // - prompt cache: the context of a finished request is kept (Cache), and a
@@ -266,10 +315,11 @@ type
   protected
     fBackend: TInferBackend;
     fOwnBackend: boolean;
-    fTokenizer: TBpeTokenizer;
-    fTemplate: TQwen3ChatTemplate;
-    fModel: TQwen3Model;
-    fDevice: TQwen3Device;
+    fFamily: TNativeFamily;
+    fTokenizer: TInferTokenizer;
+    fTemplate: TChatTemplate;
+    fModel: TDecoderModel;
+    fDevice: TDecoderDevice;
     fSafe: TLightLock; // fActive, and Device against Generate
     fActive: integer;  // requests running
     fCache: TNativePromptCache;
@@ -277,10 +327,12 @@ type
     fMaxTokens: integer;
     fEnableThinking: boolean;
     fSampling: TInferSampling;
-    procedure Generate(const aRequest: TLlmChatRequest; aParser: TQwen3OutputParser);
-    procedure SetDevice(aDevice: TQwen3Device);
+    procedure Generate(const aRequest: TLlmChatRequest; aParser: TNativeOutputParser);
+    procedure SetDevice(aDevice: TDecoderDevice);
+    procedure SetFamily(aModel: TDecoderModelClass; const aSource: TFileName);
   public
-    /// load tokenizer.json, config.json and model.safetensors of aFolder
+    /// load tokenizer.json, config.json and model.safetensors of aFolder, with
+    // the family its config.json names (model_type)
     // - aModelName: the name in Config and in every response, the folder name
     // when ''; aBackend: nil computes on a TInferCpuFastBackend of its own,
     // else on aBackend (not owned)
@@ -291,8 +343,9 @@ type
     // the reference itself instead of calling the tool)
     constructor Create(const aFolder: TFileName; const aModelName: RawUtf8 = '';
       aBackend: TInferBackend = nil; aWeights: TInferDType = idtF32); reintroduce;
-    /// one llama.cpp GGUF file of a Qwen3 model: weights, settings and the
-    // tokenizer from it (TQwen3Model.CreateFromGguf, TBpeTokenizer.CreateFromGguf)
+    /// one llama.cpp GGUF file: weights, settings and the tokenizer from it,
+    // with the family its general.architecture names
+    // (NewDecoderModelFromGguf, then the family's tokenizer CreateFromGguf)
     // - aModelName: the name in Config and in every response, the file name
     // without extension when ''; aBackend as for Create
     // - a GGUF file has no generation_config.json: Sampling is greedy until set
@@ -307,7 +360,8 @@ type
     // reasoning included)
     property MaxTokens: integer
       read fMaxTokens write fMaxTokens;
-    /// whether Qwen3 thinks before it answers when a request does not say
+    /// whether the model reasons before it answers when a request does not
+    // say (Qwen3: a <think> block)
     // (default true, the model's own default)
     property EnableThinking: boolean
       read fEnableThinking write fEnableThinking;
@@ -321,21 +375,37 @@ type
     property Cache: TNativePromptCache
       read fCache;
     /// the model
-    property Model: TQwen3Model
+    property Model: TDecoderModel
       read fModel;
+    /// the classes of the model's family
+    property Family: TNativeFamily
+      read fFamily;
     /// where the model computes: nil (the default) on the backend of Create,
-    // else a TQwen3Device of Model - e.g. TQwen3Vulkan.Create(Model, gpu)
+    // else a TDecoderDevice of Model - e.g. TQwen3Vulkan.Create(Model, gpu)
     // decodes on a GPU - owned: freed with the client or when replaced
     // - raises ELlmClient while a request runs or for a device of another
     // model (aDevice is then not taken over); the prompt cache is cleared
     // - a context taken with Cache.Acquire outside of a request must be given
     // back before: the old device is freed here
-    property Device: TQwen3Device
+    property Device: TDecoderDevice
       read fDevice write SetDevice;
     /// the chat template, and through it the tokenizer
-    property Template: TQwen3ChatTemplate
+    property Template: TChatTemplate
       read fTemplate;
   end;
+
+
+/// make a decoder family known to TNativeLlmClient: the tokenizer, chat
+// template and output parser classes of its model class
+// - call it from an initialization section: the list is not locked; a model
+// class registered twice is listed twice, NativeFamily finds the first entry
+procedure RegisterNativeFamily(aModel: TDecoderModelClass;
+  aTokenizer: TInferTokenizerClass; aTemplate: TChatTemplateClass;
+  aParser: TNativeOutputParserClass);
+
+/// the registered classes of a model class - false when it has none
+function NativeFamily(aModel: TDecoderModelClass;
+  out aFamily: TNativeFamily): boolean;
 
 
 implementation
@@ -445,7 +515,7 @@ begin
 end;
 
 
-{ TQwen3OutputParser }
+{ TNativeOutputParser }
 
 function FinishReasonText(aReason: TLlmFinishReason): RawUtf8;
 begin
@@ -463,28 +533,21 @@ begin
   end;
 end;
 
-function NeedToken(aTokenizer: TBpeTokenizer; const aContent: RawUtf8): integer;
-begin
-  result := aTokenizer.TokenId(aContent);
-  if result < 0 then
-    EInferError.RaiseUtf8('TQwen3OutputParser: no % token', [aContent]);
-end;
-
-constructor TQwen3OutputParser.Create(aTokenizer: TBpeTokenizer;
+constructor TNativeOutputParser.Create(aTokenizer: TInferTokenizer;
   const aOnDelta: TLlmStreamDeltaEvent);
 begin
   inherited Create;
+  if aTokenizer = nil then
+    EInferError.RaiseUtf8('%.Create: no tokenizer', [self]);
   fTokenizer := aTokenizer;
   fOnDelta := aOnDelta;
-  fStop := NeedToken(aTokenizer, '<|im_end|>');
-  fEndOfText := aTokenizer.TokenId('<|endoftext|>'); // -1 when absent
-  fThink := NeedToken(aTokenizer, '<think>');
-  fThinkEnd := NeedToken(aTokenizer, '</think>');
-  fToolCall := NeedToken(aTokenizer, '<tool_call>');
-  fToolCallEnd := NeedToken(aTokenizer, '</tool_call>');
 end;
 
-function TQwen3OutputParser.Bytes(aId: integer): RawUtf8;
+procedure TNativeOutputParser.FlushOpen;
+begin
+end;
+
+function TNativeOutputParser.Bytes(aId: integer): RawUtf8;
 var
   b: RawByteString;
 begin
@@ -492,7 +555,7 @@ begin
   FastSetString(result, pointer(b), length(b));
 end;
 
-procedure TQwen3OutputParser.Send(var aDelta: TLlmStreamDelta);
+procedure TNativeOutputParser.Send(var aDelta: TLlmStreamDelta);
 begin
   if not Assigned(fOnDelta) then
     exit;
@@ -504,7 +567,7 @@ begin
   fOnDelta(aDelta);
 end;
 
-procedure TQwen3OutputParser.SendContent(const aText: RawUtf8);
+procedure TNativeOutputParser.SendContent(const aText: RawUtf8);
 var
   d: TLlmStreamDelta;
 begin
@@ -516,7 +579,7 @@ begin
   Send(d);
 end;
 
-procedure TQwen3OutputParser.SendReasoning(const aText: RawUtf8);
+procedure TNativeOutputParser.SendReasoning(const aText: RawUtf8);
 var
   d: TLlmStreamDelta;
 begin
@@ -530,20 +593,16 @@ begin
   Send(d);
 end;
 
-procedure TQwen3OutputParser.EndToolCall;
+procedure TNativeOutputParser.AddToolCall(const aName, aArguments: RawUtf8);
 var
   call: TLlmToolCall;
   d: TLlmStreamDelta;
   n: PtrInt;
 begin
-  if not ParseQwen3ToolCall(fToolBody, call.Name, call.ArgumentsJson) then
-  begin
-    // not a call the agent could run: keep it visible as text
-    SendContent(fContent.Add(Bytes(fToolCall) + fToolBody + Bytes(fToolCallEnd)));
-    exit;
-  end;
-  // a call: the newlines before it are the template's, which writes its own
+  // the newlines before a call are the template's, which writes its own
   SendContent(fContent.Flush(true));
+  call.Name := aName;
+  call.ArgumentsJson := aArguments;
   call.Id := 'call_' + CardinalToHexLower(Random32) + CardinalToHexLower(Random32);
   n := length(fCalls);
   SetLength(fCalls, n + 1);
@@ -560,7 +619,7 @@ begin
   Send(d);
 end;
 
-function TQwen3OutputParser.Push(aId: integer): boolean;
+function TNativeOutputParser.Push(aId: integer): boolean;
 begin
   if fFinished then
     ELlmClient.RaiseUtf8('%.Push after Finish', [self]);
@@ -568,6 +627,86 @@ begin
     ELlmClient.RaiseUtf8('%.Push: the model generated id %, outside the ' +
       'tokenizer (0..%)', [self, aId, fTokenizer.VocabSize - 1]);
   inc(fCount);
+  result := Token(aId);
+end;
+
+procedure TNativeOutputParser.Finish(aLength: boolean; aPromptTokens: integer);
+var
+  d: TLlmStreamDelta;
+begin
+  if fFinished then
+    ELlmClient.RaiseUtf8('%.Finish called twice', [self]);
+  fFinished := true;
+  FlushOpen;
+  // after tool calls, trailing newlines only separated them
+  SendContent(fContent.Flush(fCalls <> nil));
+  Finalize(fResponse);
+  FillCharFast(fResponse, SizeOf(fResponse), 0);
+  fResponse.Content := fContent.Text;
+  fResponse.ToolCalls := fCalls;
+  if aLength then
+    fResponse.FinishReason := lfrLength
+  else if fCalls <> nil then
+    fResponse.FinishReason := lfrToolCalls
+  else
+    fResponse.FinishReason := lfrStop;
+  fResponse.Usage.PromptTokens := aPromptTokens;
+  fResponse.Usage.CompletionTokens := fCount;
+  fResponse.Usage.TotalTokens := aPromptTokens + fCount;
+  if fReasoning.Text <> '' then
+    // the message shape of vLLM's reasoning parser
+    fResponse.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,
+      'message', _ObjFast(['role', 'assistant',
+        'reasoning_content', fReasoning.Text])])])]);
+  if not Assigned(fOnDelta) then
+    exit;
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.FinishReason := FinishReasonText(fResponse.FinishReason);
+  d.HasUsage := true;
+  d.Usage := fResponse.Usage;
+  Send(d);
+  Finalize(d);
+  FillCharFast(d, SizeOf(d), 0);
+  d.Done := true;
+  Send(d);
+end;
+
+
+{ TQwen3OutputParser }
+
+function NeedToken(aTokenizer: TInferTokenizer; const aContent: RawUtf8): integer;
+begin
+  result := aTokenizer.TokenId(aContent);
+  if result < 0 then
+    EInferError.RaiseUtf8('TQwen3OutputParser: no % token', [aContent]);
+end;
+
+constructor TQwen3OutputParser.Create(aTokenizer: TInferTokenizer;
+  const aOnDelta: TLlmStreamDeltaEvent);
+begin
+  inherited Create(aTokenizer, aOnDelta);
+  fStop := NeedToken(aTokenizer, '<|im_end|>');
+  fEndOfText := aTokenizer.TokenId('<|endoftext|>'); // -1 when absent
+  fThink := NeedToken(aTokenizer, '<think>');
+  fThinkEnd := NeedToken(aTokenizer, '</think>');
+  fToolCall := NeedToken(aTokenizer, '<tool_call>');
+  fToolCallEnd := NeedToken(aTokenizer, '</tool_call>');
+end;
+
+procedure TQwen3OutputParser.EndToolCall;
+var
+  name, args: RawUtf8;
+begin
+  if ParseQwen3ToolCall(fToolBody, name, args) then
+    AddToolCall(name, args)
+  else
+    // not a call the agent could run: keep it visible as text
+    SendContent(fContent.Add(Bytes(fToolCall) + fToolBody + Bytes(fToolCallEnd)));
+end;
+
+function TQwen3OutputParser.Token(aId: integer): boolean;
+begin
   result := (aId = fStop) or ((fEndOfText >= 0) and (aId = fEndOfText));
   if result then
     exit;
@@ -607,13 +746,8 @@ begin
   end;
 end;
 
-procedure TQwen3OutputParser.Finish(aLength: boolean; aPromptTokens: integer);
-var
-  d: TLlmStreamDelta;
+procedure TQwen3OutputParser.FlushOpen;
 begin
-  if fFinished then
-    ELlmClient.RaiseUtf8('%.Finish called twice', [self]);
-  fFinished := true;
   case fState of
     qpsReasoning:
       SendReasoning(fReasoning.Flush(true));
@@ -621,38 +755,6 @@ begin
       // cut before </tool_call>: no call, the text stays
       SendContent(fContent.Add(Bytes(fToolCall) + fToolBody));
   end;
-  // after tool calls, trailing newlines only separated them
-  SendContent(fContent.Flush(fCalls <> nil));
-  Finalize(fResponse);
-  FillCharFast(fResponse, SizeOf(fResponse), 0);
-  fResponse.Content := fContent.Text;
-  fResponse.ToolCalls := fCalls;
-  if aLength then
-    fResponse.FinishReason := lfrLength
-  else if fCalls <> nil then
-    fResponse.FinishReason := lfrToolCalls
-  else
-    fResponse.FinishReason := lfrStop;
-  fResponse.Usage.PromptTokens := aPromptTokens;
-  fResponse.Usage.CompletionTokens := fCount;
-  fResponse.Usage.TotalTokens := aPromptTokens + fCount;
-  if fReasoning.Text <> '' then
-    // the message shape of vLLM's reasoning parser
-    fResponse.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,
-      'message', _ObjFast(['role', 'assistant',
-        'reasoning_content', fReasoning.Text])])])]);
-  if not Assigned(fOnDelta) then
-    exit;
-  Finalize(d);
-  FillCharFast(d, SizeOf(d), 0);
-  d.FinishReason := FinishReasonText(fResponse.FinishReason);
-  d.HasUsage := true;
-  d.Usage := fResponse.Usage;
-  Send(d);
-  Finalize(d);
-  FillCharFast(d, SizeOf(d), 0);
-  d.Done := true;
-  Send(d);
 end;
 
 
@@ -675,7 +777,7 @@ begin
   result := kw^.Values[i];
 end;
 
-function NativeChatPrompt(aTemplate: TQwen3ChatTemplate;
+function NativeChatPrompt(aTemplate: TChatTemplate;
   const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
 var
   i: PtrInt;
@@ -839,12 +941,12 @@ end;
 
 { NativeDecode }
 
-function NativeDecode(aModel: TQwen3Model; const aPrompt: TIntegerDynArray;
-  aMaxNew: PtrInt; aParser: TQwen3OutputParser; const aSampling: TInferSampling;
-  aContext: TQwen3Context): PtrInt;
+function NativeDecode(aModel: TDecoderModel; const aPrompt: TIntegerDynArray;
+  aMaxNew: PtrInt; aParser: TNativeOutputParser; const aSampling: TInferSampling;
+  aContext: TDecoderContext): PtrInt;
 var
   logits: TSingleDynArray;
-  ctx: TQwen3Context;
+  ctx: TDecoderContext;
   sampler: TInferSampler;
   n: PtrInt;
   id: integer;
@@ -905,7 +1007,7 @@ end;
 procedure TNativePromptCache.SetSlots(aSlots: integer);
 var
   i, n: PtrInt;
-  drop: TQwen3ContextDynArray;
+  drop: TDecoderContextDynArray;
 begin
   if aSlots < 0 then
     ELlmClient.RaiseUtf8('%.Slots = %', [self, aSlots]);
@@ -934,14 +1036,14 @@ end;
 procedure TNativePromptCache.Clear;
 var
   i: PtrInt;
-  drop: TQwen3ContextDynArray;
+  drop: TDecoderContextDynArray;
 begin
   drop := Take;
   for i := 0 to high(drop) do
     drop[i].Free;
 end;
 
-function TNativePromptCache.Take: TQwen3ContextDynArray;
+function TNativePromptCache.Take: TDecoderContextDynArray;
 begin
   fSafe.Lock;
   try
@@ -952,7 +1054,7 @@ begin
   end;
 end;
 
-function TNativePromptCache.Acquire(const aPrompt: TIntegerDynArray): TQwen3Context;
+function TNativePromptCache.Acquire(const aPrompt: TIntegerDynArray): TDecoderContext;
 var
   i, best, common, longest: PtrInt;
 begin
@@ -987,12 +1089,12 @@ begin
     if fModel <> nil then
       result := fModel.NewContext
     else
-      result := TQwen3Context.Create;
+      result := TDecoderContext.Create;
 end;
 
-procedure TNativePromptCache.Release(aContext: TQwen3Context; aReused: PtrInt);
+procedure TNativePromptCache.Release(aContext: TDecoderContext; aReused: PtrInt);
 var
-  drop: TQwen3Context;
+  drop: TDecoderContext;
   i: PtrInt;
 begin
   if aContext = nil then
@@ -1071,14 +1173,16 @@ begin
     fBackend := TInferCpuFastBackend.Create;
     fOwnBackend := true;
   end;
-  fTokenizer := TBpeTokenizer.Create(dir + 'tokenizer.json');
-  fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
-  fModel := TQwen3Model.Create(dir, fBackend, aWeights);
+  // the family of config.json: its tokenizer and template before the weights
+  SetFamily(DecoderModelClassOfFolder(dir), dir + 'config.json');
+  fTokenizer := fFamily.Tokenizer.Create(dir + 'tokenizer.json');
+  fTemplate := fFamily.Template.Create(fTokenizer);
+  fModel := fFamily.Model.Create(dir, fBackend, aWeights);
   fSampling := InferSamplingFromConfig(dir + 'generation_config.json');
   fCache := TNativePromptCache.Create;
   fCache.Model := fModel;
   // the stop and control tokens: fail at load, not at the first request
-  TQwen3OutputParser.Create(fTokenizer).Free;
+  fFamily.Parser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
   if fConfig.DefaultModel = '' then
     fConfig.DefaultModel := StringToUtf8(ExtractFileName(ExcludeTrailingPathDelimiter(aFolder)));
@@ -1096,20 +1200,29 @@ begin
     fBackend := TInferCpuFastBackend.Create;
     fOwnBackend := true;
   end;
-  fModel := TQwen3Model.CreateFromGguf(aFileName, fBackend);
-  fTokenizer := TBpeTokenizer.CreateFromGguf(fModel.Gguf);
+  fModel := NewDecoderModelFromGguf(aFileName, fBackend);
+  SetFamily(TDecoderModelClass(fModel.ClassType), aFileName);
+  fTokenizer := fFamily.Tokenizer.CreateFromGguf(fModel.Gguf);
   if fTokenizer.VocabSize > fModel.Config.VocabSize then
     ELlmClient.RaiseUtf8('%: % tokens but % embedding rows in %',
       [self, fTokenizer.VocabSize, fModel.Config.VocabSize, aFileName]);
-  fTemplate := TQwen3ChatTemplate.Create(fTokenizer);
+  fTemplate := fFamily.Template.Create(fTokenizer);
   fSampling := InferSamplingGreedy;
   fCache := TNativePromptCache.Create;
   fCache.Model := fModel;
   // the stop and control tokens: fail at load, not at the first request
-  TQwen3OutputParser.Create(fTokenizer).Free;
+  fFamily.Parser.Create(fTokenizer).Free;
   fConfig.DefaultModel := aModelName;
   if fConfig.DefaultModel = '' then
     fConfig.DefaultModel := StringToUtf8(ChangeFileExt(ExtractFileName(aFileName), ''));
+end;
+
+procedure TNativeLlmClient.SetFamily(aModel: TDecoderModelClass;
+  const aSource: TFileName);
+begin
+  if not NativeFamily(aModel, fFamily) then
+    ELlmClient.RaiseUtf8('%: no chat family registered for % (%)',
+      [self, aModel.ModelType, aSource]);
 end;
 
 destructor TNativeLlmClient.Destroy;
@@ -1127,12 +1240,12 @@ begin
 end;
 
 procedure TNativeLlmClient.Generate(const aRequest: TLlmChatRequest;
-  aParser: TQwen3OutputParser);
+  aParser: TNativeOutputParser);
 var
   maxNew, reused: PtrInt;
   prompt: TIntegerDynArray;
   sampling: TInferSampling;
-  ctx: TQwen3Context;
+  ctx: TDecoderContext;
 begin
   maxNew := aRequest.MaxTokens;
   if maxNew <= 0 then
@@ -1162,9 +1275,9 @@ end;
 function TNativeLlmClient.ChatComplete(
   const aRequest: TLlmChatRequest): TLlmChatResponse;
 var
-  parser: TQwen3OutputParser;
+  parser: TNativeOutputParser;
 begin
-  parser := TQwen3OutputParser.Create(fTokenizer);
+  parser := fFamily.Parser.Create(fTokenizer);
   try
     Generate(aRequest, parser);
     result := parser.Response;
@@ -1177,9 +1290,9 @@ end;
 procedure TNativeLlmClient.ChatStream(const aRequest: TLlmChatRequest;
   const aOnDelta: TLlmStreamDeltaEvent);
 var
-  parser: TQwen3OutputParser;
+  parser: TNativeOutputParser;
 begin
-  parser := TQwen3OutputParser.Create(fTokenizer, aOnDelta);
+  parser := fFamily.Parser.Create(fTokenizer, aOnDelta);
   try
     Generate(aRequest, parser);
   finally
@@ -1187,10 +1300,10 @@ begin
   end;
 end;
 
-procedure TNativeLlmClient.SetDevice(aDevice: TQwen3Device);
+procedure TNativeLlmClient.SetDevice(aDevice: TDecoderDevice);
 var
-  old: TQwen3Device;
-  drop: TQwen3ContextDynArray;
+  old: TDecoderDevice;
+  drop: TDecoderContextDynArray;
   i: PtrInt;
 begin
   if (aDevice <> nil) and (aDevice.Model <> fModel) then
@@ -1227,5 +1340,48 @@ function TNativeLlmClient.Config: TLlmProviderConfig;
 begin
   result := fConfig;
 end;
+
+{ families }
+
+var
+  NativeFamilies: array of TNativeFamily;
+
+procedure RegisterNativeFamily(aModel: TDecoderModelClass;
+  aTokenizer: TInferTokenizerClass; aTemplate: TChatTemplateClass;
+  aParser: TNativeOutputParserClass);
+var
+  n: PtrInt;
+begin
+  if (aModel = nil) or (aTokenizer = nil) or (aTemplate = nil) or
+     (aParser = nil) then
+    exit;
+  n := length(NativeFamilies);
+  SetLength(NativeFamilies, n + 1);
+  NativeFamilies[n].Model := aModel;
+  NativeFamilies[n].Tokenizer := aTokenizer;
+  NativeFamilies[n].Template := aTemplate;
+  NativeFamilies[n].Parser := aParser;
+end;
+
+function NativeFamily(aModel: TDecoderModelClass;
+  out aFamily: TNativeFamily): boolean;
+var
+  i: PtrInt;
+begin
+  for i := 0 to high(NativeFamilies) do
+    if NativeFamilies[i].Model = aModel then
+    begin
+      aFamily := NativeFamilies[i];
+      result := true;
+      exit;
+    end;
+  FillCharFast(aFamily, SizeOf(aFamily), 0);
+  result := false;
+end;
+
+
+initialization
+  RegisterNativeFamily(TQwen3Model, TBpeTokenizer, TQwen3ChatTemplate,
+    TQwen3OutputParser);
 
 end.

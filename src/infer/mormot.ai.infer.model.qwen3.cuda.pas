@@ -37,6 +37,7 @@ uses
   mormot.ai.infer.backend,
   mormot.ai.infer.cuda,
   mormot.ai.infer.backend.cuda,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3;
 
 type
@@ -100,7 +101,7 @@ type
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no kernel (F32, Q8_0, Q4_K, Q6_K do)
     // - aModel and aBackend are not owned and must outlive this instance
-    constructor Create(aModel: TQwen3Model; aBackend: TInferCudaBackend);
+    constructor Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
     destructor Destroy; override;
     /// a context for this model on this device (owned by the caller)
     function NewContext: TQwen3CuContext;
@@ -214,11 +215,14 @@ end;
 
 { TQwen3Cuda }
 
-constructor TQwen3Cuda.Create(aModel: TQwen3Model; aBackend: TInferCudaBackend);
+constructor TQwen3Cuda.Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
+  // the layers it runs: attention and a dense SwiGLU block (Qwen3)
+  if not aModel.HasOnly(dmAttention, dfDense) then
+    EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then

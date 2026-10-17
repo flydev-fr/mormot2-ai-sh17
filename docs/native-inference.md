@@ -1524,10 +1524,53 @@ Karte, C5 Tempo.
     Gegenprobe (kein Update, kein Start, Abbruch ohne Ende der Aufzeichnung, Kopie auf dem
     Legacy-Stream, blockierender Stream) scheitert in allen fünf Fällen.
 
+### Phase D — weitere Decoder-Familien
+
+Plan, Kandidaten und Reihenfolge: [backlog.md](backlog.md), Abschnitt B4 (MoE, Sliding
+Window, gpt-oss-20b, Gemma 4, Gated DeltaNet, Kolibri).
+
+**D1 erledigt (2026-10-17): gemeinsame Decoder-Typen.** Reiner Umbau, die Rechnung ist
+unverändert (alle Qwen3-Tests ohne Änderung grün, Decode-Tempo gleich).
+
+- `mormot.ai.infer.decoder`: `TDecoderModel` (Gewichte laden und prüfen, Forward, Reuse,
+  Greedy, Übergabe an ein Gerät), `TDecoderContext` (KV-Cache einer Sequenz),
+  `TDecoderDevice` (GPU), `TDecoderConfig`. Neu in der Konfiguration ist `Spec`, die Art
+  jedes Layers: `Mixer` (heute nur `dmAttention`) und `Ffn` (heute nur `dfDense`). Forward
+  verzweigt je Layer darauf (`AttentionBlock`, `DenseBlock`); eine Familie, die `Spec` leer
+  lässt, bekommt überall Attention und SwiGLU.
+- `mormot.ai.infer.model.qwen3` ist nur noch die Familie: Einstellungen aus `config.json`
+  oder den GGUF-Metadaten, Tensornamen, Gewichte. Die alten Namen (`TQwen3Context`,
+  `TQwen3Config`, `TQwen3Device` ...) bleiben als Aliase.
+- `mormot.ai.infer.tokenizer`: `TInferTokenizer`, die Schnittstelle, die Template und
+  Parser brauchen (`TBpeTokenizer` erbt davon). `mormot.ai.infer.chat`: `TChatTemplate`
+  (eine Familie überschreibt `Build`). `mormot.ai.llm.native`: `TNativeOutputParser` setzt
+  die Antwort zusammen (Inhalt, Reasoning, Tool-Aufrufe, Usage); eine Familie überschreibt
+  `Token` (welche Ids stoppen, Reasoning oder einen Tool-Aufruf öffnen) und `FlushOpen`.
+- Zwei Registrierungen: `RegisterDecoderModel` (Modellklasse nach `model_type` bzw.
+  `general.architecture`; `NewDecoderModel`, `NewDecoderModelFromGguf`) und
+  `RegisterNativeFamily` (Tokenizer, Template und Parser zur Modellklasse).
+  `TNativeLlmClient` wählt darüber: `TNativeLlmClient.Create(Ordner)` liest `model_type`,
+  `CreateFromGguf` die Architektur.
+- Geräte (`TQwen3Vulkan`, `TQwen3Cuda`) nehmen ein `TDecoderModel` und lehnen Modelle ab,
+  deren Layer nicht alle Attention mit dichtem Block sind (`HasOnly`).
+
+*Eine Familie andocken:* eine Unit mit `TXxxModel = class(TDecoderModel)`, die `ModelType`,
+`Architecture`, `LoadConfig`, `LoadGgufConfig` (beide enden mit `CheckConfig`),
+`GgufName` und `LoadWeights` überschreibt und sich in `initialization` mit
+`RegisterDecoderModel` anmeldet; braucht sie andere Layer, ergänzt sie `TDecoderMixer` bzw.
+`TDecoderFfn`, füllt `Spec` und bekommt in `Forward` einen eigenen Zweig. Für den Client
+dazu Tokenizer, Template und Parser (oder die vorhandenen) mit `RegisterNativeFamily`.
+
+*Tests:* `DecoderFamilies` (Registrierung, `NewDecoderModel` aus Ordner und GGUF, `Spec`,
+fremde `model_type`/Architektur abgelehnt) und `NativeFamilies` (Klassen von Qwen3,
+unvollständige Registrierungen ignoriert, Parser ohne Tokenizer abgelehnt). Grün unter
+FPC 3.2.4 und 3.2.2 (WSL, 2600 Assertions), auf dem RTX-Rechner mit echtem Modell unter
+FPC 3.2.2, Delphi 13 und Delphi 7. Gegenprobe: elf eingebaute Fehler (Layer-Liste nicht gefüllt, `HasOnly` immer falsch, Registry findet keine Klasse nach `model_type` bzw. Architektur, fremder `model_type` bzw. fremde Architektur angenommen, Parser schließt offene Blöcke nicht, Zeilenumbrüche vor einem Tool-Aufruf bleiben, Parser ohne Tokenizer, Familiensuche ignoriert die Klasse, Familie ohne Template registriert) - alle scheitern.
+
 ### Danach — nach Bedarf
 
-Weitere Architekturen (Llama 3, Mistral, Gemma), Reranker (BGE-Reranker),
-Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding, MoE.
+Reranker (BGE-Reranker), Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding; weitere
+Decoder siehe Phase D.
 
 Eine eigene Spur daneben ist die Verteilung großer Jobs auf ungenutzte Rechner:
 [distributed-execution.md](distributed-execution.md). Ihr Executor ist diese Engine.

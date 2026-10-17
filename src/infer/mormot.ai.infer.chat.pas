@@ -1,7 +1,9 @@
 /// native inference engine - chat templates of the supported decoder models
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
-// - the Jinja template of a model is not run: TQwen3ChatTemplate writes the
+// - TChatTemplate is what the client of every decoder family calls; a family
+//   brings its own descendant (Build) - the Jinja template of a model is not
+//   run: TQwen3ChatTemplate writes the
 //   same text in Pascal (tokenizer_config.json of Qwen/Qwen3-0.6B revision
 //   c1899de289a04d12100db370d81485cdf75e47ca), gate tests/data/infer-ref/qwen3-chat
 // - one difference by design: the template emits the control tokens
@@ -18,7 +20,8 @@ unit mormot.ai.infer.chat;
   *****************************************************************************
 
     - PythonJson: JSON re-serialized the way Python json.dumps writes it
-    - TQwen3ChatTemplate: messages and tools to token ids (and text)
+    - TChatTemplate: messages and tools to token ids (and text), per family
+    - TQwen3ChatTemplate: the template of Qwen3
 
   *****************************************************************************
 }
@@ -35,14 +38,14 @@ uses
   mormot.ai.llm.types,
   mormot.ai.infer.tensor,
   mormot.ai.infer.unicode,
-  mormot.ai.infer.tokenizer.bpe;
+  mormot.ai.infer.tokenizer;
 
 type
   /// the output of one template run: text is buffered and encoded in one
   // piece up to the next control token, exactly as the tokenizer would cut
   // the rendered text
   TChatSegments = object
-    Tokenizer: TBpeTokenizer;
+    Tokenizer: TInferTokenizer;
     WithIds: boolean;
     Ids: TIntegerDynArray;
     Count: PtrInt;
@@ -52,24 +55,27 @@ type
     procedure Flush;
   end;
 
-  /// the chat template of Qwen3 (and Qwen2.5 tool calling): ChatML with
-  // <think> blocks and <tools> in the system turn
+  /// the chat template of a decoder family: a conversation as token ids
+  // - a family overrides Build (and Create, for its control tokens)
   // - thread-safe: every call works on its own TChatSegments
-  TQwen3ChatTemplate = class
+  TChatTemplate = class
   protected
-    fTokenizer: TBpeTokenizer;
-    fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
-    fToolResponse, fToolResponseEnd: integer;
+    fTokenizer: TInferTokenizer;
+    /// write the conversation into aOut: text with Add, control tokens with
+    // Control
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
+      virtual; abstract;
+    /// the id of a control token - raises EInferError when the tokenizer has
+    // none
     function Need(const aContent: RawUtf8): integer;
   public
-    /// look up the control tokens in aTokenizer (not owned) - raises
-    // EInferError when one is missing
-    constructor Create(aTokenizer: TBpeTokenizer);
+    /// keep aTokenizer (not owned) - raises EInferError when nil
+    constructor Create(aTokenizer: TInferTokenizer); virtual;
     /// the token ids of a conversation
     // - aAddGenerationPrompt opens the assistant turn; aEnableThinking = false
-    // adds the empty <think> block that makes Qwen3 answer directly
+    // asks the model to answer without reasoning first (Qwen3: an empty
+    // <think> block)
     // - raises EInferError for a tool whose JSON is invalid or not supported
     function Encode(const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
@@ -80,8 +86,26 @@ type
       const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
       aEnableThinking: boolean = true): RawUtf8;
     /// the tokenizer the ids belong to
-    property Tokenizer: TBpeTokenizer
+    property Tokenizer: TInferTokenizer
       read fTokenizer;
+  end;
+
+  /// a chat template class, as a decoder family registers it
+  TChatTemplateClass = class of TChatTemplate;
+
+  /// the chat template of Qwen3 (and Qwen2.5 tool calling): ChatML with
+  // <think> blocks and <tools> in the system turn
+  TQwen3ChatTemplate = class(TChatTemplate)
+  protected
+    fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
+    fToolResponse, fToolResponseEnd: integer;
+    procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
+      override;
+  public
+    /// look up the control tokens in aTokenizer (not owned) - raises
+    // EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
   end;
 
 /// re-serialize JSON the way Python json.dumps(json.loads(aJson)) writes it
@@ -555,14 +579,29 @@ begin
 end;
 
 
-{ TQwen3ChatTemplate }
+{ TChatTemplate }
 
-constructor TQwen3ChatTemplate.Create(aTokenizer: TBpeTokenizer);
+constructor TChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create;
   if aTokenizer = nil then
     EInferError.RaiseUtf8('%.Create: no tokenizer', [self]);
   fTokenizer := aTokenizer;
+end;
+
+function TChatTemplate.Need(const aContent: RawUtf8): integer;
+begin
+  result := fTokenizer.TokenId(aContent);
+  if result < 0 then
+    EInferError.RaiseUtf8('%: tokenizer has no % token', [self, aContent]);
+end;
+
+
+{ TQwen3ChatTemplate }
+
+constructor TQwen3ChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
   fImStart := Need('<|im_start|>');
   fImEnd := Need('<|im_end|>');
   fThink := Need('<think>');
@@ -573,12 +612,6 @@ begin
   fToolResponseEnd := Need('</tool_response>');
 end;
 
-function TQwen3ChatTemplate.Need(const aContent: RawUtf8): integer;
-begin
-  result := fTokenizer.TokenId(aContent);
-  if result < 0 then
-    EInferError.RaiseUtf8('%: tokenizer has no % token', [self, aContent]);
-end;
 
 { TChatSegments }
 
@@ -812,7 +845,7 @@ begin
   aOut.Flush;
 end;
 
-function TQwen3ChatTemplate.Encode(const aMessages: TLlmMessageDynArray;
+function TChatTemplate.Encode(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
   aEnableThinking: boolean): TIntegerDynArray;
 var
@@ -832,7 +865,7 @@ begin
   end;
 end;
 
-function TQwen3ChatTemplate.Render(const aMessages: TLlmMessageDynArray;
+function TChatTemplate.Render(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
   aEnableThinking: boolean): RawUtf8;
 var

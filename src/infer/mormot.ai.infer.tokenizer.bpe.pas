@@ -42,6 +42,7 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.gguf,
+  mormot.ai.infer.tokenizer,
   mormot.ai.infer.unicode;
 
 type
@@ -63,7 +64,7 @@ type
   end;
 
   /// a byte-level BPE tokenizer with the Qwen2 pre-tokenizer
-  TBpeTokenizer = class
+  TBpeTokenizer = class(TInferTokenizer)
   protected
     fTokens: TRawByteStringDynArray; // id -> bytes ('' = no token)
     fVocabCount: integer;            // ids below are BPE tokens, above added ones
@@ -90,32 +91,32 @@ type
     // NFC, Split(Qwen2 regex, Isolated) + ByteLevel(no prefix space, no regex),
     // BPE (no dropout, no unk, no prefix/suffix, no byte fallback), ByteLevel
     // decoder - raises EInferError otherwise
-    constructor Create(const aFileName: TFileName);
+    constructor Create(const aFileName: TFileName); override;
     /// the same tokenizer from the tokenizer.ggml.* metadata of a GGUF file:
     // model gpt2, pre-tokenizer qwen2; normal tokens are the BPE vocabulary,
     // control and user-defined ones the added tokens, unused ones no token
     // - GGUF stores no normalizer: NFC is applied, as Qwen's tokenizer.json has
     // it (llama.cpp itself does not normalize)
-    constructor CreateFromGguf(aGguf: TGgufFile);
+    constructor CreateFromGguf(aGguf: TGgufFile); override;
     /// the NFC-normalized text (invalid UTF-8 replaced first)
     function Normalize(const aText: RawUtf8): RawUtf8;
     /// the pre-tokenized pieces of the normalized text, as UTF-8
     function Split(const aText: RawUtf8): TRawUtf8DynArray;
     /// token ids of aText - every text is text, no control token is matched
-    function Encode(const aText: RawUtf8): TIntegerDynArray;
+    function Encode(const aText: RawUtf8): TIntegerDynArray; override;
     /// append the token ids of aText to aIds[0..aCount-1]
     procedure EncodeAppend(const aText: RawUtf8; var aIds: TIntegerDynArray;
-      var aCount: PtrInt);
+      var aCount: PtrInt); override;
     /// the id of an added token by its content (e.g. '<|im_end|>'), -1 if none
-    function TokenId(const aContent: RawUtf8): integer;
+    function TokenId(const aContent: RawUtf8): integer; override;
     /// the bytes of one token: '' for an id inside the vocabulary that has no
     // token; a BPE token may be part of a UTF-8 sequence only
-    function TokenBytes(aId: integer): RawByteString;
+    function TokenBytes(aId: integer): RawByteString; override;
     /// the concatenated bytes of the ids - valid UTF-8 only when no multi-byte
     // character is cut at the ends of the list
-    function Decode(const aIds: array of integer): RawUtf8;
+    function Decode(const aIds: array of integer): RawUtf8; override;
     /// highest id + 1 (BPE tokens and added tokens)
-    function VocabSize: integer;
+    function VocabSize: integer; override;
     /// number of BPE tokens (ids 0..BpeCount-1)
     property BpeCount: integer
       read fVocabCount;
@@ -200,7 +201,7 @@ var
   addedId: TIntegerDynArray;
   text: RawUtf8;
 begin
-  inherited Create;
+  inherited Create(aFileName);
   if not doc.InitJsonFromFile(aFileName, JSON_FAST_FLOAT) then
     EInferError.RaiseUtf8('%: cannot read %', [self, aFileName]);
   // the pipeline this class implements, and nothing else
@@ -290,7 +291,7 @@ var
   count: Int64;
   i, n, sp: PtrInt;
 begin
-  inherited Create;
+  inherited CreateFromGguf(aGguf);
   // llama.cpp's names of the Qwen2 pipeline: a GPT-2 byte-level BPE with the
   // qwen2 pre-tokenizer (the Split regex of tokenizer.json); GGUF stores no
   // normalizer - Qwen's tokenizer.json has NFC, which Normalize applies

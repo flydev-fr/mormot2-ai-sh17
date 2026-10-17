@@ -27,6 +27,7 @@ uses
   mormot.ai.infer.loader.safetensors,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.sampler,
   test.infer.ref,
@@ -102,6 +103,9 @@ type
     procedure Qwen3Gguf;
     /// a Q4_K_M GGUF of Qwen3-0.6B (Q4_K and Q6_K matrices) against FP32
     procedure Qwen3GgufQ4KM;
+    /// the decoder families: registration, NewDecoderModel by model_type and
+    // architecture, the kind of every layer, foreign families refused
+    procedure DecoderFamilies;
   end;
 
 
@@ -1552,5 +1556,76 @@ begin
     ref.Free;
   end;
 end;
+
+
+procedure TTestInferQwen3.DecoderFamilies;
+var
+  dir, gdir, tmp: TFileName;
+  m: TDecoderModel;
+  i: PtrInt;
+  attention: boolean;
+
+  function Refused(const aFolder, aGguf: TFileName; const aWhy: RawUtf8): boolean;
+  begin
+    result := false;
+    try
+      if aGguf <> '' then
+        NewDecoderModelFromGguf(aGguf, fCpu).Free
+      else
+        NewDecoderModel(aFolder, fCpu).Free;
+    except
+      on E: EInferError do
+        result := PosEx(aWhy, StringToUtf8(E.Message)) > 0;
+    end;
+  end;
+
+begin
+  Check(DecoderModelClass('qwen3') = TQwen3Model, 'model_type qwen3');
+  Check(DecoderModelClassOfArchitecture('qwen3') = TQwen3Model, 'architecture qwen3');
+  Check(DecoderModelClass('qwen2') = nil, 'model_type qwen2: none');
+  Check(DecoderModelClassOfArchitecture('llama') = nil, 'architecture llama: none');
+  // registered once: a second registration changes nothing
+  RegisterDecoderModel(TQwen3Model);
+  Check(DecoderModelClass('qwen3') = TQwen3Model, 'still TQwen3Model');
+  dir := FindInferRefDir('tiny-qwen3');
+  gdir := FindInferRefDir('tiny-qwen3-gguf');
+  if CheckFailed((dir <> '') and (gdir <> ''), 'tiny-qwen3 and its GGUF found') then
+    exit;
+  Check(DecoderModelClassOfFolder(dir) = TQwen3Model, 'the folder is qwen3');
+  m := NewDecoderModel(dir, fCpu, idtQ8_0);
+  try
+    Check(m is TQwen3Model, 'NewDecoderModel: a TQwen3Model');
+    Check(m.Weights = idtQ8_0, 'the weights asked for');
+    CheckEqual(length(m.Config.Spec), m.Config.Layers, 'a kind per layer');
+    attention := true;
+    for i := 0 to high(m.Config.Spec) do
+      if (m.Config.Spec[i].Mixer <> dmAttention) or (m.Config.Spec[i].Ffn <> dfDense) then
+        attention := false;
+    Check(attention, 'every layer attention and dense');
+    Check(m.HasOnly(dmAttention, dfDense), 'HasOnly');
+  finally
+    m.Free;
+  end;
+  m := NewDecoderModelFromGguf(gdir + 'q8_0.gguf', fCpu);
+  try
+    Check(m is TQwen3Model, 'NewDecoderModelFromGguf: a TQwen3Model');
+    CheckEqual(length(m.Config.Spec), m.Config.Layers, 'a kind per layer (GGUF)');
+  finally
+    m.Free;
+  end;
+  Check(Refused('', gdir + 'bad-arch.gguf', 'not supported'), 'GGUF of another architecture');
+  // a folder of another model_type, and one without config.json
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-dec-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  try
+    Check(Refused(tmp, '', 'cannot read'), 'no config.json');
+    FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
+      '"qwen3"', '"qwen2"'), tmp + 'config.json');
+    Check(Refused(tmp, '', 'not supported'), 'model_type qwen2');
+  finally
+    DirectoryDeleteAll(tmp);
+  end;
+end;
+
 
 end.

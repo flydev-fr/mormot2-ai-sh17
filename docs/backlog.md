@@ -190,6 +190,16 @@ Positionsverfahren (RoPE, teilweise RoPE, YaRN, NoPE). Tokenizer, Chat-Template 
 Antwort-Parser hinter kleinen Schnittstellen; Backends melden vor dem Laden, was sie können.
 Gebaut wird nur, was Qwen3 braucht. Gate: alle Qwen3-Tests (CPU, Vulkan, CUDA, Prompt-Cache,
 Client) unverändert grün auf allen Compilern bis Delphi 7.
+*Erledigt 2026-10-17:* `mormot.ai.infer.decoder` (`TDecoderModel`, `TDecoderContext`,
+`TDecoderDevice`, `Spec` je Layer), `TInferTokenizer`, `TChatTemplate`,
+`TNativeOutputParser`, `RegisterDecoderModel` und `RegisterNativeFamily`; wie man eine
+Familie andockt: `native-inference.md`, Phase D. Die Layer-Liste hat erst die Arten, die
+Qwen3 braucht; Zustand, Positionsverfahren und Bias kommen mit D2 bis D5. Dabei anzupassen
+(Review D1): `TDecoderLayer` ist ein flacher Attention-plus-SwiGLU-Satz, und `CreateFromGguf`
+nimmt den Gewichtstyp aus `fLayer[0].Q`; `Grow` legt für jeden Layer KV derselben Breite an;
+`Rotary` ist eine Tabelle über die ganze Kopfdimension; `CheckConfig` verlangt
+`Intermediate > 0`, `RopeTheta > 1` und prüft von `Spec` nur die Länge; die
+Puffergrößen in `Forward`/`Grow` kennen nur `Hidden`, `Intermediate` und die Kopfbreite.
 
 **D2 — MoE auf der CPU.** Router (Softmax und Sigmoid, Top-k, optional normiert), gewichtete
 Summe der Experten, Experten als Sichten auf die Gewichte; bestehende Quant-Kernel weiter

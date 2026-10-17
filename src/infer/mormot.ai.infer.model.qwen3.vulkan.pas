@@ -38,6 +38,7 @@ uses
   mormot.ai.infer.backend,
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3;
 
 type
@@ -106,7 +107,7 @@ type
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no shader (F32, Q8_0, Q4_K, Q6_K do)
     // - aModel and aBackend are not owned and must outlive this instance
-    constructor Create(aModel: TQwen3Model; aBackend: TInferVulkanBackend);
+    constructor Create(aModel: TDecoderModel; aBackend: TInferVulkanBackend);
     destructor Destroy; override;
     /// a context for this model on this device (owned by the caller)
     function NewContext: TQwen3VkContext;
@@ -269,11 +270,14 @@ end;
 
 { TQwen3Vulkan }
 
-constructor TQwen3Vulkan.Create(aModel: TQwen3Model; aBackend: TInferVulkanBackend);
+constructor TQwen3Vulkan.Create(aModel: TDecoderModel; aBackend: TInferVulkanBackend);
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
+  // the layers it runs: attention and a dense SwiGLU block (Qwen3)
+  if not aModel.HasOnly(dmAttention, dfDense) then
+    EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
