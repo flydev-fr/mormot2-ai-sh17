@@ -891,20 +891,59 @@ begin
   end;
 end;
 
+// unaligned Int64 loads are fine on these CPUs (Q4_0 qs sits at offset 2)
+{$ifdef CPUINTEL}
+  {$define INFERQ4WORDS}
+{$endif CPUINTEL}
+{$ifdef CPUAARCH64}
+  {$define INFERQ4WORDS}
+{$endif CPUAARCH64}
+
+{$ifdef INFERQ4WORDS}
+// eight nibbles x (0..15) of an Int64 as the eight int8 x - 8, bitwise only (no
+// carry between the bytes): y = x xor 8 is x - 8 where x >= 8, else x + 8,
+// which then only needs its high nibble set (0xF0) where bit 3 of y is set
+function Q4Minus8(x: Int64): Int64;
+  {$ifdef HASINLINE} inline; {$endif}
+var
+  t: Int64;
+begin
+  result := x xor Int64($0808080808080808);
+  t := result and Int64($0808080808080808);
+  result := result or (t shl 1) or (t shl 2) or (t shl 3) or (t shl 4);
+end;
+{$endif INFERQ4WORDS}
+
 procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 var
-  b, j: PtrInt;
-  v: PtrInt;
+  b: PtrInt;
+  {$ifdef INFERQ4WORDS}
+  s, d: PInt64Array;
+  {$else}
+  j, v: PtrInt;
+  {$endif INFERQ4WORDS}
 begin
   for b := 0 to aBlocks - 1 do
   begin
     aDst^.d := aSrc^.d;
+    // qs[j] low nibble -> qs[j], high nibble -> qs[j + 16]
+    {$ifdef INFERQ4WORDS}
+    // 8 bytes at a time
+    s := @aSrc^.qs;
+    d := @aDst^.qs;
+    d^[0] := Q4Minus8(s^[0] and Int64($0F0F0F0F0F0F0F0F));
+    d^[1] := Q4Minus8(s^[1] and Int64($0F0F0F0F0F0F0F0F));
+    d^[2] := Q4Minus8((s^[0] shr 4) and Int64($0F0F0F0F0F0F0F0F));
+    d^[3] := Q4Minus8((s^[1] shr 4) and Int64($0F0F0F0F0F0F0F0F));
+    {$else}
+    // other CPUs (32-bit ARM) may fault on an unaligned Int64: by bytes
     for j := 0 to 15 do
     begin
       v := aSrc^.qs[j];
       aDst^.qs[j] := (v and 15) - 8;
       aDst^.qs[j + 16] := (v shr 4) - 8;
     end;
+    {$endif INFERQ4WORDS}
     inc(aSrc);
     inc(aDst);
   end;
@@ -1628,8 +1667,12 @@ begin
         SetLength(unpackedHeap, (oEnd - wfirst + 1) * nb);
         wbase := pointer(unpackedHeap);
       end;
-      InferQ4ToQ8(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
-        (oEnd - wfirst + 1) * nb, @wbase^[0]);
+      if Assigned(InferQ4Unpack) then
+        InferQ4Unpack(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
+          (oEnd - wfirst + 1) * nb, @wbase^[0])
+      else
+        InferQ4ToQ8(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
+          (oEnd - wfirst + 1) * nb, @wbase^[0]);
     end;
     sums := @local;
     if nb * 4 > length(local) then

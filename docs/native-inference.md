@@ -739,6 +739,12 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   4 oder 8 Zeilen). Sinnvoll vor allem für größere Qwen3-Modelle (4B, 8B), bei denen 4 Bit
   qualitativ reichen. Der Speicher sinkt erst mit fertig quantisierten GGUF-Dateien
   spürbar (heute 1,9 statt 2,1 GB, weil die BF16-Datei gemappt bleibt).
+- *B2 (2026-10-17):* Das Entpacken war der Engpass, nicht die Rechnung. `InferQ4ToQ8`
+  entpackt jetzt acht Nibbles je Int64, nur bitweise (`Q4Minus8`, auf x86, x64 und
+  aarch64; sonst byteweise wegen unausgerichteter Zugriffe), dazu `Q4UnpackNeon` für
+  jedes aarch64. Decode, Qwen3-0.6B Q4_0, 32 Tokens: Snapdragon X 30 → 57 (Pascal)
+  → 70–78 Tokens/s (NEON), Q8_0 dort 58–66; M2 Pro 28,5 → 84. Ein fusionierter Kernel
+  ist damit für das Ziel „≥ Q8_0“ nicht nötig. Offen: AVX2-Entpacken.
 - Weiter (Entscheid 2026-10-15): 3e-2 Qwen3 direkt aus GGUF laden, 3e-3 Q4_K/Q6_K (die
   Mischung Q4_K_M) mit fusionierten NEON- und AVX2-Kerneln nach ggml-Vorbild.
 
@@ -871,7 +877,8 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   `llm-bench` schaltet unter Windows die EcoQoS-Drossel ab (wie `embed-bench`).
 
 - Offen in Phase 3, als agentenfertige Einträge in [backlog.md](backlog.md): K-Quant-Prefill
-  (B1, ein Versuch ohne eigenen Kernel war langsamer), Q4_0-Kernel (B2).
+  (B1, ein Versuch ohne eigenen Kernel war langsamer), Q4_0-Kernel (B2, auf ARM
+  erledigt, offen AVX2).
 - *B1, erster Teil (2026-10-16):* `TInferKSums2` und `Q4KSums2NeonDot`.
   - Eine Q4_K-Gewichtszeile läuft gegen zwei Q8_K-Tokenzeilen. Nibbles, Skalen und Minima
     werden pro Block einmal ausgepackt, die SDOTs laufen gegen beide Zeilen.

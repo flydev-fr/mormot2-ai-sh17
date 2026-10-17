@@ -89,6 +89,20 @@ ARM-Repacking (block_q4_0 4×4/8×4 verschränkt, GEMV über 4/8 Zeilen).
 **Fertig, wenn:** `TTestInferFast.LinearQ4MatchesReference` grün (exakt bitgleich),
 Gegenproben, Decode-Tempo im A/B-Lauf ≥ Q8_0.
 
+**Erledigt auf ARM (2026-10-17), ohne fusionierten Kernel:** Der Engpass war das
+byteweise Entpacken nach Q8_0.
+- *Pascal:* `InferQ4ToQ8` entpackt acht Nibbles je Int64 bitweise (`Q4Minus8`) auf x86,
+  x64 und aarch64; andere CPUs bleiben byteweise (unausgerichtete Int64 bei Offset 2).
+- *NEON:* `Q4UnpackNeon` hinter `InferQ4Unpack` (jedes aarch64).
+- *Test:* `LinearQ4MatchesReference` prüft `InferQ4ToQ8` über alle 256 Bytewerte gegen
+  die Definition (die Referenz teilt die Funktion, fast = ref allein fände dort nichts)
+  und den Kernel = Pascal. Gegenproben: ohne `or (t shl 4)` scheitert der 256-Byte-Test,
+  ein `nop` statt des zweiten NEON-`sub` lässt 13 Assertions scheitern.
+- *Messung (Decode, Qwen3-0.6B Q4_0, 32 Tokens):* Snapdragon X 30 → 70–78 Tokens/s
+  (Q8_0 58–66), M2 Pro 28,5 → 84.
+- *Offen:* AVX2-Fassung von `InferQ4Unpack` (Messung auf dem RTX-Rechner); fusionierter
+  Kernel und Repacking nur, wenn größere Modelle es verlangen.
+
 ---
 
 ## B3 — CUDA-Backend (zweites GPU-Backend nach Vulkan)

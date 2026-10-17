@@ -71,6 +71,9 @@ type
   // TInferKSums calls, the weights unpacked once for both (backlog B1)
   TInferKSums2 = procedure(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
     aXStride: PtrInt);
+  /// aBlocks Q4_0 blocks at aSrc as Q8_0 blocks at aDst: the same scale,
+  // q - 8 as the signed value (see InferQ4ToQ8 in mormot.ai.infer.backend.cpu)
+  TInferQ4Unpack = procedure(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
   /// the same for the four weight rows w, w + aStride, w + 2 aStride and
   // w + 3 aStride (aStride in bytes) against one row x:
   // aSums[b * 4 + k] = block b of row k
@@ -111,6 +114,9 @@ var
   /// the Q6_K sums of two activation rows (see TInferKSums2), nil without a
   // kernel: the caller then calls InferQ6KSums per row
   InferQ6KSums2: TInferKSums2;
+  /// the Q4_0 to Q8_0 unpacking of this CPU (see TInferQ4Unpack), nil without
+  // a kernel: the caller then uses the Pascal InferQ4ToQ8
+  InferQ4Unpack: TInferQ4Unpack;
   /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod', 'avx2'
   InferQ8KernelName: RawUtf8;
   /// every IEEE half (raw bits) as single - 256 KB, filled at initialization
@@ -1212,6 +1218,29 @@ asm
   subs x2, x2, #1
   b.ne .Lq6k2_0
 .Lq6k2_2:
+end;
+
+/// Q4_0 -> Q8_0: per block the scale copied, the low nibbles and the high ones
+// minus 8 as 32 int8 (plain NEON); x0 = aSrc (18-byte blocks), x1 = aBlocks,
+// x2 = aDst (34-byte blocks); the opcodes from GNU as 2.42
+procedure Q4UnpackNeon(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+  assembler; nostackframe;
+asm
+  cbz x1, .Lq4u_0
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+  .long 0x4f00e51e // movi v30.16b, #0x8
+.Lq4u_1:
+  .long 0x78402409 // ldrh w9, [x0], #2
+  .long 0x4cdf7000 // ld1 {v0.16b}, [x0], #16
+  .long 0x4e3f1c01 // and v1.16b, v0.16b, v31.16b
+  .long 0x6f0c0402 // ushr v2.16b, v0.16b, #4
+  .long 0x6e3e8421 // sub v1.16b, v1.16b, v30.16b
+  .long 0x6e3e8442 // sub v2.16b, v2.16b, v30.16b
+  .long 0x78002449 // strh w9, [x2], #2
+  .long 0x4c9fa041 // st1 {v1.16b-v2.16b}, [x2], #32
+  subs x1, x1, #1
+  b.ne .Lq4u_1
+.Lq4u_0:
 end;
 
 /// Q6_K x two Q8_K rows, fused: Q6KSumsNeonDot with the 6-bit values and the
@@ -2448,6 +2477,7 @@ begin
   InferDotsF32 := TInferDotsF32(@DotsF32Neon);
   InferAxpyRowsF32 := TInferDotsF32(@AxpyRowsF32Neon);
   InferQ8QuantizeRow := TInferQ8QuantizeRow(@Q8QuantizeRowNeon);
+  InferQ4Unpack := TInferQ4Unpack(@Q4UnpackNeon);
   if HasArmDotProd then
   begin
     // an assembler routine: one calling convention on aarch64 whatever the

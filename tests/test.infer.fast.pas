@@ -652,11 +652,40 @@ const
     (1, 32, 1), (3, 96, 17), (37, 256, 33), (64, 1024, 100), (5, 3072, 48),
     (2, 4352, 20));
 var
-  i, rows, nin, nout: PtrInt;
+  i, j, rows, nin, nout: PtrInt;
   x, bias, y1, y2, y3: TSingleDynArray;
   wq: RawByteString;
   e: double;
+  q4: array[0..15] of TInferBlockQ4_0;
+  q8, q8b: array[0..15] of TInferBlockQ8_0;
+  ok: boolean;
 begin
+  // the unpacking every Q4_0 path shares, against its definition: all 256 bytes
+  for i := 0 to 15 do
+  begin
+    q4[i].d := i * 7 + 1;
+    for j := 0 to 15 do
+      q4[i].qs[j] := i * 16 + j;
+  end;
+  InferQ4ToQ8(@q4, 16, @q8);
+  ok := true;
+  for i := 0 to 15 do
+  begin
+    if q8[i].d <> q4[i].d then
+      ok := false;
+    for j := 0 to 15 do
+      if (q8[i].qs[j] <> (q4[i].qs[j] and 15) - 8) or
+         (q8[i].qs[j + 16] <> (q4[i].qs[j] shr 4) - 8) then
+        ok := false;
+  end;
+  Check(ok, 'InferQ4ToQ8 = q - 8 for all 256 bytes');
+  if Assigned(InferQ4Unpack) then
+  begin
+    FillCharFast(q8, SizeOf(q8), 0);
+    InferQ4Unpack(@q4, 16, @q8);
+    InferQ4ToQ8(@q4, 16, @q8b);
+    Check(CompareMem(@q8, @q8b, SizeOf(q8)), 'Q4_0 unpack kernel = Pascal');
+  end;
   for i := 0 to high(SHAPES) do
   begin
     rows := SHAPES[i, 0];

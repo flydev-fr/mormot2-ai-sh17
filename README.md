@@ -569,7 +569,7 @@ Next, in this order:
    reproducible per seed), and so is a prompt cache (the next turn of a conversation
    only computes what is new), and norms, RoPE and SwiGLU run on all cores (prefill
    up to 1.8x faster). Q4_0 works (byte-identical to ggml) but is experimental: too
-   coarse for a 0.6B model and, without kernels of its own, slower than Q8_0. Qwen3
+   coarse for a 0.6B model; on ARM it now decodes faster than Q8_0. Qwen3
    loads straight from llama.cpp GGUF files (Q8_0, Q4_0, F16), tokenizer included, so
    one .gguf file is a complete native `ILlmClient`, and Q4_K_M files load too (Q4_K
    and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
