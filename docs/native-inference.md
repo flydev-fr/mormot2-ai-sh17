@@ -1567,6 +1567,47 @@ unvollständige Registrierungen ignoriert, Parser ohne Tokenizer abgelehnt). Gr�
 FPC 3.2.4 und 3.2.2 (WSL, 2600 Assertions), auf dem RTX-Rechner mit echtem Modell unter
 FPC 3.2.2, Delphi 13 und Delphi 7. Gegenprobe: elf eingebaute Fehler (Layer-Liste nicht gefüllt, `HasOnly` immer falsch, Registry findet keine Klasse nach `model_type` bzw. Architektur, fremder `model_type` bzw. fremde Architektur angenommen, Parser schließt offene Blöcke nicht, Zeilenumbrüche vor einem Tool-Aufruf bleiben, Parser ohne Tokenizer, Familiensuche ignoriert die Klasse, Familie ohne Template registriert) - alle scheitern.
 
+**D2 erledigt (2026-10-17): Mixture of Experts auf der CPU.**
+
+- `TDecoderFfn` hat `dfMoe`; `TDecoderConfig` dazu `Experts`, `ExpertsUsed`,
+  `ExpertIntermediate` und `NormTopK`, `TDecoderLayer` den Router (F32, auch wenn die
+  Matrizen beim Laden quantisiert werden) und die Experten als je ein Gewicht.
+- `MoeBlock`: RMSNorm, Router-Logits, je Token Softmax (in double), die `ExpertsUsed`
+  höchsten (bei Gleichstand die kleinere Id), auf Summe 1 normiert, wenn `NormTopK`. Dann
+  Experte für Experte in Id-Reihenfolge (wie die Referenz addiert): seine Tokens gesammelt,
+  ein SwiGLU-Block über sie, mit dem Router-Gewicht in ihre Zeilen addiert. Decode rechnet so
+  nur die gewählten Experten, Prefill einen Block je Experte über alle seine Tokens.
+- `TQwen3MoeModel` (`model_type` `qwen3_moe`, GGUF-Architektur `qwen3moe`): Experten aus
+  safetensors einzeln (`mlp.experts.E.gate_proj` ...), aus GGUF als Scheiben der 3-D-Tensoren
+  `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps` (`TDecoderModel.GgufExperts`, Q8_0,
+  Q4_0, Q4_K, Q6_K, in place); dichte Layer nach `mlp_only_layers` und
+  `decoder_sparse_step`, im GGUF dort, wo `ffn_gate_inp` fehlt. Im GGUF steht keine
+  Normierung: wie llama.cpp für qwen3moe immer normiert. Tokenizer, Template und Parser
+  sind die von Qwen3.
+- GPU-Geräte lehnen MoE-Modelle ab (`HasOnly`), das kommt mit D3.
+
+*Referenz:* `tiny-qwen3moe` (transformers 5.19 `Qwen3MoeForCausalLM`): 3 Layer, 0 und 2 mit
+8 Experten der Breite 64 und Top-2, Layer 1 dicht; der erste Seed ab 20261017, bei dem
+zwischen dem k-ten und dem (k+1)-ten Router-Logit jedes Tokens mindestens 0,05 liegen (sonst
+hinge die Expertenwahl an der Rundung; gewählt 20261018 mit 0,17). Dazu eine Variante ohne
+Normierung und GGUF-Dateien (Q8_0, Q4_0 aus ggml) mit 3-D-Experten.
+
+*Tests:* `TinyMoeMatchesReference` (alle Zustände bis 3e-6, Cache und Prefill in zwei
+Teilen bitgleich zum ganzen Durchlauf, Greedy, ohne Normierung), `TinyMoeQuantized` (Q8_0
+beim Laden: höchstens 0,21 neben FP32 bei Kosinus 0,9991 - der Router des Tiny-Modells ist
+scharf, Token 5 von Fall 1 rückt in Layer 2 um 0,2; GGUF: jeder Experte Byte für Byte wie
+unsere Quantisierung, Q4_0-Logits neben unseren), `TinyMoeRefused` (fehlende Schlüssel,
+mehr Experten je Token als Experten, Breiten und Experten, die nicht zur Datei passen),
+`Qwen3MoeChatClientGguf` (Qwen3-30B-A3B Q4_K_M hinter `TNativeLlmClient`, wo die Datei
+liegt). Gegenprobe: 14 eingebaute Fehler (Wahrscheinlichkeiten nicht normiert, `NormTopK` übergangen, niedrigster Logit gewählt, ein Experte doppelt, Router-Gewicht übergangen, Summe nicht geleert, Ausgabe in die gesammelte statt die eigene Zeile, jeder Experte dieselbe GGUF-Scheibe, Form der Experten ungeprüft, mehr Experten je Token als Experten, `mlp_only_layers` übergangen, `decoder_sparse_step` um eins verschoben, im GGUF jeder Layer mit Experten, Router quantisiert) - alle scheitern, der doppelte Experte durch Absturz (der Sammelpuffer läuft über; `Route` wählt nie doppelt).
+
+*Qwen3-30B-A3B* (`Qwen/Qwen3-30B-A3B-GGUF`, `Qwen3-30B-A3B-Q4_K_M.gguf`, 18,6 GB; Q4_K, Q6_K
+für einen Teil von `attn_v` und `ffn_down_exps`, Router F32) auf dem RTX-Rechner (i9-14900K,
+22 Threads, CPU): geladen in 3,8 s, 17,7 GB Spitze; Prefill 85 Tokens/s, Decode 16
+Tokens/s bei 200 Tokens Prompt (zum Vergleich Qwen3-0.6B Q8_0: 759 und 70). Antwortet
+`chat_en` mit „Paris“. Grün unter FPC 3.2.2, Delphi 13 (je 3165 Assertions) und Delphi 7
+(1978, der 30B-Test braucht einen 64-Bit-Prozess).
+
 ### Danach — nach Bedarf
 
 Reranker (BGE-Reranker), Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding; weitere

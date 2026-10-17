@@ -17,12 +17,18 @@
 // - or a llama.cpp GGUF file of the qwen3 architecture (CreateFromGguf): its
 //   metadata for the settings, its Q8_0 / Q4_0 / Q4_K / Q6_K matrices used in
 //   place
+// - TQwen3MoeModel: Qwen3-MoE (model_type qwen3_moe, GGUF architecture
+//   qwen3moe, e.g. Qwen3-30B-A3B) - the same attention, a mixture of experts
+//   as feed-forward block (looked up in modeling_qwen3_moe.py: a softmax router,
+//   the top num_experts_per_tok experts, renormed when norm_topk_prob; dense
+//   layers where mlp_only_layers or decoder_sparse_step say so)
 unit mormot.ai.infer.model.qwen3;
 
 {
   *****************************************************************************
 
     - TQwen3Model: the qwen3 family of TDecoderModel
+    - TQwen3MoeModel: Qwen3-MoE, the experts as feed-forward block
     - TQwen3Config, TQwen3Context, TQwen3Device...: the decoder types under
       their former names
 
@@ -63,10 +69,46 @@ type
     procedure LoadGgufConfig; override;
     procedure LoadWeights; override;
     function GgufName(const aName: RawUtf8): RawUtf8; override;
+    /// a positive count of the GGUF metadata, bounded before it becomes a
+    // PtrInt: a value beyond 32 bits must not wrap into a valid one
+    function GgufCount(const aKey: RawUtf8): PtrInt;
+    /// the feed-forward settings of config.json (aDoc), before CheckConfig -
+    // nothing here: every layer dense
+    procedure LoadFfnConfig(const aDoc: TDocVariantData;
+      const aConfigFile: TFileName); virtual;
+    /// the same from the GGUF metadata - nothing here
+    procedure LoadGgufFfnConfig; virtual;
+    /// the feed-forward weights of layer aLayer (tensor names from aPrefix,
+    // 'model.layers.N.'); returns how many tensors they took - here the dense
+    // gate, up and down
+    function LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt; virtual;
   public
     /// 'qwen3'
     class function ModelType: RawUtf8; override;
     /// 'qwen3'
+    class function Architecture: RawUtf8; override;
+  end;
+
+  /// a Qwen3-MoE causal language model (e.g. Qwen3-30B-A3B)
+  // - config.json: num_experts, num_experts_per_tok, moe_intermediate_size,
+  // norm_topk_prob, decoder_sparse_step and mlp_only_layers; the experts one by
+  // one (model.layers.N.mlp.experts.E.gate_proj ...), the router mlp.gate
+  // - GGUF (architecture qwen3moe): expert_count, expert_used_count,
+  // expert_feed_forward_length; the experts of a layer as one 3-D tensor each
+  // (ffn_gate_exps, ffn_up_exps, ffn_down_exps), the router ffn_gate_inp; a
+  // layer without ffn_gate_inp is dense; the weights always renormed, as
+  // llama.cpp computes qwen3moe
+  // - the router stays F32 when the matrices are quantized at load
+  TQwen3MoeModel = class(TQwen3Model)
+  protected
+    procedure LoadFfnConfig(const aDoc: TDocVariantData;
+      const aConfigFile: TFileName); override;
+    procedure LoadGgufFfnConfig; override;
+    function LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt; override;
+  public
+    /// 'qwen3_moe'
+    class function ModelType: RawUtf8; override;
+    /// 'qwen3moe'
     class function Architecture: RawUtf8; override;
   end;
 
@@ -100,8 +142,9 @@ var
 begin
   if not doc.InitJsonFromFile(aConfigFile, JSON_FAST_FLOAT) then
     EInferError.RaiseUtf8('%: cannot read %', [self, aConfigFile]);
-  if doc.U['model_type'] <> 'qwen3' then
-    EInferError.RaiseUtf8('%: model_type "%" is not qwen3', [self, doc.U['model_type']]);
+  if doc.U['model_type'] <> ModelType then
+    EInferError.RaiseUtf8('%: model_type "%" is not %',
+      [self, doc.U['model_type'], ModelType]);
   // a missing key would read as 0: refused, also head_dim (no hidden / heads
   // fallback - that is exactly the value Qwen3 does not have)
   for i := 0 to high(REQUIRED_KEYS) do
@@ -140,35 +183,44 @@ begin
   fConfig.MaxPositions := doc.I['max_position_embeddings'];
   fConfig.RmsEps := doc.D['rms_norm_eps'];
   fConfig.TiedEmbeddings := doc.B['tie_word_embeddings'];
+  LoadFfnConfig(doc, aConfigFile);
   CheckConfig(aConfigFile);
+end;
+
+procedure TQwen3Model.LoadFfnConfig(const aDoc: TDocVariantData;
+  const aConfigFile: TFileName);
+begin
+end;
+
+function TQwen3Model.GgufCount(const aKey: RawUtf8): PtrInt;
+var
+  v: Int64;
+begin
+  v := fGguf.Int(aKey);
+  if (v <= 0) or (v > 1 shl 30) then
+    EInferError.RaiseUtf8('%: % = % out of range', [self, aKey, v]);
+  result := v;
+end;
+
+procedure TQwen3Model.LoadGgufFfnConfig;
+begin
 end;
 
 procedure TQwen3Model.LoadGgufConfig;
 var
   emb: PInferTensor;
-
-  // a positive count, bounded before it becomes a PtrInt: a value beyond 32
-  // bits must not wrap into a valid one in a 32-bit process
-  function Count(const aKey: RawUtf8): PtrInt;
-  var
-    v: Int64;
-  begin
-    v := fGguf.Int(aKey);
-    if (v <= 0) or (v > 1 shl 30) then
-      EInferError.RaiseUtf8('%: % = % out of range', [self, aKey, v]);
-    result := v;
-  end;
-
+  a: RawUtf8;
 begin
-  if fGguf.Str('general.architecture') <> 'qwen3' then
-    EInferError.RaiseUtf8('%: architecture "%" is not qwen3',
-      [self, fGguf.Str('general.architecture')]);
+  if fGguf.Str('general.architecture') <> Architecture then
+    EInferError.RaiseUtf8('%: architecture "%" is not %',
+      [self, fGguf.Str('general.architecture'), Architecture]);
+  a := Architecture + '.';
   // a scaled RoPE or a sliding window would change the arithmetic: refused
-  if fGguf.Has('qwen3.rope.scaling.type') and
-     (fGguf.Str('qwen3.rope.scaling.type') <> 'none') then
+  if fGguf.Has(a + 'rope.scaling.type') and
+     (fGguf.Str(a + 'rope.scaling.type') <> 'none') then
     EInferError.RaiseUtf8('%: rope scaling "%" not supported',
-      [self, fGguf.Str('qwen3.rope.scaling.type')]);
-  if fGguf.Has('qwen3.attention.sliding_window') then
+      [self, fGguf.Str(a + 'rope.scaling.type')]);
+  if fGguf.Has(a + 'attention.sliding_window') then
     EInferError.RaiseUtf8('%: sliding window attention not supported', [self]);
   emb := fGguf.Tensor('token_embd.weight');
   if length(emb^.Shape) <> 2 then
@@ -177,31 +229,32 @@ begin
   if (emb^.Shape[0] <= 0) or (emb^.Shape[0] > 1 shl 22) then
     EInferError.RaiseUtf8('%: a vocabulary of % tokens', [self, emb^.Shape[0]]);
   fConfig.VocabSize := emb^.Shape[0];
-  fConfig.Hidden := Count('qwen3.embedding_length');
-  fConfig.Layers := Count('qwen3.block_count');
-  fConfig.Heads := Count('qwen3.attention.head_count');
-  fConfig.KvHeads := Count('qwen3.attention.head_count_kv');
-  fConfig.HeadDim := Count('qwen3.attention.key_length');
+  fConfig.Hidden := GgufCount(a + 'embedding_length');
+  fConfig.Layers := GgufCount(a + 'block_count');
+  fConfig.Heads := GgufCount(a + 'attention.head_count');
+  fConfig.KvHeads := GgufCount(a + 'attention.head_count_kv');
+  fConfig.HeadDim := GgufCount(a + 'attention.key_length');
   // RoPE over a part of each head only would be another arithmetic
-  if fGguf.Has('qwen3.rope.dimension_count') and
-     (Count('qwen3.rope.dimension_count') <> fConfig.HeadDim) then
+  if fGguf.Has(a + 'rope.dimension_count') and
+     (GgufCount(a + 'rope.dimension_count') <> fConfig.HeadDim) then
     EInferError.RaiseUtf8('%: RoPE over % of % dimensions not supported',
-      [self, Count('qwen3.rope.dimension_count'), fConfig.HeadDim]);
-  if fGguf.Has('qwen3.attention.value_length') and
-     (Count('qwen3.attention.value_length') <> fConfig.HeadDim) then
+      [self, GgufCount(a + 'rope.dimension_count'), fConfig.HeadDim]);
+  if fGguf.Has(a + 'attention.value_length') and
+     (GgufCount(a + 'attention.value_length') <> fConfig.HeadDim) then
     EInferError.RaiseUtf8('%: key and value heads of different sizes', [self]);
-  fConfig.Intermediate := Count('qwen3.feed_forward_length');
-  fConfig.MaxPositions := Count('qwen3.context_length');
-  fConfig.RmsEps := fGguf.Float('qwen3.attention.layer_norm_rms_epsilon');
-  fConfig.RopeTheta := fGguf.Float('qwen3.rope.freq_base');
+  fConfig.Intermediate := GgufCount(a + 'feed_forward_length');
+  fConfig.MaxPositions := GgufCount(a + 'context_length');
+  fConfig.RmsEps := fGguf.Float(a + 'attention.layer_norm_rms_epsilon');
+  fConfig.RopeTheta := fGguf.Float(a + 'rope.freq_base');
   // llama.cpp ties the head to the embedding by leaving output.weight out
   fConfig.TiedEmbeddings := fGguf.FindTensor('output.weight') = nil;
+  LoadGgufFfnConfig;
   CheckConfig(fGguf.FileName);
 end;
 
 const
   /// Hugging Face names and llama.cpp's for the tensors of one layer
-  LAYER_NAMES: array[0..10, 0..1] of RawUtf8 = (
+  LAYER_NAMES: array[0..11, 0..1] of RawUtf8 = (
     ('self_attn.q_proj.weight', 'attn_q.weight'),
     ('self_attn.k_proj.weight', 'attn_k.weight'),
     ('self_attn.v_proj.weight', 'attn_v.weight'),
@@ -212,7 +265,8 @@ const
     ('mlp.up_proj.weight', 'ffn_up.weight'),
     ('mlp.down_proj.weight', 'ffn_down.weight'),
     ('input_layernorm.weight', 'attn_norm.weight'),
-    ('post_attention_layernorm.weight', 'ffn_norm.weight'));
+    ('post_attention_layernorm.weight', 'ffn_norm.weight'),
+    ('mlp.gate.weight', 'ffn_gate_inp.weight')); // the router of Qwen3-MoE
 
 function TQwen3Model.GgufName(const aName: RawUtf8): RawUtf8;
 var
@@ -246,7 +300,7 @@ end;
 procedure TQwen3Model.LoadWeights;
 var
   i, used: PtrInt;
-  h, f, qw, kvw: Int64;
+  h, qw, kvw: Int64;
   p: RawUtf8;
   l: ^TDecoderLayer;
   head, emb: PInferTensor;
@@ -258,7 +312,6 @@ begin
   if headType = idtQ4_0 then
     headType := idtQ8_0;
   h := fConfig.Hidden;
-  f := fConfig.Intermediate;
   qw := fConfig.Heads * fConfig.HeadDim;
   kvw := fConfig.KvHeads * fConfig.HeadDim;
   fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
@@ -305,12 +358,9 @@ begin
     l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw, fWeights);
     l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
     l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
-    l^.Gate := Matrix(p + 'mlp.gate_proj.weight', f, h, fWeights);
-    l^.Up := Matrix(p + 'mlp.up_proj.weight', f, h, fWeights);
-    l^.Down := Matrix(p + 'mlp.down_proj.weight', h, f, fWeights);
     l^.InputNorm := Weight(p + 'input_layernorm.weight', [h]);
     l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
-    inc(used, 11);
+    inc(used, 8 + LoadFfn(i, p));
   end;
   // an unknown tensor means a model we do not understand
   if used <> TensorCount then
@@ -318,8 +368,134 @@ begin
       [self, TensorCount, used]);
 end;
 
+function TQwen3Model.LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt;
+var
+  l: ^TDecoderLayer;
+  h, f: Int64;
+begin
+  l := @fLayer[aLayer];
+  h := fConfig.Hidden;
+  f := fConfig.Intermediate;
+  l^.Gate := Matrix(aPrefix + 'mlp.gate_proj.weight', f, h, fWeights);
+  l^.Up := Matrix(aPrefix + 'mlp.up_proj.weight', f, h, fWeights);
+  l^.Down := Matrix(aPrefix + 'mlp.down_proj.weight', h, f, fWeights);
+  result := 3;
+end;
+
+
+{ TQwen3MoeModel }
+
+class function TQwen3MoeModel.ModelType: RawUtf8;
+begin
+  result := 'qwen3_moe';
+end;
+
+class function TQwen3MoeModel.Architecture: RawUtf8;
+begin
+  result := 'qwen3moe';
+end;
+
+const
+  MOE_KEYS: array[0..4] of RawUtf8 = (
+    'num_experts', 'num_experts_per_tok', 'moe_intermediate_size',
+    'norm_topk_prob', 'decoder_sparse_step');
+
+procedure TQwen3MoeModel.LoadFfnConfig(const aDoc: TDocVariantData;
+  const aConfigFile: TFileName);
+var
+  only: PDocVariantData;
+  i, j, step: PtrInt;
+  dense: boolean;
+begin
+  for i := 0 to high(MOE_KEYS) do
+    if aDoc.GetValueIndex(MOE_KEYS[i]) < 0 then
+      EInferError.RaiseUtf8('%: % has no "%"', [self, aConfigFile, MOE_KEYS[i]]);
+  fConfig.Experts := aDoc.I['num_experts'];
+  fConfig.ExpertsUsed := aDoc.I['num_experts_per_tok'];
+  fConfig.ExpertIntermediate := aDoc.I['moe_intermediate_size'];
+  fConfig.NormTopK := aDoc.B['norm_topk_prob'];
+  step := aDoc.I['decoder_sparse_step'];
+  if step <= 0 then
+    EInferError.RaiseUtf8('%: decoder_sparse_step = %', [self, step]);
+  // as Qwen3MoeDecoderLayer: experts unless the layer is in mlp_only_layers
+  // or (index + 1) is no multiple of decoder_sparse_step - an invalid layer
+  // count is left to CheckConfig
+  if (fConfig.Layers <= 0) or (fConfig.Layers > 1024) then
+    exit;
+  if not aDoc.GetAsArray('mlp_only_layers', only) then
+    only := nil;
+  SetLength(fConfig.Spec, fConfig.Layers);
+  for i := 0 to fConfig.Layers - 1 do
+  begin
+    dense := (i + 1) mod step <> 0;
+    if only <> nil then
+      for j := 0 to only^.Count - 1 do
+        if VariantToInt64Def(only^.Values[j], -1) = i then
+          dense := true;
+    if not dense then
+      fConfig.Spec[i].Ffn := dfMoe;
+  end;
+end;
+
+procedure TQwen3MoeModel.LoadGgufFfnConfig;
+var
+  a: RawUtf8;
+  i: PtrInt;
+begin
+  a := Architecture + '.';
+  fConfig.Experts := GgufCount(a + 'expert_count');
+  fConfig.ExpertsUsed := GgufCount(a + 'expert_used_count');
+  fConfig.ExpertIntermediate := GgufCount(a + 'expert_feed_forward_length');
+  fConfig.NormTopK := true;
+  if (fConfig.Layers <= 0) or (fConfig.Layers > 1024) then
+    exit;
+  SetLength(fConfig.Spec, fConfig.Layers);
+  for i := 0 to fConfig.Layers - 1 do
+    if fGguf.FindTensor(FormatUtf8('blk.%.ffn_gate_inp.weight', [i])) <> nil then
+      fConfig.Spec[i].Ffn := dfMoe;
+end;
+
+function TQwen3MoeModel.LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt;
+var
+  l: ^TDecoderLayer;
+  h, fi, n, e: PtrInt;
+  b: RawUtf8;
+begin
+  if fConfig.Spec[aLayer].Ffn = dfDense then
+  begin
+    result := inherited LoadFfn(aLayer, aPrefix);
+    exit;
+  end;
+  l := @fLayer[aLayer];
+  h := fConfig.Hidden;
+  fi := fConfig.ExpertIntermediate;
+  n := fConfig.Experts;
+  l^.Router := Matrix(aPrefix + 'mlp.gate.weight', n, h, idtF32);
+  if fGguf <> nil then
+  begin
+    b := FormatUtf8('blk.%.', [aLayer]);
+    l^.ExpertGate := GgufExperts(b + 'ffn_gate_exps.weight', n, fi, h);
+    l^.ExpertUp := GgufExperts(b + 'ffn_up_exps.weight', n, fi, h);
+    l^.ExpertDown := GgufExperts(b + 'ffn_down_exps.weight', n, h, fi);
+    result := 4;
+    exit;
+  end;
+  SetLength(l^.ExpertGate, n);
+  SetLength(l^.ExpertUp, n);
+  SetLength(l^.ExpertDown, n);
+  for e := 0 to n - 1 do
+  begin
+    b := FormatUtf8('%mlp.experts.%.', [aPrefix, e]);
+    l^.ExpertGate[e] := Matrix(b + 'gate_proj.weight', fi, h, fWeights);
+    l^.ExpertUp[e] := Matrix(b + 'up_proj.weight', fi, h, fWeights);
+    l^.ExpertDown[e] := Matrix(b + 'down_proj.weight', h, fi, fWeights);
+  end;
+  result := 1 + 3 * n;
+end;
+
 
 initialization
   RegisterDecoderModel(TQwen3Model);
+  RegisterDecoderModel(TQwen3MoeModel);
 
 end.

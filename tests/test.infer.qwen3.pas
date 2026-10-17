@@ -106,6 +106,12 @@ type
     /// the decoder families: registration, NewDecoderModel by model_type and
     // architecture, the kind of every layer, foreign families refused
     procedure DecoderFamilies;
+    /// tiny Qwen3-MoE: every state, the cache, greedy, unnormed top-k weights
+    procedure TinyMoeMatchesReference;
+    /// tiny Qwen3-MoE in Q8_0 and from GGUF with 3-D expert tensors
+    procedure TinyMoeQuantized;
+    /// Qwen3-MoE settings refused
+    procedure TinyMoeRefused;
   end;
 
 
@@ -1582,6 +1588,9 @@ var
 begin
   Check(DecoderModelClass('qwen3') = TQwen3Model, 'model_type qwen3');
   Check(DecoderModelClassOfArchitecture('qwen3') = TQwen3Model, 'architecture qwen3');
+  Check(DecoderModelClass('qwen3_moe') = TQwen3MoeModel, 'model_type qwen3_moe');
+  Check(DecoderModelClassOfArchitecture('qwen3moe') = TQwen3MoeModel,
+    'architecture qwen3moe');
   Check(DecoderModelClass('qwen2') = nil, 'model_type qwen2: none');
   Check(DecoderModelClassOfArchitecture('llama') = nil, 'architecture llama: none');
   // registered once: a second registration changes nothing
@@ -1622,6 +1631,308 @@ begin
     FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
       '"qwen3"', '"qwen2"'), tmp + 'config.json');
     Check(Refused(tmp, '', 'not supported'), 'model_type qwen2');
+  finally
+    DirectoryDeleteAll(tmp);
+  end;
+end;
+
+
+/// the bytes of a matrix of aRows x aCols as stored
+function MatrixBytes(const w: TInferWeight; aRows, aCols: PtrInt): PtrInt;
+begin
+  result := (aRows * aCols div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType];
+end;
+
+procedure TTestInferQwen3.TinyMoeMatchesReference;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  full, step, ctx: TDecoderContext;
+  ids: PIntegerArray;
+  n, i, k, v, vocab, diff: PtrInt;
+  all, one: TSingleDynArray;
+  prompt, mine: TIntegerDynArray;
+  same: boolean;
+  margin: double;
+  detail: RawUtf8;
+begin
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  model := nil;
+  full := nil;
+  step := nil;
+  try
+    model := NewDecoderModel(dir, fCpu);
+    Check(model is TQwen3MoeModel, 'qwen3_moe: a TQwen3MoeModel');
+    CheckEqual(model.Config.Experts, 8, 'experts');
+    CheckEqual(model.Config.ExpertsUsed, 2, 'experts per token');
+    CheckEqual(model.Config.ExpertIntermediate, 64, 'expert width');
+    Check(model.Config.NormTopK, 'norm_topk_prob');
+    Check((model.Config.Spec[0].Ffn = dfMoe) and (model.Config.Spec[1].Ffn = dfDense) and
+      (model.Config.Spec[2].Ffn = dfMoe), 'layer 1 dense (mlp_only_layers)');
+    Check(not model.HasOnly(dmAttention, dfDense), 'not only dense layers');
+    // every state: layer00_mlp is the mixture of experts of layer 0; three
+    // layers, so up to 3e-6 apart where tiny-qwen3 stays within 2e-6
+    for k := 0 to 2 do
+      CheckStates(TQwen3Model(model), ref, FormatUtf8('case%', [k]), 5e-6, 2e-5, true);
+    // one token at a time (one row per expert) = the prefill (rows gathered)
+    vocab := model.Config.VocabSize;
+    ids := ref.I32('case2.ids', n);
+    full := model.NewContext;
+    step := model.NewContext;
+    SetLength(all, n * vocab);
+    SetLength(one, vocab);
+    model.Forward(full, ids, n, pointer(all), true);
+    same := true;
+    for i := 0 to n - 1 do
+    begin
+      model.Forward(step, @ids^[i], 1, pointer(one));
+      for v := 0 to vocab - 1 do
+        if PCardinal(@one[v])^ <> PCardinal(@all[i * vocab + v])^ then
+          same := false;
+    end;
+    Check(same, 'cached logits bit-identical to the full pass');
+    step.Reset;
+    model.Forward(step, ids, 4, nil);
+    model.Forward(step, @ids^[4], n - 4, pointer(one));
+    Check(CompareMem(pointer(one), @all[(n - 1) * vocab], vocab * SizeOf(single)),
+      'prefill in two chunks');
+    // greedy continuations
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, 16, [2]);
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+      CheckUtf8(diff < 0, 'MoE case% differs at step % (margin %, %)',
+        [k, diff, margin, detail]);
+    end;
+    // the top-k weights not renormed
+    FreeAndNil(step);
+    FreeAndNil(full);
+    FreeAndNil(model);
+    dir := MakePath([dir, 'unnormed'], true);
+    ref.Free;
+    ref := TInferRefSet.CreateFromFolder(dir);
+    model := TQwen3MoeModel.Create(dir, fCpu);
+    Check(not model.Config.NormTopK, 'norm_topk_prob false');
+    CheckStates(TQwen3Model(model), ref, 'case0', 5e-6, 2e-5, true);
+  finally
+    step.Free;
+    full.Free;
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.TinyMoeQuantized;
+var
+  dir, gdir: TFileName;
+  ref: TInferRefSet;
+  a, c, g: TDecoderModel;
+  ca, cc: TDecoderContext;
+  la, lc: TSingleDynArray;
+  ids: PIntegerArray;
+  n, m, k, v, l, e: PtrInt;
+  cmp: TInferCompare;
+  same: boolean;
+  t: TInferDType;
+  f: RawUtf8;
+
+  function Refused(const aFile, aWhy: RawUtf8): boolean;
+  begin
+    result := false;
+    try
+      TQwen3MoeModel.CreateFromGguf(gdir + Utf8ToString(aFile), fCpu).Free;
+    except
+      on E: EInferError do
+        result := PosEx(aWhy, StringToUtf8(E.Message)) > 0;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  gdir := MakePath([dir, 'gguf'], true);
+  ref := TInferRefSet.CreateFromFolder(dir);
+  a := nil;
+  c := nil;
+  g := nil;
+  try
+    // Q8_0 at load: the router stays F32, the experts in Q8_0
+    a := TQwen3MoeModel.Create(dir, fCpu, idtQ8_0);
+    c := TQwen3MoeModel.Create(dir, fFast, idtQ8_0);
+    Check(a.Layers[0].Router.DType = idtF32, 'router in F32');
+    Check(a.Layers[0].ExpertGate[3].DType = idtQ8_0, 'experts in Q8_0');
+    v := a.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(la, n * v);
+      SetLength(lc, n * v);
+      ca := a.NewContext;
+      cc := c.NewContext;
+      try
+        a.Forward(ca, ids, n, pointer(la), true);
+        c.Forward(cc, ids, n, pointer(lc), true);
+      finally
+        ca.Free;
+        cc.Free;
+      end;
+      cmp := InferCompare(pointer(lc), pointer(la), n * v, 2e-2, 1e-2);
+      CheckUtf8(InferCompareOk(cmp), 'MoE case % Q8_0 float path: %',
+        [k, InferCompareText(cmp)]);
+      // the router of this tiny model is sharp (logits spread by 0.6 weights):
+      // Q8_0 moves a state by up to 0.04 per layer, and token 5 of case 1 by
+      // 0.2 in layer 2 - measured 2026-10-17 max 0.21, cosine 0.9991
+      cmp := InferCompare(pointer(la), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 0.3, 0.3);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.998), 'MoE case % Q8_0 vs FP32: %',
+        [k, InferCompareText(cmp)]);
+      AddConsole(FormatString('MoE case % Q8_0 vs FP32: %', [k, InferCompareText(cmp)]));
+    end;
+    FreeAndNil(c);
+    // GGUF with 3-D expert tensors: every expert byte for byte our own
+    // quantization of it (ggml's reference quantizers), the settings alike
+    for t := idtQ8_0 to idtQ4_0 do
+    begin
+      if t = idtQ8_0 then
+        f := 'q8_0.gguf'
+      else
+        f := 'q4_0.gguf';
+      FreeAndNil(a);
+      FreeAndNil(g);
+      a := TQwen3MoeModel.Create(dir, fCpu, t);
+      g := NewDecoderModelFromGguf(gdir + Utf8ToString(f), fCpu);
+      Check(g is TQwen3MoeModel, 'qwen3moe: a TQwen3MoeModel');
+      Check((g.Config.Experts = a.Config.Experts) and
+        (g.Config.ExpertsUsed = a.Config.ExpertsUsed) and
+        (g.Config.ExpertIntermediate = a.Config.ExpertIntermediate) and
+        g.Config.NormTopK, 'the expert settings of the file');
+      Check((g.Config.Spec[0].Ffn = dfMoe) and (g.Config.Spec[1].Ffn = dfDense) and
+        (g.Config.Spec[2].Ffn = dfMoe), 'dense where ffn_gate_inp is missing');
+      same := true;
+      for l := 0 to g.Config.Layers - 1 do
+        if g.Config.Spec[l].Ffn = dfMoe then
+        begin
+          if not CompareMem(g.Layers[l].Router.Data, a.Layers[l].Router.Data,
+               g.Config.Experts * g.Config.Hidden * SizeOf(single)) then
+            same := false;
+          for e := 0 to g.Config.Experts - 1 do
+            if (g.Layers[l].ExpertGate[e].DType <> t) or
+               (g.Layers[l].ExpertDown[e].DType <> t) or
+               not CompareMem(g.Layers[l].ExpertGate[e].Data, a.Layers[l].ExpertGate[e].Data,
+                 MatrixBytes(g.Layers[l].ExpertGate[e], 64, 64)) or
+               not CompareMem(g.Layers[l].ExpertUp[e].Data, a.Layers[l].ExpertUp[e].Data,
+                 MatrixBytes(g.Layers[l].ExpertUp[e], 64, 64)) or
+               not CompareMem(g.Layers[l].ExpertDown[e].Data, a.Layers[l].ExpertDown[e].Data,
+                 MatrixBytes(g.Layers[l].ExpertDown[e], 64, 64)) then
+              same := false;
+        end
+        else if not CompareMem(g.Layers[l].Gate.Data, a.Layers[l].Gate.Data,
+                  MatrixBytes(g.Layers[l].Gate, 160, 64)) then
+          same := false;
+      CheckUtf8(same, '% experts and router like ours', [f]);
+    end;
+    // the Q4_0 file decodes: its logits close to our Q4_0 model of the same
+    // bytes (the embedding is Q8_0 in the file, BF16 in ours)
+    ids := ref.I32('case0.ids', n);
+    SetLength(la, n * v);
+    SetLength(lc, n * v);
+    ca := a.NewContext;
+    cc := g.NewContext;
+    try
+      a.Forward(ca, ids, n, pointer(la), true);
+      g.Forward(cc, ids, n, pointer(lc), true);
+    finally
+      ca.Free;
+      cc.Free;
+    end;
+    cmp := InferCompare(pointer(lc), pointer(la), n * v, 0.1, 0.1);
+    CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999), 'Q4_0 GGUF vs ours: %',
+      [InferCompareText(cmp)]);
+    Check(Refused('bad-experts.gguf', 'shaped'), 'experts one short refused');
+  finally
+    g.Free;
+    c.Free;
+    a.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.TinyMoeRefused;
+var
+  dir, tmp: TFileName;
+  cfg, why: RawUtf8;
+
+  function LoadRefused(const aFrom, aTo: RawUtf8): boolean;
+  begin
+    result := false;
+    FileFromString(StringReplaceAll(cfg, aFrom, aTo), tmp + 'config.json');
+    try
+      TQwen3MoeModel.Create(tmp, fCpu).Free;
+    except
+      on EInferError do
+        result := true;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  // LF whatever a checkout made of the line ends: the patterns below rely on it
+  cfg := StringReplaceAll(StringFromFile(dir + 'config.json'), #13#10, #10);
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-moe-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  try
+    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
+    Check(not LoadRefused('"x"', '"x"'), 'the copy loads');
+    Check(LoadRefused('"decoder_sparse_step": 1', '"decoder_sparse_step": 0'),
+      'decoder_sparse_step 0');
+    Check(LoadRefused('"num_experts": 8', '"num_expertz": 8'), 'no num_experts');
+    Check(LoadRefused('"num_experts_per_tok": 2', '"num_experts_per_tok": 9'),
+      'more experts per token than experts');
+    Check(LoadRefused('"num_experts": 8', '"num_experts": 7'),
+      'the experts of the file one more');
+    Check(LoadRefused('"moe_intermediate_size": 64', '"moe_intermediate_size": 32'),
+      'the expert width not that of the weights');
+    // decoder_sparse_step 2 and no mlp_only_layers: layers 0 and 2 dense, 1
+    // with experts - the file has it the other way round, the dense block of
+    // layer 0 is missing (the first tensor looked for)
+    FileFromString(StringReplaceAll(StringReplaceAll(cfg,
+      '"decoder_sparse_step": 1', '"decoder_sparse_step": 2'),
+      '"mlp_only_layers": [' + #10 + '  1' + #10 + ' ]', '"mlp_only_layers": []'),
+      tmp + 'config.json');
+    why := '';
+    try
+      TQwen3MoeModel.Create(tmp, fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no tensor model.layers.0.mlp.gate_proj.weight', why) > 0,
+      'layer kinds other than the file: %', [why]);
+    // a qwen3_moe folder is no qwen3 model
+    FileFromString(cfg, tmp + 'config.json');
+    Check(not LoadRefused('"x"', '"x"'), 'restored');
+    try
+      TQwen3Model.Create(tmp, fCpu).Free;
+      Check(false, 'TQwen3Model loads qwen3_moe');
+    except
+      on EInferError do
+        Check(true);
+    end;
   finally
     DirectoryDeleteAll(tmp);
   end;

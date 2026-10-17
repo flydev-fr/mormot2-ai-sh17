@@ -11,8 +11,10 @@
 //   attention, output projection) and a pre-norm SwiGLU feed-forward block,
 //   both with a residual; a final RMSNorm and the language-model head (tied to
 //   the embedding or its own matrix) - TDecoderLayerSpec names the kind of
-//   every layer, so another mixer (sliding window, linear attention) or
-//   another feed-forward block (mixture of experts) docks in there
+//   every layer, so another mixer (sliding window, linear attention) docks in
+//   there; the feed-forward block is dense or a mixture of experts (dfMoe: a
+//   softmax router picks the top k of the experts per token, their SwiGLU
+//   outputs are summed with the router weights, renormed or not)
 // - weights: F32 is used in place (memory-mapped), BF16 widened to F32 once at
 //   load (exact: BF16 is the upper half of an F32); or every matrix quantized
 //   to Q8_0 (or Q4_0) at load, byte for byte as a GGUF writer does it; the
@@ -63,8 +65,13 @@ type
 
   /// the feed-forward block of a layer
   // - dfDense: one SwiGLU block (gate, up, down)
+  // - dfMoe: a mixture of experts - a router (softmax over Experts logits)
+  // picks ExpertsUsed SwiGLU blocks of ExpertIntermediate per token, their
+  // outputs are summed with the router probabilities (renormed to a sum of 1
+  // when NormTopK)
   TDecoderFfn = (
-    dfDense);
+    dfDense,
+    dfMoe);
 
   /// the kind of one layer
   // - all zero (the default of a new array) is attention and a dense block
@@ -87,15 +94,30 @@ type
     RmsEps: double;
     RopeTheta: double;
     TiedEmbeddings: boolean;
+    /// the experts of a dfMoe layer (0 without one)
+    Experts: PtrInt;
+    /// the experts a token goes through (top k)
+    ExpertsUsed: PtrInt;
+    /// the hidden width of one expert
+    ExpertIntermediate: PtrInt;
+    /// the weights of the chosen experts renormed to a sum of 1
+    NormTopK: boolean;
     /// the kind of every layer ([Layers]) - a family that leaves it empty
     // gets attention and a dense block in every layer
     Spec: TDecoderLayerSpecDynArray;
   end;
 
+  /// weights by expert
+  TInferWeightDynArray = array of TInferWeight;
+
   /// the weights of one decoder layer - F32 views
+  // - Gate, Up and Down for a dfDense layer; Router ([Experts, Hidden], F32)
+  // and ExpertGate, ExpertUp, ExpertDown ([Experts] each) for a dfMoe one
   TDecoderLayer = record
     Q, K, V, O, Gate, Up, Down: TInferWeight;
     QNorm, KNorm, InputNorm, PostNorm: PSingleArray;
+    Router: TInferWeight;
+    ExpertGate, ExpertUp, ExpertDown: TInferWeightDynArray;
   end;
   TDecoderLayerDynArray = array of TDecoderLayer;
 
@@ -125,6 +147,11 @@ type
     fIds: TIntegerDynArray; // [capacity] the token at every cached position
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
     fCos, fSin: TSingleDynArray; // [new tokens, HeadDim / 2] rotary factors
+    // a dfMoe layer: router logits [new tokens, Experts], the chosen experts
+    // and their weights [new tokens, ExpertsUsed], the rows of one expert
+    // (gathered input, output, row index, weight)
+    fRoute, fChosenW, fGather, fExpertOut, fRowW: TSingleDynArray;
+    fChosen, fRow: TIntegerDynArray;
     function GetId(aPosition: PtrInt): integer;
   public
     /// forget the cached tokens - the buffers stay allocated
@@ -187,6 +214,13 @@ type
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
     function Matrix(const aName: RawUtf8; aRows, aCols: Int64;
       aType: TInferDType): TInferWeight;
+    /// the experts of a GGUF tensor [aExperts, aRows, aCols] (by its llama.cpp
+    // name): one view per expert into the blocks as stored - Q8_0, Q4_0, Q4_K
+    // or Q6_K
+    function GgufExperts(const aGgufName: RawUtf8;
+      aExperts, aRows, aCols: Int64): TInferWeightDynArray;
+    /// a BF16 or F16 tensor widened to F32, kept with the model
+    function WidenTensor(t: PInferTensor; const aName: RawUtf8): PSingleArray;
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
@@ -199,6 +233,13 @@ type
     /// the dfDense block of layer aLayer, its output added to fX
     procedure DenseBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
       const aOnState: TOnDecoderState);
+    /// the dfMoe block of layer aLayer, its output added to fX
+    procedure MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+      const aOnState: TOnDecoderState);
+    /// the experts of one token from its router logits: aChosen and aWeights
+    // ([ExpertsUsed] each), highest probability first
+    procedure Route(aLogits: PSingleArray; aChosen: PIntegerArray;
+      aWeights: PSingleArray);
     procedure SetDevice(aDevice: TDecoderDevice);
   public
     /// the model_type of a Hugging Face config.json this class loads
@@ -420,6 +461,7 @@ begin
   LoadConfig(IncludeTrailingPathDelimiter(aFolder) + 'config.json');
   if (aWeights <> idtF32) and
      ((fConfig.Hidden and 31 <> 0) or (fConfig.Intermediate and 31 <> 0) or
+      (fConfig.ExpertIntermediate and 31 <> 0) or
       ((fConfig.Heads * fConfig.HeadDim) and 31 <> 0)) then
     EInferError.RaiseUtf8('%: % needs widths that are multiples of 32',
       [self, INFER_DTYPE_NAME[aWeights]]);
@@ -449,6 +491,7 @@ end;
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
 var
   i: PtrInt;
+  moe: boolean;
 begin
   // every dimension bounded on its own before any product: a product of
   // unbounded values could wrap around and pass
@@ -471,6 +514,22 @@ begin
   else if length(fConfig.Spec) <> fConfig.Layers then
     EInferError.RaiseUtf8('%: % layer kinds for % layers',
       [self, length(fConfig.Spec), fConfig.Layers]);
+  // experts only with a dfMoe layer, and then bounded
+  moe := false;
+  for i := 0 to high(fConfig.Spec) do
+    if fConfig.Spec[i].Ffn = dfMoe then
+      moe := true;
+  if moe then
+  begin
+    if (fConfig.Experts <= 0) or (fConfig.Experts > 1 shl 12) or
+       (fConfig.ExpertsUsed <= 0) or (fConfig.ExpertsUsed > fConfig.Experts) or
+       (fConfig.ExpertIntermediate <= 0) or (fConfig.ExpertIntermediate > 1 shl 18) then
+      EInferError.RaiseUtf8('%: % has invalid experts (% of %, width %)', [self,
+        aSource, fConfig.ExpertsUsed, fConfig.Experts, fConfig.ExpertIntermediate]);
+  end
+  else if (fConfig.Experts <> 0) or (fConfig.ExpertsUsed <> 0) or
+          (fConfig.ExpertIntermediate <> 0) then
+    EInferError.RaiseUtf8('%: % has experts but no layer uses them', [self, aSource]);
   // inverse rotary frequencies as the reference forms them in float32:
   // 1 / theta ^ (2i / d), each step rounded to single
   SetLength(fInvFreq, fConfig.HeadDim shr 1);
@@ -553,16 +612,21 @@ function TDecoderModel.Weight(const aName: RawUtf8;
   const aDims: array of Int64): PSingleArray;
 var
   t: PInferTensor;
+begin
+  t := Checked(aName, aDims);
+  if t^.DType = idtF32 then
+    result := t^.Data
+  else
+    result := WidenTensor(t, aName);
+end;
+
+function TDecoderModel.WidenTensor(t: PInferTensor;
+  const aName: RawUtf8): PSingleArray;
+var
   i, n: PtrInt;
   src: PWordArray;
   dst: PCardinalArray;
 begin
-  t := Checked(aName, aDims);
-  if t^.DType = idtF32 then
-  begin
-    result := t^.Data;
-    exit;
-  end;
   // BF16 is the upper half of an F32, F16 a subset of it: widening is exact
   if t^.Count > High(PtrInt) div 4 then
     EInferError.RaiseUtf8('%: % too large', [self, aName]);
@@ -637,6 +701,35 @@ procedure TDecoderModel.CheckBlockScales(aTensor: PInferTensor;
   const aName: RawUtf8);
 begin
   CheckScales(aTensor, aName, self);
+end;
+
+function TDecoderModel.GgufExperts(const aGgufName: RawUtf8;
+  aExperts, aRows, aCols: Int64): TInferWeightDynArray;
+var
+  t: PInferTensor;
+  e: PtrInt;
+  size: Int64;
+  p: PByteArray;
+begin
+  t := fGguf.FindTensor(aGgufName);
+  if t = nil then
+    EInferError.RaiseUtf8('%: no tensor % in %', [self, aGgufName, fGguf.FileName]);
+  if not InferShapeIs(t^, [aExperts, aRows, aCols]) then
+    EInferError.RaiseUtf8('%: % is shaped %, expected [%,%,%]',
+      [self, aGgufName, InferShapeText(t^.Shape), aExperts, aRows, aCols]);
+  if not (t^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) then
+    EInferError.RaiseUtf8('%: % is %, not supported for experts here',
+      [self, aGgufName, INFER_DTYPE_NAME[t^.DType]]);
+  if not fBackend.Supports(ioLinear, t^.DType) then
+    EInferError.RaiseUtf8('%: the backend has no % Linear for %',
+      [self, INFER_DTYPE_NAME[t^.DType], aGgufName]);
+  CheckScales(t, aGgufName, self);
+  // one expert: aRows rows of whole blocks, right after the one before
+  p := t^.Data;
+  size := (aRows * aCols div INFER_DTYPE_BLOCK[t^.DType]) * INFER_DTYPE_SIZE[t^.DType];
+  SetLength(result, aExperts);
+  for e := 0 to aExperts - 1 do
+    result[e] := InferWeight(@p^[e * size], t^.DType);
 end;
 
 function TDecoderModel.Matrix(const aName: RawUtf8; aRows, aCols: Int64;
@@ -790,10 +883,22 @@ begin
   Need(aCtx.fAttn, aNew * fConfig.Heads * fConfig.HeadDim);
   Need(aCtx.fK, aNew * kvw);
   Need(aCtx.fV, aNew * kvw);
-  Need(aCtx.fGate, aNew * fConfig.Intermediate);
-  Need(aCtx.fUp, aNew * fConfig.Intermediate);
+  Need(aCtx.fGate, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
+  Need(aCtx.fUp, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
   Need(aCtx.fCos, aNew * (fConfig.HeadDim shr 1));
   Need(aCtx.fSin, aNew * (fConfig.HeadDim shr 1));
+  if fConfig.Experts > 0 then
+  begin
+    Need(aCtx.fRoute, aNew * fConfig.Experts);
+    Need(aCtx.fChosenW, aNew * fConfig.ExpertsUsed);
+    Need(aCtx.fGather, aNew * fConfig.Hidden);
+    Need(aCtx.fExpertOut, aNew * fConfig.Hidden);
+    Need(aCtx.fRowW, aNew);
+    if length(aCtx.fChosen) < aNew * fConfig.ExpertsUsed then
+      SetLength(aCtx.fChosen, aNew * fConfig.ExpertsUsed);
+    if length(aCtx.fRow) < aNew then
+      SetLength(aCtx.fRow, aNew);
+  end;
 end;
 
 procedure TDecoderModel.RopeFactors(aCtx: TDecoderContext; aRows, aFirstPos: PtrInt);
@@ -896,6 +1001,105 @@ begin
   fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
+procedure TDecoderModel.Route(aLogits: PSingleArray; aChosen: PIntegerArray;
+  aWeights: PSingleArray);
+var
+  i, j, t, best, e, k: PtrInt;
+  m, sum, picked: double;
+  taken: boolean;
+begin
+  e := fConfig.Experts;
+  k := fConfig.ExpertsUsed;
+  // softmax in double: the probabilities of all experts
+  m := aLogits^[0];
+  for i := 1 to e - 1 do
+    if aLogits^[i] > m then
+      m := aLogits^[i];
+  sum := 0;
+  for i := 0 to e - 1 do
+    sum := sum + Exp(aLogits^[i] - m);
+  // the k highest logits (the highest probabilities), the lower id on a tie
+  picked := 0;
+  for j := 0 to k - 1 do
+  begin
+    best := -1;
+    for i := 0 to e - 1 do
+    begin
+      taken := false;
+      for t := 0 to j - 1 do
+        if aChosen^[t] = i then
+          taken := true;
+      if not taken and ((best < 0) or (aLogits^[i] > aLogits^[best])) then
+        best := i;
+    end;
+    aChosen^[j] := best;
+    aWeights^[j] := Exp(aLogits^[best] - m) / sum;
+    picked := picked + aWeights^[j];
+  end;
+  if fConfig.NormTopK then
+    for j := 0 to k - 1 do
+      aWeights^[j] := aWeights^[j] / picked;
+end;
+
+procedure TDecoderModel.MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+  const aOnState: TOnDecoderState);
+var
+  n, h, fi, k, e, r, j, c, cnt, i: PtrInt;
+  w: single;
+  ly: ^TDecoderLayer;
+  src, dst: PSingleArray;
+begin
+  ly := @fLayer[aLayer];
+  n := aRows;
+  h := fConfig.Hidden;
+  fi := fConfig.ExpertIntermediate;
+  k := fConfig.ExpertsUsed;
+  // pre-norm, the router: its logits, then the experts of every token
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts, nil,
+    pointer(aCtx.fRoute));
+  for r := 0 to n - 1 do
+    Route(@aCtx.fRoute[r * fConfig.Experts], @aCtx.fChosen[r * k],
+      @aCtx.fChosenW[r * k]);
+  FillCharFast(pointer(aCtx.fTmp)^, n * h * SizeOf(single), 0);
+  // expert by expert, in id order (as the reference adds them): its tokens
+  // gathered, one SwiGLU block over them, weighted into their rows
+  for e := 0 to fConfig.Experts - 1 do
+  begin
+    cnt := 0;
+    for r := 0 to n - 1 do
+      for j := 0 to k - 1 do
+        if aCtx.fChosen[r * k + j] = e then
+        begin
+          aCtx.fRow[cnt] := r;
+          aCtx.fRowW[cnt] := aCtx.fChosenW[r * k + j];
+          MoveFast(aCtx.fH[r * h], aCtx.fGather[cnt * h], h * SizeOf(single));
+          inc(cnt);
+        end;
+    if cnt = 0 then
+      continue;
+    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertGate[e], fi, nil,
+      pointer(aCtx.fGate));
+    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertUp[e], fi, nil,
+      pointer(aCtx.fUp));
+    fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), cnt * fi);
+    fBackend.Linear(pointer(aCtx.fGate), cnt, fi, ly^.ExpertDown[e], h, nil,
+      pointer(aCtx.fExpertOut));
+    for c := 0 to cnt - 1 do
+    begin
+      w := aCtx.fRowW[c];
+      src := @aCtx.fExpertOut[c * h];
+      dst := @aCtx.fTmp[aCtx.fRow[c] * h];
+      for i := 0 to h - 1 do
+        dst^[i] := dst^[i] + w * src^[i];
+    end;
+  end;
+  if Assigned(aOnState) and (aLayer = 0) then
+    aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
+  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
+end;
+
 /// 'layerNN' - two digits at least, like the reference ('layer%02d')
 function LayerName(aLayer: PtrInt): RawUtf8;
 begin
@@ -932,7 +1136,8 @@ begin
       [self, past, aCount, fConfig.MaxPositions]);
   n := aCount;
   h := fConfig.Hidden;
-  f := fConfig.Intermediate;
+  f := MaxPtrInt(fConfig.Intermediate,
+    MaxPtrInt(fConfig.ExpertIntermediate, fConfig.Experts));
   qw := fConfig.Heads * fConfig.HeadDim;
   if n > (High(PtrInt) div SizeOf(single)) div MaxPtrInt(f, MaxPtrInt(h, qw)) then
     EInferError.RaiseUtf8('%.Forward: % tokens too many at once', [self, n]);
@@ -958,6 +1163,8 @@ begin
     case fConfig.Spec[l].Ffn of
       dfDense:
         DenseBlock(aCtx, l, n, aOnState);
+      dfMoe:
+        MoeBlock(aCtx, l, n, aOnState);
     end;
     if Assigned(aOnState) then
       aOnState(LayerName(l), pointer(aCtx.fX), n, h);

@@ -59,6 +59,7 @@ Ziele:
   jedes Paar und Starter mal Zeichen trifft. Der HF-Normalisierer beruht auf älteren
   Unicode-Daten als Python, deshalb ist er der Vertrag und nicht `unicodedata`.
 - `qwen3-tokens` und `qwen3-chat` sind die Gates von 2a.
+- `tiny-qwen3moe` gehört zu Phase D (D2, MoE).
 - `tiny-qwen3` und `qwen3` gehören zu 2b und 2c. Das echte Modell braucht rund 6 GB RAM
   und läuft auf einem Thread einige Minuten.
 

@@ -1383,5 +1383,7 @@ end;
 initialization
   RegisterNativeFamily(TQwen3Model, TBpeTokenizer, TQwen3ChatTemplate,
     TQwen3OutputParser);
+  RegisterNativeFamily(TQwen3MoeModel, TBpeTokenizer, TQwen3ChatTemplate,
+    TQwen3OutputParser);
 
 end.

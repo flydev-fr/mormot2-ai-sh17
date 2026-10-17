@@ -207,6 +207,10 @@ nutzen. Decode rechnet nur die gewählten Experten, Prefill gruppiert die Tokens
 Erstes Modell **Qwen3-30B-A3B** (nur Zwischenschritt für MoE, kein Kandidat): reines MoE ohne neuen Tokenizer, ohne Sliding Window, ohne
 neues Quant-Format. Gate: Tiny-Qwen3-MoE gegen `transformers` (Experten-IDs, Gewichte,
 Logits), Einzeltoken und Prefill gleich; Qwen3-30B-A3B Q4_K_M auf dem RTX-Rechner.
+*Erledigt 2026-10-17* (`native-inference.md`, Phase D): `dfMoe`, `TQwen3MoeModel` aus
+safetensors und GGUF; Router nur Softmax (Sigmoid kommt mit Kolibri, D8). Qwen3-30B-A3B auf
+der CPU des RTX-Rechners: Decode 16, Prefill 85 Tokens/s, antwortet richtig. Prefill
+verliert Zeit in vielen kleinen Produkten (128 Experten mit je wenigen Tokens).
 
 **D3 — MoE auf CUDA und Vulkan.** Expertenauswahl bleibt auf dem Gerät; Decode mit kleinen
 Produkten der gewählten Experten, Prefill gruppiert. Erst korrekt ohne CUDA-Graph, danach ein
@@ -468,3 +472,70 @@ letzte Teil zu groß - alle acht scheitern.
 Prefill 368 und Decode 30 Tokens/s, die CPU desselben Rechners (8 Threads, NEON-Dotprod) 639
 und 68. Die Adreno rechnet richtig, lohnt sich aber nicht; die Shader sind nicht auf sie
 abgestimmt (`matvec8` dort aus, `gemm8` für RTX und M2 Pro gemessen).
+
+---
+
+## B12 — Telemetrie: Auslastung, Takt, Temperatur, Leistung (aufgenommen 2026-10-17)
+
+Einordnung: nach D3 (MoE auf der GPU), dann sind die GPU-Werte der großen Modelle
+aussagekräftig. Anlass: die Frage, was ein Lauf von Qwen3-30B-A3B auf der CPU an Last und
+Wärme erzeugt - die Engine kann es heute nicht sagen, nur ein Skript von außen
+(Windows-Leistungsindikatoren und `nvidia-smi`).
+
+**Ziel:** eine Unit `mormot.ai.infer.telemetry`, die einen Messwert-Satz liefert, so weit die
+Plattform ihn hergibt, und sagt, was fehlt (kein stilles 0):
+
+| Wert | Windows | Linux | macOS |
+|---|---|---|---|
+| CPU-Auslastung | `GetSystemTimes` | `/proc/stat` | `host_processor_info` |
+| effektiver CPU-Takt | `CallNtPowerInformation` (`ProcessorInformation`: aktuelle und maximale MHz je Kern) | `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` | offen (vermutlich nicht ohne private Schnittstellen) |
+| CPU-Temperatur | nicht ohne Sensortreiber (ACPI-Zonen meist leer) | hwmon (`coretemp`, `k10temp`; schon in `mormot.ai.governor`) | nein |
+| GPU NVIDIA: Leistung, Temperatur, Auslastung, Takt | NVML (`nvml.dll` kommt mit dem Treiber; zur Laufzeit laden wie `libcuda`, nichts mitliefern) | NVML (`libnvidia-ml.so.1`) | - |
+| GPU AMD | offen | hwmon von `amdgpu` | - |
+| GPU Apple | - | - | keine öffentliche Schnittstelle |
+
+**Verwendung:**
+
+1. `mormot.ai.governor`: drosseln nach echten Signalen - sinkender Takt bei voller Last
+   (thermische Drosselung), GPU-Temperatur oder -Leistung über einer Schwelle - statt nur
+   nach der Durchsatz-Heuristik.
+2. `llm-bench` und `TNativeLlmClient`: je Lauf Mittel und Spitze von Auslastung, Takt,
+   Leistung und Temperatur; daraus Tokens je Joule für den Dauerbetrieb.
+3. Verteilte Ausführung (`docs/distributed-execution.md`): ein Rechner meldet, ob er frei und
+   kühl genug für weitere Jobs ist.
+
+**Regeln:** keine DLL mitliefern, Bibliotheken des Treibers nur zur Laufzeit laden und ihr
+Fehlen melden; Abfragen billig genug für einmal je Sekunde neben einem Lauf; Delphi 7 bis 13
+und FPC wie überall.
+
+**Fertig, wenn:** die Werte auf dem RTX-Rechner (Windows, NVIDIA), unter WSL bzw. Linux und
+auf dem M2 Pro gegen eine Gegenmessung stimmen (Windows-Leistungsindikatoren, `nvidia-smi`,
+`sensors`), der Governor mit einem Takt- oder Temperatursignal drosselt (Test mit
+eingespeisten Werten) und `llm-bench` die Werte ausgibt.
+
+**Ausgangswert (2026-10-17, RTX-Rechner, i9-14900K + RTX 5090, über SSH gemessen;
+Auslastung per `GetSystemTimes`, GPU per `nvidia-smi`, je Sekunde):**
+
+| Lauf | CPU | GPU-Leistung | GPU-Temperatur | GPU-Last, Takt |
+|---|---|---|---|---|
+| Leerlauf | 4 % | 20 W | 41 °C | - |
+| Qwen3-30B-A3B Q4_K_M, CPU, 22 Threads: Prefill 2000 Tokens (67 Tokens/s), 256 Tokens Decode (11 Tokens/s), 52 s | 69 % (22 von 32 Threads voll) | 19 W | 40 °C | 0 % |
+| Qwen3-0.6B Q8_0, Vulkan: Prefill 8000 (6786/s), 2048 Decode (254/s), 10 s | 6 % | Mittel 318 W, Spitze 477 W | 51 bis 56 °C | 85 %, 2,76 GHz |
+| dasselbe, CUDA: Prefill 7500/s, Decode 304/s | 7 % | Mittel 341 W, Spitze 495 W | 50 bis 53 °C | 90 %, 2,75 GHz |
+
+Die GPU-Läufe sind zu kurz für einen Wärme-Gleichgewichtszustand. Selbst das kleine Modell
+treibt die 5090 an ihre Leistungsgrenze (rund 0,8 Decode-Tokens je Joule bei Vulkan).
+
+**Befunde für den Bau:**
+
+- In einer SSH-Sitzung (Dienstanmeldung) verweigert Windows Leistungsindikatoren
+  (`Get-Counter`: c0000bc8) und WMI (`Win32_PerfFormattedData_*`, `MSAcpi_ThermalZone`:
+  Zugriff verweigert). Die Telemetrie muss die Win32-API direkt nehmen; `GetSystemTimes`
+  geht.
+- `CallNtPowerInformation(ProcessorInformation)` meldet als `CurrentMhz` durchgehend 3200,
+  den Basistakt, auch unter Volllast - für den effektiven Takt unbrauchbar. Offen bleibt,
+  was ohne Treiber den echten Takt liefert (Leistungsindikator `% Processor Performance`
+  nur mit Rechten; APERF/MPERF nur im Kernel). Eine Drosselung wäre dann nur über den
+  Durchsatz zu erkennen, wie heute im Governor.
+- CPU-Temperatur und -Leistung: unter Windows ohne Sensortreiber nicht zu bekommen,
+  bestätigt.

@@ -1,0 +1,34 @@
+{
+ "dataset": "tiny-qwen3moe/gguf",
+ "environment": {
+  "created_utc": "2026-10-17T12:20:57Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "note": "tiny-qwen3moe as qwen3moe GGUF files: q8_0 and q4_0 matrices from ggml's reference quantizers (token_embd Q8_0, norms and routers F32), the experts of layers 0 and 2 as 3-D tensors, layer 1 dense; bad-experts: ffn_up_exps of layer 2 with 7 instead of 8 experts",
+ "files": {
+  "bad-experts.gguf": "5933c876733ba376f86dd16c45ed62a95952c600531f03ab6523387f4e5ac2c4",
+  "q4_0.gguf": "fca2ca8e5733592e9ae9e57c0bdd176a150715958a081b836acfdc5687048054",
+  "q8_0.gguf": "7e96fbe86ca30e96e06c090e6e04f9b71f6035267fa6dedf50a0516bb6e9e520"
+ }
+}

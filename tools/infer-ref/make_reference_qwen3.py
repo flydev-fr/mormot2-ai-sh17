@@ -11,6 +11,10 @@ Targets (all of them when called without arguments):
                  with every state, the logits and greedy continuations
   tiny-qwen3-gguf tests/data/infer-ref/tiny-qwen3-gguf: tiny-qwen3 as GGUF files (Q8_0,
                  Q4_0 and F16 from ggml's quantizers) and damaged variants
+  tiny-qwen3moe  tests/data/infer-ref/tiny-qwen3moe: a seeded 3-layer Qwen3-MoE (layers 0
+                 and 2 with 8 experts, top 2; layer 1 dense), every state, the logits
+                 and greedy continuations; its variant without normed top-k weights;
+                 and both as GGUF files with 3-D expert tensors (Q8_0, Q4_0)
   qwen3          tests/data/infer-ref/qwen3: Qwen3-0.6B in FP32 - states, logits and
                  greedy continuations of a fixed prompt set (the gate of phase 2)
 
@@ -1132,11 +1136,261 @@ def tiny_qwen3_gguf():
         json.dump(manifest, f, indent=1)
 
 
+# ---------------------------------------------------------------- tiny Qwen3-MoE
+
+QWEN3MOE_SPARSE = [0, 2]  # the layers with experts; layer 1 is dense (mlp_only_layers)
+
+
+def tiny_qwen3moe():
+    """a seeded Qwen3-MoE: the router (softmax, top-k, normed or not), the experts,
+    a dense layer between sparse ones - transformers' Qwen3MoeForCausalLM"""
+    print("tiny Qwen3-MoE")
+    # the first seed whose router keeps a clear gap between the k-th and the
+    # (k+1)-th logit for every token: the expert choice must not hang on rounding
+    for seed in range(TINY_SEED + 2, TINY_SEED + 202):
+        model, cfg = moe_model(seed)
+        gap = min(router_margin(model, ids) for ids in moe_cases())
+        if gap >= MOE_ROUTER_GAP:
+            break
+    else:
+        raise ValueError("no seed with a clear router")
+    print(f"  seed {seed}, smallest router logit gap {gap:.4f}")
+    folder = os.path.join(mr.OUT, "tiny-qwen3moe")
+    write_moe(model, cfg, folder, "tiny-qwen3moe", True, seed)
+    # the same weights, the top-k weights not normed (norm_topk_prob false)
+    write_moe(model, cfg, os.path.join(folder, "unnormed"), "tiny-qwen3moe/unnormed",
+              False, seed)
+
+
+MOE_ROUTER_GAP = 0.05
+
+
+def moe_cases():
+    rng = np.random.default_rng(TINY_SEED + 2)
+    return [rng.integers(3, 96, size=n).tolist() for n in (5, 9, 13)]
+
+
+def moe_model(seed):
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+    torch.manual_seed(seed)
+    cfg = Qwen3MoeConfig(
+        vocab_size=96, hidden_size=64, intermediate_size=160, moe_intermediate_size=64,
+        num_experts=8, num_experts_per_tok=2, norm_topk_prob=True, decoder_sparse_step=1,
+        mlp_only_layers=[1], num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=32, max_position_embeddings=512, rms_norm_eps=1e-6,
+        rope_theta=1000000.0, tie_word_embeddings=True, attention_bias=False,
+        hidden_act="silu", bos_token_id=1, eos_token_id=2, pad_token_id=0,
+        use_sliding_window=False, attn_implementation="eager")
+    model = Qwen3MoeForCausalLM(cfg)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1:
+                p.copy_(1.0 + 0.25 * torch.randn_like(p))
+            elif name.endswith("mlp.gate.weight"):
+                # a router that decides: its logits spread over several units
+                p.copy_(0.6 * torch.randn_like(p))
+            else:
+                p.copy_(0.08 * torch.randn_like(p))
+            p.copy_(p.to(torch.bfloat16).to(torch.float32))
+    model.eval()
+    return model, cfg
+
+
+def write_moe(model, cfg, folder, dataset, normed, seed):
+    from transformers import Qwen3MoeForCausalLM
+    os.makedirs(folder, exist_ok=True)
+    cfg.norm_topk_prob = normed
+    model.config.norm_topk_prob = normed
+    # BF16 in the file, like the checkpoints (the weights are BF16-exact)
+    model.to(torch.bfloat16)
+    model.save_pretrained(folder, safe_serialization=True)
+    model.to(torch.float32)
+    st = os.path.join(folder, "model.safetensors")
+    # the config as the checkpoints write it (num_experts, not transformers 5's
+    # num_local_experts), minus what only training reads
+    with open(os.path.join(folder, "config.json"), encoding="utf-8") as f:
+        d = json.load(f)
+    for k in ("transformers_version", "router_aux_loss_coef", "output_router_logits",
+              "use_cache", "initializer_range", "attention_dropout", "dtype"):
+        d.pop(k, None)
+    d["num_experts"] = d.pop("num_local_experts")
+    d["torch_dtype"] = "bfloat16"
+    d["architectures"] = ["Qwen3MoeForCausalLM"]
+    with open(os.path.join(folder, "config.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(d, f, indent=1)
+        f.write("\n")
+    for extra in ("generation_config.json",):
+        if os.path.exists(os.path.join(folder, extra)):
+            os.remove(os.path.join(folder, extra))
+    back = Qwen3MoeForCausalLM.from_pretrained(folder, dtype=torch.float32,
+                                               attn_implementation="eager")
+    back.eval()
+    if back.config.norm_topk_prob != normed:
+        raise ValueError("norm_topk_prob not taken over")
+    seqs = moe_cases()
+    if not normed:
+        seqs = seqs[:1]
+    blob = mr.Blob()
+    entries = []
+    for k, ids in enumerate(seqs):
+        a = record(back, ids)
+        b = record(back, ids)
+        for name in a:
+            if not np.array_equal(a[name], b[name]):
+                raise ValueError(f"{dataset} {k} {name}: two runs differ")
+        e = {"case": k, "ids": ids, "tokens": len(ids)}
+        blob.add(f"case{k}.ids", np.array(ids, dtype=np.int64))
+        for name, v in a.items():
+            blob.add(f"case{k}.{name}", v)
+        new, margins = greedy(back, ids, 16, [2])
+        if greedy_no_cache(back, ids, 16, [2]) != new:
+            raise ValueError(f"{dataset} {k}: greedy with and without cache differ")
+        blob.add(f"case{k}.greedy", np.array(new, dtype=np.int64))
+        blob.add(f"case{k}.greedy_margin", np.array(margins, dtype=np.float32))
+        e["greedy"] = new
+        e["min_margin"] = min(margins)
+        e["router_gap"] = router_margin(back, ids)
+        entries.append(e)
+    manifest = {
+        "dataset": dataset,
+        "note": "seeded Qwen3-MoE, 3 layers (0 and 2: 8 experts of 64, top 2, softmax "
+                "router, norm_topk_prob " + str(normed).lower() + "; 1: dense SwiGLU of "
+                "160), hidden 64, 4 heads / 2 KV heads, head_dim 32, tied embeddings, BF16 "
+                "weights. The contract is model.safetensors + config.json (experts stored "
+                "one by one, as the Hugging Face checkpoints). States as tiny-qwen3; "
+                "router_gap: the smallest gap between the k-th and the (k+1)-th router "
+                f"logit over every token and sparse layer (seed {seed}: the first one "
+                f"with every gap >= {MOE_ROUTER_GAP})",
+        "config": json.load(open(os.path.join(folder, "config.json"), encoding="utf-8")),
+        "safetensors_sha256": mr.sha256_file(st),
+        "environment": mr.environment(),
+        "cases": entries,
+    }
+    blob.write(folder, manifest)
+
+
+def router_margin(model, ids):
+    """the smallest gap between the k-th and the (k+1)-th router logit: a tiny
+    gap would make the expert choice depend on rounding"""
+    gaps = []
+    hooks = []
+
+    def hook(mod, inp, out):
+        top = torch.topk(out[0].double(), mod.top_k + 1, dim=-1).values
+        gaps.append(float((top[:, mod.top_k - 1] - top[:, mod.top_k]).min()))
+
+    for i in QWEN3MOE_SPARSE:
+        hooks.append(model.model.layers[i].mlp.gate.register_forward_hook(hook))
+    try:
+        with torch.no_grad():
+            model(input_ids=torch.tensor([ids]), use_cache=False)
+    finally:
+        for h in hooks:
+            h.remove()
+    return min(gaps)
+
+
+QWEN3MOE_GGUF_LAYER = [
+    ("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"),
+    ("self_attn.v_proj", "attn_v"), ("self_attn.o_proj", "attn_output"),
+    ("self_attn.q_norm", "attn_q_norm"), ("self_attn.k_norm", "attn_k_norm"),
+    ("input_layernorm", "attn_norm"), ("post_attention_layernorm", "ffn_norm")]
+
+
+def tiny_qwen3moe_gguf():
+    """tiny-qwen3moe as llama.cpp writes a qwen3moe file: the router as
+    ffn_gate_inp (F32), the experts of a layer as one 3-D tensor each
+    (ffn_gate_exps, ffn_up_exps [experts, out, in]; ffn_down_exps), the dense layer
+    with ffn_gate/up/down - and a damaged variant"""
+    print("tiny-qwen3moe-gguf")
+    from safetensors.torch import load_file
+    g = mr.Ggml()
+    folder = os.path.join(mr.OUT, "tiny-qwen3moe", "gguf")
+    os.makedirs(folder, exist_ok=True)
+    src = os.path.join(mr.OUT, "tiny-qwen3moe")
+    cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+    sd = {k: v.float().numpy() for k, v in
+          load_file(os.path.join(src, "model.safetensors")).items()}
+    arch = "qwen3moe"
+    kv = [("general.architecture", "str", arch),
+          ("general.name", "str", "tiny-qwen3moe"),
+          (arch + ".block_count", "u32", cfg["num_hidden_layers"]),
+          (arch + ".context_length", "u32", cfg["max_position_embeddings"]),
+          (arch + ".embedding_length", "u32", cfg["hidden_size"]),
+          (arch + ".feed_forward_length", "u32", cfg["intermediate_size"]),
+          (arch + ".attention.head_count", "u32", cfg["num_attention_heads"]),
+          (arch + ".attention.head_count_kv", "u32", cfg["num_key_value_heads"]),
+          (arch + ".rope.freq_base", "f32", cfg["rope_parameters"]["rope_theta"]),
+          (arch + ".attention.layer_norm_rms_epsilon", "f32", cfg["rms_norm_eps"]),
+          (arch + ".attention.key_length", "u32", cfg["head_dim"]),
+          (arch + ".attention.value_length", "u32", cfg["head_dim"]),
+          (arch + ".expert_count", "u32", cfg["num_experts"]),
+          (arch + ".expert_used_count", "u32", cfg["num_experts_per_tok"]),
+          (arch + ".expert_feed_forward_length", "u32", cfg["moe_intermediate_size"])]
+
+    def tensors(matrix):
+        out = []
+
+        def add(name, a, kind):
+            a = np.ascontiguousarray(a, dtype=np.float32)
+            ne = list(reversed(a.shape))
+            rows = a.reshape(-1, a.shape[-1])
+            if kind == "f32":
+                out.append((name, 0, ne, a.tobytes()))
+            elif kind == "q8":
+                out.append((name, 8, ne, b"".join(g.quant_ref(r) for r in rows)))
+            else:
+                out.append((name, 2, ne, b"".join(g.quant_q4(r) for r in rows)))
+
+        add("token_embd.weight", sd["model.embed_tokens.weight"], "q8")
+        add("output_norm.weight", sd["model.norm.weight"], "f32")
+        for i in range(cfg["num_hidden_layers"]):
+            p = f"model.layers.{i}."
+            for hf, gg in QWEN3MOE_GGUF_LAYER:
+                a = sd[p + hf + ".weight"]
+                add(f"blk.{i}.{gg}.weight", a, "f32" if a.ndim == 1 else matrix)
+            if i in QWEN3MOE_SPARSE:
+                add(f"blk.{i}.ffn_gate_inp.weight", sd[p + "mlp.gate.weight"], "f32")
+                n = cfg["num_experts"]
+                for hf, gg in (("gate_proj", "ffn_gate_exps"), ("up_proj", "ffn_up_exps"),
+                               ("down_proj", "ffn_down_exps")):
+                    a = np.stack([sd[p + f"mlp.experts.{e}.{hf}.weight"] for e in range(n)])
+                    add(f"blk.{i}.{gg}.weight", a, matrix)
+            else:
+                for hf, gg in (("gate_proj", "ffn_gate"), ("up_proj", "ffn_up"),
+                               ("down_proj", "ffn_down")):
+                    add(f"blk.{i}.{gg}.weight", sd[p + f"mlp.{hf}.weight"], matrix)
+        return out
+
+    files = {"q8_0.gguf": (kv, tensors("q8")), "q4_0.gguf": (kv, tensors("q4"))}
+    # damaged: the experts of layer 2 one short
+    short = []
+    for t in tensors("q8"):
+        if t[0] == "blk.2.ffn_up_exps.weight":
+            ne = list(t[2])
+            ne[2] -= 1
+            t = (t[0], t[1], ne, t[3][:len(t[3]) * ne[2] // (ne[2] + 1)])
+        short.append(t)
+    files["bad-experts.gguf"] = (kv, short)
+    for name, (kvs, tens) in files.items():
+        mr.gguf_write(os.path.join(folder, name), kvs, tens)
+    manifest = {"dataset": "tiny-qwen3moe/gguf", "environment": mr.environment(),
+                "ggml": {"dir": os.path.relpath(mr.GGML_DIR, mr.ROOT), "sha256": g.libs},
+                "note": "tiny-qwen3moe as qwen3moe GGUF files: q8_0 and q4_0 matrices from "
+                        "ggml's reference quantizers (token_embd Q8_0, norms and routers "
+                        "F32), the experts of layers 0 and 2 as 3-D tensors, layer 1 dense; "
+                        "bad-experts: ffn_up_exps of layer 2 with 7 instead of 8 experts",
+                "files": {n: mr.sha256_file(os.path.join(folder, n)) for n in sorted(files)}}
+    with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1)
+
+
 def main():
     mr.setup_determinism()
     what = set(sys.argv[1:]) or {"qwen3-unicode", "qwen3-tokens", "qwen3-chat",
-                                 "tiny-qwen3", "tiny-qwen3-gguf", "qwen3"}
-    snapshot = fetch_model() if what - {"tiny-qwen3", "tiny-qwen3-gguf"} else None
+                                 "tiny-qwen3", "tiny-qwen3-gguf", "tiny-qwen3moe", "qwen3"}
+    snapshot = fetch_model() if what - {"tiny-qwen3", "tiny-qwen3-gguf",
+                                        "tiny-qwen3moe"} else None
     if "qwen3-unicode" in what:
         unicode_inc(snapshot)
     if "qwen3-tokens" in what:
@@ -1147,6 +1401,9 @@ def main():
         tiny_qwen3()
     if "tiny-qwen3-gguf" in what:
         tiny_qwen3_gguf()
+    if "tiny-qwen3moe" in what:
+        tiny_qwen3moe()
+        tiny_qwen3moe_gguf()
     if "qwen3" in what:
         qwen3(snapshot)
 

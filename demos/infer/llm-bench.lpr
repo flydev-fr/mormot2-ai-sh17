@@ -39,6 +39,7 @@ uses
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.kernels,
   mormot.ai.infer.tokenizer.bpe,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
@@ -281,7 +282,7 @@ var
   inner: TInferBackend;
   timed: TTimedBackend;
   tok: TBpeTokenizer;
-  model: TQwen3Model;
+  model: TDecoderModel;
   ctx: TQwen3Context;
   text: RawUtf8;
   ids, all: TIntegerDynArray;
@@ -345,15 +346,16 @@ begin
     QueryPerformanceMicroSeconds(t0);
     if SameText(ExtractFileExt(folder), '.gguf') then
     begin
-      // one llama.cpp file: its own weight types and tokenizer
-      model := TQwen3Model.CreateFromGguf(folder, timed);
+      // one llama.cpp file: its own weight types and tokenizer, the family
+      // its architecture names (qwen3 or qwen3moe)
+      model := NewDecoderModelFromGguf(folder, timed);
       tok := TBpeTokenizer.CreateFromGguf(model.Gguf);
     end
     else
     begin
       tok := TBpeTokenizer.Create(IncludeTrailingPathDelimiter(folder) +
         'tokenizer.json');
-      model := TQwen3Model.Create(folder, timed, weights);
+      model := NewDecoderModel(folder, timed, weights);
     end;
     QueryPerformanceMicroSeconds(t1);
     ConsoleWrite('loaded in % ms: % layers, hidden %, vocab %, weights %, peak % MB',

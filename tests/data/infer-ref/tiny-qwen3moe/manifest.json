@@ -1,0 +1,530 @@
+{
+ "dataset": "tiny-qwen3moe",
+ "note": "seeded Qwen3-MoE, 3 layers (0 and 2: 8 experts of 64, top 2, softmax router, norm_topk_prob true; 1: dense SwiGLU of 160), hidden 64, 4 heads / 2 KV heads, head_dim 32, tied embeddings, BF16 weights. The contract is model.safetensors + config.json (experts stored one by one, as the Hugging Face checkpoints). States as tiny-qwen3; router_gap: the smallest gap between the k-th and the (k+1)-th router logit over every token and sparse layer (seed 20261018: the first one with every gap >= 0.05)",
+ "config": {
+  "architectures": [
+   "Qwen3MoeForCausalLM"
+  ],
+  "attention_bias": false,
+  "bos_token_id": 1,
+  "decoder_sparse_step": 1,
+  "eos_token_id": 2,
+  "head_dim": 32,
+  "hidden_act": "silu",
+  "hidden_size": 64,
+  "intermediate_size": 160,
+  "max_position_embeddings": 512,
+  "mlp_only_layers": [
+   1
+  ],
+  "model_type": "qwen3_moe",
+  "moe_intermediate_size": 64,
+  "norm_topk_prob": true,
+  "num_attention_heads": 4,
+  "num_experts_per_tok": 2,
+  "num_hidden_layers": 3,
+  "num_key_value_heads": 2,
+  "pad_token_id": 0,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+   "rope_theta": 1000000.0,
+   "rope_type": "default"
+  },
+  "sliding_window": null,
+  "tie_word_embeddings": true,
+  "use_sliding_window": false,
+  "vocab_size": 96,
+  "num_experts": 8,
+  "torch_dtype": "bfloat16"
+ },
+ "safetensors_sha256": "4d68494b0dc9ed98a2bf0ff90c03599812741d2e13c4e0fec545ec663157cc75",
+ "environment": {
+  "created_utc": "2026-10-17T12:20:56Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "cases": [
+  {
+   "case": 0,
+   "ids": [
+    80,
+    79,
+    54,
+    50,
+    82
+   ],
+   "tokens": 5,
+   "greedy": [
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    53,
+    83,
+    83,
+    83,
+    83,
+    83
+   ],
+   "min_margin": 0.021433115005493164,
+   "router_gap": 0.19170069694519043
+  },
+  {
+   "case": 1,
+   "ids": [
+    92,
+    8,
+    74,
+    64,
+    53,
+    84,
+    65,
+    5,
+    36
+   ],
+   "tokens": 9,
+   "greedy": [
+    21,
+    70,
+    70,
+    70,
+    70,
+    70,
+    70,
+    70,
+    70,
+    70,
+    70,
+    81,
+    44,
+    17,
+    44,
+    44
+   ],
+   "min_margin": 0.011537730693817139,
+   "router_gap": 0.16772127151489258
+  },
+  {
+   "case": 2,
+   "ids": [
+    13,
+    38,
+    9,
+    28,
+    44,
+    49,
+    68,
+    28,
+    52,
+    55,
+    79,
+    83,
+    61
+   ],
+   "tokens": 13,
+   "greedy": [
+    63,
+    63,
+    63,
+    63,
+    63,
+    31,
+    47,
+    47,
+    47,
+    47,
+    47,
+    47,
+    47,
+    47,
+    47,
+    47
+   ],
+   "min_margin": 0.04594993591308594,
+   "router_gap": 0.23900103569030762
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 59244,
+  "sha256": "ada5a610c5a4512e7d2d690a6b9c779e9f9791274d8215278baf1e5004779599",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "case0.ids",
+   "dtype": "i32",
+   "shape": [
+    5
+   ],
+   "offset": 0,
+   "bytes": 20,
+   "sha256": "f70cf222b76eb80cbc6c77fb9c459882c97564eec6de3bb7a936736128703cbd"
+  },
+  {
+   "name": "case0.embed",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 20,
+   "bytes": 1280,
+   "sha256": "177f45340f88310405b99243930dd293602339dcb9821c31f32f9a4d302b7329"
+  },
+  {
+   "name": "case0.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 1300,
+   "bytes": 1280,
+   "sha256": "71062da7f47ae3138ae1f122a94dc1f3c04e95add77fde45de1d35c2867e32fe"
+  },
+  {
+   "name": "case0.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 2580,
+   "bytes": 1280,
+   "sha256": "38f36f8970ab6617d0b86617ef23c0306599611c91d03c745d8d9caf4789a1cb"
+  },
+  {
+   "name": "case0.layer00",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 3860,
+   "bytes": 1280,
+   "sha256": "4196a5d7332afe7fe247dbc3cc196dd47d0af328fd819883ee9d66c4a2fba58a"
+  },
+  {
+   "name": "case0.layer01",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 5140,
+   "bytes": 1280,
+   "sha256": "56bb0bbc187057bcb1fc19cc4ef58ea5ebe47a8106fd8061697945fdf457b7f7"
+  },
+  {
+   "name": "case0.layer02",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 6420,
+   "bytes": 1280,
+   "sha256": "de32b7cf68eab4a1bf536da2d01512f90073482bc023012f738a135cf23e63ad"
+  },
+  {
+   "name": "case0.norm",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 7700,
+   "bytes": 1280,
+   "sha256": "dafcabd83f1b2ccc2c39a97e532a079ed27429595d52a67fe344c45ac9289492"
+  },
+  {
+   "name": "case0.logits",
+   "dtype": "f32",
+   "shape": [
+    5,
+    96
+   ],
+   "offset": 8980,
+   "bytes": 1920,
+   "sha256": "f17feb15f512ea12592a216b9602e512de30164e87ce3a43348cf85b30fc0048"
+  },
+  {
+   "name": "case0.greedy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 10900,
+   "bytes": 64,
+   "sha256": "cc4c24d4e86aab65703e3d5635b3322e36fc887d4acbcfedf64f4f0eea0c79c6"
+  },
+  {
+   "name": "case0.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    16
+   ],
+   "offset": 10964,
+   "bytes": 64,
+   "sha256": "f58eb289fa5d58db6527ff1bbfd239bc52c1cbcdf0eb11fc0b51795364c427f4"
+  },
+  {
+   "name": "case1.ids",
+   "dtype": "i32",
+   "shape": [
+    9
+   ],
+   "offset": 11028,
+   "bytes": 36,
+   "sha256": "7644682855d8e3b770a41879efeb4c7caa2be6ee2cf622d5523c470f919ad8c0"
+  },
+  {
+   "name": "case1.embed",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 11064,
+   "bytes": 2304,
+   "sha256": "6a04d59ef6cb33463f3819bc3390d87dc50e9898dddb67ef236752054837769f"
+  },
+  {
+   "name": "case1.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 13368,
+   "bytes": 2304,
+   "sha256": "35b5356b01eb4d173b87a58151d0bbe9c33647d7bb56d0f0511ca3c304da41fa"
+  },
+  {
+   "name": "case1.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 15672,
+   "bytes": 2304,
+   "sha256": "841304d5775ef9398d9ad049a2e42ee2e7144c23b810666c3aca40125c479503"
+  },
+  {
+   "name": "case1.layer00",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 17976,
+   "bytes": 2304,
+   "sha256": "f5401b93728e812f8ddeaca43b56615120f62891b3bc7b8842607b4a83adbfd6"
+  },
+  {
+   "name": "case1.layer01",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 20280,
+   "bytes": 2304,
+   "sha256": "c275e9a90e0d100afdcf6824a2cb6e1632082bb1764457640753aea69b9f1810"
+  },
+  {
+   "name": "case1.layer02",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 22584,
+   "bytes": 2304,
+   "sha256": "3296ca851ca089ba61ce916b7b018a50dddc9f7505e8aa92fb7daaac838bc5ff"
+  },
+  {
+   "name": "case1.norm",
+   "dtype": "f32",
+   "shape": [
+    9,
+    64
+   ],
+   "offset": 24888,
+   "bytes": 2304,
+   "sha256": "9ee6c3b471baf3b0a2d2be17fc5a11242c10f2530fc27618f9c9b4cf7b03c76e"
+  },
+  {
+   "name": "case1.logits",
+   "dtype": "f32",
+   "shape": [
+    9,
+    96
+   ],
+   "offset": 27192,
+   "bytes": 3456,
+   "sha256": "297aada8bf3a2759198bc6a2163b3c7b68831fb88f903747007036785c3d8b31"
+  },
+  {
+   "name": "case1.greedy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 30648,
+   "bytes": 64,
+   "sha256": "4fd0aff2523ea6bcdf48d06dbd649ac78fdff87f312ee602205e9127bce56299"
+  },
+  {
+   "name": "case1.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    16
+   ],
+   "offset": 30712,
+   "bytes": 64,
+   "sha256": "b402d3719f039cdb4c442ff34f602badfcb379e5436c3f25e7c00671f4080626"
+  },
+  {
+   "name": "case2.ids",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 30776,
+   "bytes": 52,
+   "sha256": "19a5e1f6b01cc13b0273287e5a47cb6e34549d5a8965f1cac265d934b0adf8e0"
+  },
+  {
+   "name": "case2.embed",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 30828,
+   "bytes": 3328,
+   "sha256": "233a2d8fc58e39960775592956a9d82cfe74ee913256503e78f177b781254184"
+  },
+  {
+   "name": "case2.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 34156,
+   "bytes": 3328,
+   "sha256": "7202caf3b9932a3fd1cad3189239562e2d910da702807a579362b82bb9a29159"
+  },
+  {
+   "name": "case2.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 37484,
+   "bytes": 3328,
+   "sha256": "be2821e159cd5dae1bd71415fd83918f4fe4cfb55ad94abe12926224b840b3a9"
+  },
+  {
+   "name": "case2.layer00",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 40812,
+   "bytes": 3328,
+   "sha256": "7141e7abc144ffc16be52d4c3b72630b05bde6bdb1360dd77a347610f7de3adb"
+  },
+  {
+   "name": "case2.layer01",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 44140,
+   "bytes": 3328,
+   "sha256": "f6b1bb856c5a0205ef50a4c5ae0b20e4edc544ecdbf522911cb39717a28870d6"
+  },
+  {
+   "name": "case2.layer02",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 47468,
+   "bytes": 3328,
+   "sha256": "72a4021c4436bae8eb52f87e9e7a83acd7a357f49fb8de6a6093447f492ab662"
+  },
+  {
+   "name": "case2.norm",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 50796,
+   "bytes": 3328,
+   "sha256": "d84bc40b5204e1c2999a7454927aa4ebb2381e2c5743bd32daf0435c64db0c3d"
+  },
+  {
+   "name": "case2.logits",
+   "dtype": "f32",
+   "shape": [
+    13,
+    96
+   ],
+   "offset": 54124,
+   "bytes": 4992,
+   "sha256": "2152131187556be6dde6c6bac5dc1b7097278f2b0b9727de7a9c3715385edb9d"
+  },
+  {
+   "name": "case2.greedy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 59116,
+   "bytes": 64,
+   "sha256": "7975b37e2eaaa4f3b6b03774a1212962009f94db85b5cba3f220512f37a207da"
+  },
+  {
+   "name": "case2.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    16
+   ],
+   "offset": 59180,
+   "bytes": 64,
+   "sha256": "f33996e60d2fc2f66d84e733cc54986fab889b7ce7ed96a914ae013d74d269b3"
+  }
+ ]
+}

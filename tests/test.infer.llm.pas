@@ -101,6 +101,8 @@ type
     procedure Qwen3ChatClientGguf;
     /// RegisterNativeFamily / NativeFamily: the classes of qwen3
     procedure NativeFamilies;
+    /// Qwen3-30B-A3B (Q4_K_M GGUF) behind the client, where it was put
+    procedure Qwen3MoeChatClientGguf;
   end;
 
 
@@ -1660,6 +1662,8 @@ begin
   Check(f.Tokenizer = TBpeTokenizer, 'tokenizer class');
   Check(f.Template = TQwen3ChatTemplate, 'template class');
   Check(f.Parser = TQwen3OutputParser, 'parser class');
+  Check(NativeFamily(TQwen3MoeModel, f) and (f.Template = TQwen3ChatTemplate) and
+    (f.Parser = TQwen3OutputParser), 'qwen3_moe: the classes of Qwen3');
   // the classes create what the client uses
   p := f.Parser.Create(fTokenizer);
   try
@@ -1688,6 +1692,61 @@ begin
       refused := true;
   end;
   Check(refused, 'a parser without a tokenizer');
+end;
+
+
+procedure TTestInferLlmNative.Qwen3MoeChatClientGguf;
+var
+  dir, refdir, fn: TFileName;
+  ref: TInferRefSet;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  p: PDocVariantData;
+  req: TLlmChatRequest;
+  r: TLlmChatResponse;
+  timer: TPrecisionTimer;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  // a large model of its own: only where it was put (not LAI_REQUIRE_MODEL)
+  fn := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+    'qwen3-30b-a3b-q4_k_m.gguf');
+  if not FileExists(fn) then
+  begin
+    AddConsole('SKIP Qwen3-MoE client: no vendor/models/qwen3-30b-a3b-q4_k_m.gguf');
+    exit;
+  end;
+  refdir := FindInferRefDir('qwen3');
+  if CheckFailed(refdir <> '', 'qwen3 reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    timer.Start;
+    client := TNativeLlmClient.CreateFromGguf(fn);
+    llm := client;
+    AddConsole(FormatString('Qwen3-30B-A3B client loaded in %', [timer.Stop]));
+    Check(client.Model is TQwen3MoeModel, 'a TQwen3MoeModel');
+    CheckEqual(client.Model.Config.Experts, 128, 'experts');
+    CheckEqual(client.Model.Config.ExpertsUsed, 8, 'experts per token');
+    // the same tokenizer and template as Qwen3-0.6B: the same prompt tokens
+    p := FindPrompt(ref, 'chat_en');
+    if CheckFailed(p <> nil, 'chat_en') then
+      exit;
+    req := LlmChatRequest('', nil);
+    RefRequest(p, req);
+    // a broken model would talk until the default cap of 4096 tokens
+    req.MaxTokens := 16;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('Qwen3-30B-A3B chat_en: "%" (% tokens in %)',
+      [r.Content, r.Usage.CompletionTokens, timer.Stop]));
+    CheckEqual(r.Usage.PromptTokens, p^.I['tokens'], 'chat_en prompt tokens');
+    Check(PosEx('Paris', r.Content) > 0, 'chat_en: Paris');
+    Check(r.FinishReason = lfrStop, 'chat_en stop');
+  finally
+    ref.Free;
+  end;
 end;
 
 
