@@ -58,8 +58,12 @@ nichts, die Pascal-Skalenrechnung pro Zeile dafür viel.
   Zeilen. Die Gegenprobe (vertauschte Ausgaben) lässt 16 Assertions scheitern.
 - *Messung:* Q4_K_M-Prefill bei 200 Tokens auf dem Snapdragon 275 → 299 Tokens/s, auf dem
   M2 Pro 271 → 294.
+- *Schritt 5 (2026-10-17):* `InferQ6KSums2Pascal`, `Q6KSums2NeonDot` (aus `q6k2.s`),
+  `DotQ4K2` zu `DotK2` für beide K-Typen verallgemeinert. Gegenprobe (vertauschte
+  Ausgaben) lässt 16 Assertions scheitern. Q4_K_M-Prefill bei 200 Tokens: Snapdragon
+  291 → 311 Tokens/s, M2 Pro 291 → 305.
 - *Offen:* Schritt 3 (AVX2, braucht wegen der Register xmm6..xmm15 aus dem
-  Sicherungsbereich) und Schritt 5 (Q6_K).
+  Sicherungsbereich).
 
 **Fertig, wenn:** `TTestInferFast.LinearKMatchesReference` (bitgleich, auch 513 Blöcke)
 mit einer Form „gerade/ungerade Zeilenzahl" grün; neuer Test Kernel = Pascal; Gegenproben

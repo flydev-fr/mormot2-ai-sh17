@@ -546,6 +546,7 @@ var
   kind: TInferDType;
   e: double;
   cmp: TInferCompare;
+  k2: TInferKSums2;
 begin
   for k := 0 to 1 do
   begin
@@ -594,7 +595,11 @@ begin
       CheckUtf8(CompareMem(pointer(mine), pointer(pascal), nb * 2 * SizeOf(integer)),
         '% kernel (%) = Pascal, % blocks', [INFER_DTYPE_NAME[kind],
         InferQ8KernelName, nb]);
-      if (kind = idtQ4_K) and Assigned(InferQ4KSums2) then
+      if kind = idtQ4_K then
+        k2 := InferQ4KSums2
+      else
+        k2 := InferQ6KSums2;
+      if Assigned(k2) then
       begin
         // the fused kernel for two activation rows = the Pascal one
         SetLength(xk2, nb * 2);
@@ -603,12 +608,16 @@ begin
         InferQuantizeRowQ8_K(pointer(x2), nin, @xk2[nb]);
         SetLength(mine, nb * 4);
         SetLength(pascal, nb * 4);
-        InferQ4KSums2(pointer(wq), pointer(xk2), nb, pointer(mine),
-          nb * SizeOf(TInferBlockQ8_K));
-        InferQ4KSums2Pascal(pointer(wq), pointer(xk2), nb, pointer(pascal),
-          nb * SizeOf(TInferBlockQ8_K));
+        k2(pointer(wq), pointer(xk2), nb, pointer(mine), nb * SizeOf(TInferBlockQ8_K));
+        if kind = idtQ4_K then
+          InferQ4KSums2Pascal(pointer(wq), pointer(xk2), nb, pointer(pascal),
+            nb * SizeOf(TInferBlockQ8_K))
+        else
+          InferQ6KSums2Pascal(pointer(wq), pointer(xk2), nb, pointer(pascal),
+            nb * SizeOf(TInferBlockQ8_K));
         CheckUtf8(CompareMem(pointer(mine), pointer(pascal), nb * 4 * SizeOf(integer)),
-          'Q4_K two-row kernel (%) = Pascal, % blocks', [InferQ8KernelName, nb]);
+          '% two-row kernel (%) = Pascal, % blocks', [INFER_DTYPE_NAME[kind],
+          InferQ8KernelName, nb]);
       end;
       // independent of the block sums: F32 on the dequantized weights, apart
       // only by the rounding of the activations to Q8_K

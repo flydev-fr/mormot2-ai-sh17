@@ -880,7 +880,10 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
     bitgleich.
   - Qwen3-0.6B Q4_K_M, Prefill bei 200 Tokens: Snapdragon X 275 → 299 Tokens/s (drei
     A/B-Paare), M2 Pro 271 → 294.
-  - Offen: AVX2 und Q6_K.
+  - Q6_K genauso (`Q6KSums2NeonDot`, 2026-10-17): die 6-Bit-Werte und Gruppenskalen
+    einmal je Halbblock für beide Zeilen; `DotK2` rechnet beide K-Typen. Prefill bei
+    200 Tokens: Snapdragon X 291 → 311 Tokens/s, M2 Pro 291 → 305.
+  - Offen: AVX2.
 
 ### Phase 4 — GPU: Vulkan zuerst, CUDA danach
 

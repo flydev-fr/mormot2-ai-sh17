@@ -108,6 +108,9 @@ var
   /// the Q4_K sums of two activation rows (see TInferKSums2), nil without a
   // kernel: the caller then calls InferQ4KSums per row
   InferQ4KSums2: TInferKSums2;
+  /// the Q6_K sums of two activation rows (see TInferKSums2), nil without a
+  // kernel: the caller then calls InferQ6KSums per row
+  InferQ6KSums2: TInferKSums2;
   /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod', 'avx2'
   InferQ8KernelName: RawUtf8;
   /// every IEEE half (raw bits) as single - 256 KB, filled at initialization
@@ -130,6 +133,11 @@ procedure InferQ6KSumsPascal(w, x: pointer; aBlocks: PtrInt; aSums: PIntegerArra
 /// the plain Pascal Q4_K sums of two activation rows: InferQ4KSumsPascal per
 // block and row - the yardstick of the SIMD ones
 procedure InferQ4KSums2Pascal(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
+  aXStride: PtrInt);
+
+/// the plain Pascal Q6_K sums of two activation rows: InferQ6KSumsPascal per
+// block and row - the yardstick of the SIMD ones
+procedure InferQ6KSums2Pascal(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
   aXStride: PtrInt);
 
 
@@ -228,6 +236,20 @@ begin
     InferQ4KSumsPascal(PAnsiChar(w) + b * SizeOf(TInferBlockQ4_K),
       PAnsiChar(x) + b * SizeOf(TInferBlockQ8_K), 1, @aOut^[b * 4]);
     InferQ4KSumsPascal(PAnsiChar(w) + b * SizeOf(TInferBlockQ4_K),
+      PAnsiChar(x) + aXStride + b * SizeOf(TInferBlockQ8_K), 1, @aOut^[b * 4 + 2]);
+  end;
+end;
+
+procedure InferQ6KSums2Pascal(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
+  aXStride: PtrInt);
+var
+  b: PtrInt;
+begin
+  for b := 0 to aBlocks - 1 do
+  begin
+    InferQ6KSumsPascal(PAnsiChar(w) + b * SizeOf(TInferBlockQ6_K),
+      PAnsiChar(x) + b * SizeOf(TInferBlockQ8_K), 1, @aOut^[b * 4]);
+    InferQ6KSumsPascal(PAnsiChar(w) + b * SizeOf(TInferBlockQ6_K),
       PAnsiChar(x) + aXStride + b * SizeOf(TInferBlockQ8_K), 1, @aOut^[b * 4 + 2]);
   end;
 end;
@@ -1190,6 +1212,162 @@ asm
   subs x2, x2, #1
   b.ne .Lq6k2_0
 .Lq6k2_2:
+end;
+
+/// Q6_K x two Q8_K rows, fused: Q6KSumsNeonDot with the 6-bit values and the
+// group scales rebuilt once per half block for both rows; the activations of
+// row A, then of row B, go through the same registers (v0..v5, v7, v17)
+// - exact int32, as InferQ6KSums2Pascal; v0..v7, v16..v31, x0..x15
+// - written as assembler source (armv8.2-a+dotprod), the opcodes from GNU as
+//   2.42 (aarch64), the disassembly beside each
+procedure Q6KSums2NeonDot(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
+  aXStride: PtrInt); assembler; nostackframe;
+asm
+  // x0 = w (210-byte blocks), x1 = x (292-byte Q8_K blocks, row A),
+  // x2 = aBlocks, x3 = aOut (isumA, 0, isumB, 0 per block),
+  // x4 = aXStride (row B = x1 + x4)
+  cbz x2, .Lq6kp_0
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+  .long 0x4f00e47e // movi v30.16b, #0x3
+.Lq6kp_2:
+  .long 0xaa0003e5 // mov x5, x0
+  add x8, x0, #128
+  add x6, x1, #4
+  add x10, x1, #260
+  add x13, x6, x4
+  add x14, x10, x4
+  add x11, x0, #192
+  .long 0x52800009 // mov w9, #0x0
+  .long 0x5280000f // mov w15, #0x0
+  .long 0xd2800047 // mov x7, #0x2
+.Lq6kp_1:
+  .long 0x4cdf20a0 // ld1 {v0.16b-v3.16b}, [x5], #64
+  .long 0x4cdfa104 // ld1 {v4.16b-v5.16b}, [x8], #32
+  .long 0x4e3f1c06 // and v6.16b, v0.16b, v31.16b
+  .long 0x4e3e1c87 // and v7.16b, v4.16b, v30.16b
+  .long 0x4f0c54e7 // shl v7.16b, v7.16b, #4
+  .long 0x4ea71cc6 // orr v6.16b, v6.16b, v7.16b
+  .long 0x4e3f1c30 // and v16.16b, v1.16b, v31.16b
+  .long 0x4e3e1cb1 // and v17.16b, v5.16b, v30.16b
+  .long 0x4f0c5631 // shl v17.16b, v17.16b, #4
+  .long 0x4eb11e10 // orr v16.16b, v16.16b, v17.16b
+  .long 0x4e3f1c52 // and v18.16b, v2.16b, v31.16b
+  .long 0x6f0e0493 // ushr v19.16b, v4.16b, #2
+  .long 0x4e3e1e73 // and v19.16b, v19.16b, v30.16b
+  .long 0x4f0c5673 // shl v19.16b, v19.16b, #4
+  .long 0x4eb31e52 // orr v18.16b, v18.16b, v19.16b
+  .long 0x4e3f1c74 // and v20.16b, v3.16b, v31.16b
+  .long 0x6f0e04b5 // ushr v21.16b, v5.16b, #2
+  .long 0x4e3e1eb5 // and v21.16b, v21.16b, v30.16b
+  .long 0x4f0c56b5 // shl v21.16b, v21.16b, #4
+  .long 0x4eb51e94 // orr v20.16b, v20.16b, v21.16b
+  .long 0x6f0c0416 // ushr v22.16b, v0.16b, #4
+  .long 0x6f0c0497 // ushr v23.16b, v4.16b, #4
+  .long 0x4e3e1ef7 // and v23.16b, v23.16b, v30.16b
+  .long 0x4f0c56f7 // shl v23.16b, v23.16b, #4
+  .long 0x4eb71ed6 // orr v22.16b, v22.16b, v23.16b
+  .long 0x6f0c0438 // ushr v24.16b, v1.16b, #4
+  .long 0x6f0c04b9 // ushr v25.16b, v5.16b, #4
+  .long 0x4e3e1f39 // and v25.16b, v25.16b, v30.16b
+  .long 0x4f0c5739 // shl v25.16b, v25.16b, #4
+  .long 0x4eb91f18 // orr v24.16b, v24.16b, v25.16b
+  .long 0x6f0c045a // ushr v26.16b, v2.16b, #4
+  .long 0x6f0a049b // ushr v27.16b, v4.16b, #6
+  .long 0x4f0c577b // shl v27.16b, v27.16b, #4
+  .long 0x4ebb1f5a // orr v26.16b, v26.16b, v27.16b
+  .long 0x6f0c047c // ushr v28.16b, v3.16b, #4
+  .long 0x6f0a04bd // ushr v29.16b, v5.16b, #6
+  .long 0x4f0c57bd // shl v29.16b, v29.16b, #4
+  .long 0x4ebd1f9c // orr v28.16b, v28.16b, v29.16b
+  .long 0x0cdf7177 // ld1 {v23.8b}, [x11], #8
+  .long 0x0f08a6f7 // sxtl v23.8h, v23.8b
+  .long 0x0f10a6fd // sxtl v29.4s, v23.4h
+  .long 0x4f10a6fb // sxtl2 v27.4s, v23.8h
+  .long 0x4cdf20c0 // ld1 {v0.16b-v3.16b}, [x6], #64
+  .long 0x4cdfa0c4 // ld1 {v4.16b-v5.16b}, [x6], #32
+  .long 0x4cdf70c7 // ld1 {v7.16b}, [x6], #16
+  .long 0x4cdf70d1 // ld1 {v17.16b}, [x6], #16
+  .long 0x4f000413 // movi v19.4s, #0x0
+  .long 0x4e8094d3 // sdot v19.4s, v6.16b, v0.16b
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e819615 // sdot v21.4s, v16.16b, v1.16b
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e829655 // sdot v21.4s, v18.16b, v2.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e839697 // sdot v23.4s, v20.16b, v3.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e8496d5 // sdot v21.4s, v22.16b, v4.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e859717 // sdot v23.4s, v24.16b, v5.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e879757 // sdot v23.4s, v26.16b, v7.16b
+  .long 0x4f000419 // movi v25.4s, #0x0
+  .long 0x4e919799 // sdot v25.4s, v28.16b, v17.16b
+  .long 0x4eb9bef7 // addp v23.4s, v23.4s, v25.4s
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4cdf7557 // ld1 {v23.8h}, [x10], #16
+  .long 0x0f10a6f9 // sxtl v25.4s, v23.4h
+  .long 0x4f10a6f7 // sxtl2 v23.4s, v23.8h
+  .long 0x4f255739 // shl v25.4s, v25.4s, #5
+  .long 0x4f2556f7 // shl v23.4s, v23.4s, #5
+  .long 0x6eb98673 // sub v19.4s, v19.4s, v25.4s
+  .long 0x6eb786b5 // sub v21.4s, v21.4s, v23.4s
+  .long 0x4ebd9e73 // mul v19.4s, v19.4s, v29.4s
+  .long 0x4ebb96b3 // mla v19.4s, v21.4s, v27.4s
+  .long 0x4eb1ba73 // addv s19, v19.4s
+  .long 0x1e26026c // fmov w12, s19
+  .long 0x0b0c0129 // add w9, w9, w12
+  .long 0x4cdf21a0 // ld1 {v0.16b-v3.16b}, [x13], #64
+  .long 0x4cdfa1a4 // ld1 {v4.16b-v5.16b}, [x13], #32
+  .long 0x4cdf71a7 // ld1 {v7.16b}, [x13], #16
+  .long 0x4cdf71b1 // ld1 {v17.16b}, [x13], #16
+  .long 0x4f000413 // movi v19.4s, #0x0
+  .long 0x4e8094d3 // sdot v19.4s, v6.16b, v0.16b
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e819615 // sdot v21.4s, v16.16b, v1.16b
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e829655 // sdot v21.4s, v18.16b, v2.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e839697 // sdot v23.4s, v20.16b, v3.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4eb5be73 // addp v19.4s, v19.4s, v21.4s
+  .long 0x4f000415 // movi v21.4s, #0x0
+  .long 0x4e8496d5 // sdot v21.4s, v22.16b, v4.16b
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e859717 // sdot v23.4s, v24.16b, v5.16b
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4f000417 // movi v23.4s, #0x0
+  .long 0x4e879757 // sdot v23.4s, v26.16b, v7.16b
+  .long 0x4f000419 // movi v25.4s, #0x0
+  .long 0x4e919799 // sdot v25.4s, v28.16b, v17.16b
+  .long 0x4eb9bef7 // addp v23.4s, v23.4s, v25.4s
+  .long 0x4eb7beb5 // addp v21.4s, v21.4s, v23.4s
+  .long 0x4cdf75d7 // ld1 {v23.8h}, [x14], #16
+  .long 0x0f10a6f9 // sxtl v25.4s, v23.4h
+  .long 0x4f10a6f7 // sxtl2 v23.4s, v23.8h
+  .long 0x4f255739 // shl v25.4s, v25.4s, #5
+  .long 0x4f2556f7 // shl v23.4s, v23.4s, #5
+  .long 0x6eb98673 // sub v19.4s, v19.4s, v25.4s
+  .long 0x6eb786b5 // sub v21.4s, v21.4s, v23.4s
+  .long 0x4ebd9e73 // mul v19.4s, v19.4s, v29.4s
+  .long 0x4ebb96b3 // mla v19.4s, v21.4s, v27.4s
+  .long 0x4eb1ba73 // addv s19, v19.4s
+  .long 0x1e26026c // fmov w12, s19
+  .long 0x0b0c01ef // add w15, w15, w12
+  subs x7, x7, #1
+  b.ne .Lq6kp_1
+  .long 0x28817c69 // stp w9, wzr, [x3], #8
+  .long 0x28817c6f // stp w15, wzr, [x3], #8
+  add x0, x0, #210
+  add x1, x1, #292
+  subs x2, x2, #1
+  b.ne .Lq6kp_2
+.Lq6kp_0:
 end;
 
 {$endif FPC}
@@ -2282,6 +2460,7 @@ begin
     InferQ4KSums := TInferKSums(@Q4KSumsNeonDot);
     InferQ4KSums2 := TInferKSums2(@Q4KSums2NeonDot);
     InferQ6KSums := TInferKSums(@Q6KSumsNeonDot);
+    InferQ6KSums2 := TInferKSums2(@Q6KSums2NeonDot);
     InferQ8KernelName := 'neon-dotprod';
   end;
   {$endif FPC}
