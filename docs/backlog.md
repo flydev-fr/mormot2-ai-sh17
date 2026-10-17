@@ -221,6 +221,19 @@ noch auf dem Host: Qwen3-30B-A3B auf der RTX 5090 Decode 33 bis 35, Prefill 384 
 Tokens/s. *Offen:* D3b Vulkan (Bindungen mit Versatz für die Experten, drei Shader, ein
 Warten je MoE-Layer); danach die Wahl auf dem Gerät (Route-Kernel, Linear mit Experten-Ids,
 Graph) für das Decode-Tempo.
+*Mit D3b (entschieden 2026-10-17): Expertenwahl im Vergleichstest vorgeben.* Heute misst
+`Qwen3MoeGgufMatchesCpu` Rechengenauigkeit und Routing in einem Kosinus: unter Delphi 13 kippt
+bei einer knappen Router-Entscheidung ein Experte gegenüber der CPU, deshalb 0,98 und 14 von
+16 statt 0,99 und 16 von 16 (FPC erreicht 0,992). Künftig getrennt prüfen:
+1. Ein Test-Hook im Decoder gibt der GPU die Wahl der CPU vor (Experten-Ids und Gewichte je
+   Token und Layer), so wie die Tokens heute schon vorgegeben werden. Damit gilt wieder die
+   scharfe Schwelle (Ziel: Kosinus 0,99 und Argmax 16 von 16 auf beiden Compilern - erst
+   messen, dann festlegen).
+2. Ein zweiter Lauf ohne Vorgabe zählt die abweichenden Wahlen; erlaubt nur dort, wo der
+   Abstand der Router-Logits unter einer kleinen Grenze liegt (Grenze aus der Messung).
+Für CUDA und Vulkan gleich; die Gegenprobe muss zeigen, dass ein falsches Routing auf dem Gerät
+(z. B. Router-Logits der falschen Zeile) in Prüfung 2 scheitert, obwohl Prüfung 1 es nicht
+sehen kann.
 
 **D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
 dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
@@ -544,3 +557,31 @@ treibt die 5090 an ihre Leistungsgrenze (rund 0,8 Decode-Tokens je Joule bei Vul
   Durchsatz zu erkennen, wie heute im Governor.
 - CPU-Temperatur und -Leistung: unter Windows ohne Sensortreiber nicht zu bekommen,
   bestätigt.
+
+## B13 — CPU-Rechnung unter Delphi und FPC angleichen (aufgenommen 2026-10-17)
+
+Anlass: Qwen3-30B-A3B gibt auf der CPU unter Delphi 13 andere Logits als unter FPC, genug, dass
+bei knappen Router-Entscheidungen ein anderer Experte gewählt wird (Kosinus gegen CUDA 0,988
+statt 0,992, Argmax 15 statt 16 von 16; B4, D3a).
+
+**Stand der Ursache (nicht gemessen):** die x64-Kernel sind es vermutlich nicht -
+`InitKernels` setzt unter FPC und Delphi 11+ dieselben AVX2-Routinen (gemeinsamer Assembler,
+`INFERAVX2`). Verdächtig ist der Pascal-Code drumherum (Normen, Softmax, RoPE, SwiGLU,
+Akkumulationen in `TDecoderModel`): Delphi Win64 rechnet `single`-Ausdrücke ohne
+`{$EXCESSPRECISION OFF}` in doppelter Genauigkeit, FPC in einfacher. Auch Unterschiede in
+`Exp`/`Ln` der RTL oder in der Reihenfolge von Summen sind möglich.
+
+**Vorgehen:**
+1. Eingrenzen: dieselbe Eingabe, Zwischenergebnisse je Layer und Schritt (Norm, Attention,
+   Router-Logits, FFN) unter beiden Compilern bitgenau vergleichen; der erste abweichende
+   Schritt zeigt die Stelle.
+2. Angleichen, wo es billig ist (z. B. `{$EXCESSPRECISION OFF}` in den Infer-Units, eigene
+   `Exp` statt der RTL), und messen, ob Delphi dabei schneller wird - Rechnen in `double` und
+   Umwandeln kostet in heißen Schleifen.
+3. Delphi 7 (Win32, x87) bleibt außen vor: dort ist Gleichheit nicht erreichbar und nicht nötig.
+
+**Fertig, wenn:** die Ursache benannt ist, die CPU-Logits unter Delphi 13 und FPC für das
+Tiny-Modell und Qwen3-30B-A3B bitgleich oder nur noch in den letzten Bits verschieden sind und
+der Decode unter Delphi nicht langsamer ist (`llm-bench`). Danach die Delphi-Ausnahme in den
+Vergleichstests entfernen, falls die Vorgabe der Expertenwahl (B4, D3) sie nicht schon
+überflüssig gemacht hat.
