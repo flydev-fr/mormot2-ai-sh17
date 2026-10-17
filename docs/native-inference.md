@@ -1634,5 +1634,5 @@ einige Tage.
    auch für die Engine (`LICENSE`).
 2. ~~Zeitpunkt der Delphi-7-Portierung~~ — **erledigt 2026-10-14**, vor dem ersten
    Engine-Code: die Engine entsteht von Anfang an unter `run-delphi7-tests.ps1`.
-3. **Maximale Kontextlänge** für Embeddings: 512 Tokens wie im Vertrag v1, oder mehr? Das
-   bestimmt den Speicherbedarf der Attention.
+3. ~~Maximale Kontextlänge für Embeddings~~ — **entschieden 2026-10-17**: 512 Tokens wie im
+   Vertrag v1 (Begründung: `docs/backlog.md` B7).

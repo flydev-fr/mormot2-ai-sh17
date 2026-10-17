@@ -197,11 +197,16 @@ dem Programm nicht von selbst, das Skript nimmt das Demo-Verzeichnis in den Such
 
 ---
 
-## B7 — Offene Entscheidung: Kontextlänge für Embeddings
+## B7 — Kontextlänge für Embeddings (entschieden 2026-10-17: 512 bleibt)
 
 512 Tokens wie im Vertrag v1 oder mehr? Bestimmt den Speicherbedarf der Attention
-(`native-inference.md`, „Offene Entscheidungen" Nr. 3). Braucht eine Entscheidung des
-Nutzers, keine Umsetzung vorab.
+(`native-inference.md`, „Offene Entscheidungen" Nr. 3).
+
+**Entschieden (2026-10-17):** 512 Tokens bleiben. RAG zerlegt Dokumente ohnehin in Stücke
+(`ChunkText`), kurze Stücke treffen bei der Suche genauer, die Attention bleibt klein, und die
+Verträglichkeit mit gespeicherten lembed-Vektoren (Vertrag v1) bleibt erhalten. Ein Text
+über 512 Tokens wird weiter abgewiesen, nicht abgeschnitten. Eine größere Grenze erst, wenn
+ein Anwendungsfall ganze lange Texte als einen Vektor braucht.
 
 ---
 
