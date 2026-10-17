@@ -1343,6 +1343,26 @@ Karte, C5 Tempo.
     (Linux, ganze Inferenz-Suite 2645). Gegenprobe (Scores-Abstand, Norm der falschen
     Schicht, letzte Zeile, Länge nach Decode, Cache-Wachstum ohne Kopie) scheitert in jedem
     der fünf Fälle.
+- *C5, Tempo:* `llm-bench … cuda` misst wie `vulkan` (gemeinsamer Pfad über
+  `TQwen3Device`). Ausgangslage auf der RTX 5090 (Qwen3-0.6B, Prefill / Decode in Token/s):
+
+  | Modell, Prompt | Vulkan | CUDA nach C4 |
+  |---|---|---|
+  | Q8_0, 200 | 13 683 / 358 | 1 859 / 222 |
+  | Q8_0, 1000 | 14 581 / 364 | 1 494 / 109 |
+  | Q4_K_M, 200 | 13 008 / 332 | 1 543 / 219 |
+  | Q4_K_M, 1000 | 13 799 / 347 | 1 283 / 108 |
+
+  - *C5a, erledigt 2026-10-17:* `attention` ist jetzt die CUDA-Form von `attention.comp`
+    (Blöcke aus bis zu 8 Abfragen - Köpfe einer KV-Gruppe mal Zeilen -, Schlüsselkacheln
+    zu 128, Online-Softmax, die Schlüssel einer Zeile beim Decode in Bereiche geteilt) mit
+    `attnmerge`; dieselbe Aufteilung wie Vulkan (`SplitKeys`, Vorgabe 64). Der Scores-Puffer
+    und seine Chunk-Grenze entfallen. Decode bei 1000 Token Kontext: Q8_0 109 → 249, Q4_K_M
+    108 → 213 Token/s (so schnell wie bei 200). Test: `OpsMatchCpu` mit Kopfblöcken und
+    1 bis 5 Bereichen (auch leere späte Bereiche), `TinyQwen3MatchesCpu` dekodiert
+    abwechselnd mit und ohne Aufteilung; RTX 5090 175 Assertions grün unter FPC 3.2.2 und
+    Delphi 13. Gegenprobe (Gewicht im Merge, Bereich um einen Schlüssel zu kurz, kein
+    Umskalieren, Merge fehlt) scheitert in allen vier Fällen.
 
 ### Danach — nach Bedarf
 

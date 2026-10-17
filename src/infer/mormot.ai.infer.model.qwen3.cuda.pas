@@ -55,7 +55,7 @@ type
     // device scratch for up to fRows token rows
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp,
       fDevCos: TInferCuBuffer;
-    fScores, fLogits: TInferCuBuffer;
+    fPart, fLogits: TInferCuBuffer; // the key ranges of the attention, logits
     // the inputs of a chunk on the host: embeddings, then cos, then sin
     fIn: TSingleDynArray;
     procedure FreeScratch;
@@ -72,8 +72,9 @@ type
     fBackend: TInferCudaBackend;
     fCu: TInferCuda;
     fOps, fBasic: TInferCuModule;
-    fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fAdd: TCuHandle;
+    fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fMerge, fAdd: TCuHandle;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
+    fSplitKeys: integer;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
@@ -107,6 +108,11 @@ type
       aMaxNew: PtrInt; const aStop: array of integer): TIntegerDynArray;
     property Backend: TInferCudaBackend
       read fBackend;
+    /// the attention cuts the keys of a row into ranges of about SplitKeys
+    // when there are few blocks (decoding), merged afterwards - 0: never
+    // (the tests compare both)
+    property SplitKeys: integer
+      read fSplitKeys write fSplitKeys;
   end;
 
 
@@ -115,11 +121,17 @@ implementation
 const
   /// token rows per chunk at most
   CHUNK_MAX = 256;
-  /// the attention scores of a chunk (rows * heads * keys floats): the chunk
-  // rows are halved down to this size - a single row may exceed it (heads *
-  // keys floats; 2.6 MB for Qwen3-0.6B at 40960 positions) until an attention
-  // without the scores buffer (slice C5)
-  SCORES_MAX = 256 shl 20;
+  /// the logits of every row of a chunk (rows * vocabulary floats): the
+  // chunk rows are halved down to this size
+  LOGITS_MAX = 256 shl 20;
+  /// the queries of one attention block at most (MAXQ in tools/cuda/ops.cu):
+  // the heads of one KV head times rows, which share every key and value read
+  ATTENTION_QUERIES = 8;
+  /// the attention cuts the keys of a row into ranges of about SPLIT_KEYS
+  // when there are few blocks - decoding one token - at most SPLIT_GROUPS
+  // blocks in all (then attnmerge combines them); as on Vulkan
+  SPLIT_KEYS = 64;
+  SPLIT_GROUPS = 2048;
   /// the threads of a block of tools/cuda/ops.cu
   OPS_BLOCK = 128;
 
@@ -168,7 +180,7 @@ begin
   end;
   fDevKeys := nil;
   fDevValues := nil;
-  FreeAndNil(fScores);
+  FreeAndNil(fPart);
   FreeAndNil(fLogits);
   fCapacity := 0;
 end;
@@ -181,8 +193,9 @@ begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
-  // qkrope keeps one normalized head in shared memory
-  if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 1 <> 0) then
+  // qkrope keeps one normalized head in shared memory, the attention reads
+  // the keys as float4
+  if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
     EInferError.RaiseUtf8('%: head dimension % not supported', [self,
       aModel.Config.HeadDim]);
   fModel := aModel;
@@ -195,6 +208,8 @@ begin
   fSwiGlu := fOps.Kernel('swiglu');
   fQkRope := fOps.Kernel('qkrope');
   fAttention := fOps.Kernel('attention');
+  fMerge := fOps.Kernel('attnmerge');
+  fSplitKeys := SPLIT_KEYS;
   fAdd := fBasic.Kernel('add');
   fBackend.GpuLock;
   try
@@ -279,13 +294,9 @@ begin
   result := aCount;
   if result > CHUNK_MAX then
     result := CHUNK_MAX;
-  // the scores of the attention: rows * heads * (past + rows) floats
-  while (result > 1) and
-        (Int64(result) * c.Heads * (aPast + result) * 4 > SCORES_MAX) do
-    result := result shr 1;
   // the logits of every row of the chunk in one buffer
   if aAllLogits then
-    while (result > 1) and (Int64(result) * c.VocabSize * 4 > SCORES_MAX) do
+    while (result > 1) and (Int64(result) * c.VocabSize * 4 > LOGITS_MAX) do
       result := result shr 1;
 end;
 
@@ -294,7 +305,6 @@ procedure TQwen3Cuda.Prepare(aCtx: TQwen3CuContext; aTokens, aRows,
 var
   c: TQwen3Config;
   cap, kvw, l, half: PtrInt;
-  bytes: Int64;
   keys, values: TInferCuBufferDynArray;
 begin
   c := fModel.Config;
@@ -359,16 +369,6 @@ begin
     SetLength(aCtx.fIn, aRows * (c.Hidden + 2 * half));
     aCtx.fRows := aRows;
   end;
-  // the scores of this chunk's attention: rows * heads * keys - a quarter
-  // more (at most the cache capacity), else every decode step reallocates
-  bytes := Int64(aRows) * c.Heads * aTokens * 4;
-  if (aCtx.fScores = nil) or (aCtx.fScores.Size < bytes) then
-  begin
-    bytes := bytes + bytes shr 2;
-    if bytes > Int64(aRows) * c.Heads * aCtx.fCapacity * 4 then
-      bytes := Int64(aRows) * c.Heads * aCtx.fCapacity * 4;
-    NeedDevice(fCu, aCtx.fScores, bytes);
-  end;
   if aOutRows > 0 then
     NeedDevice(fCu, aCtx.fLogits, Int64(aOutRows) * c.VocabSize * 4);
 end;
@@ -408,11 +408,11 @@ procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows: PtrInt;
+  n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
-  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, psc, px, pt: TCuDevicePtr;
-  rows, heads, kvHeads, headDim, ppast, keys, count: cardinal;
+  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt: TCuDevicePtr;
+  rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count: cardinal;
   eps: single;
 begin
   c := fModel.Config;
@@ -430,6 +430,28 @@ begin
     else
       outRows := 1;
   Prepare(aCtx, past + n, n, outRows);
+  // the attention blocks: hb heads of one KV head (hb divides the group)
+  // times rb rows, the keys of a row cut into splits ranges unless there are
+  // enough blocks without
+  hb := c.Heads div c.KvHeads;
+  while (hb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod hb <> 0) do
+    dec(hb);
+  rb := ATTENTION_QUERIES div hb;
+  blocks := (n + rb - 1) div rb;
+  splits := 1;
+  if fSplitKeys > 0 then
+    splits := (past + n + fSplitKeys - 1) div fSplitKeys;
+  most := SPLIT_GROUPS div ((c.Heads div hb) * blocks);
+  if splits > most then
+    splits := most;
+  if splits < 1 then
+    splits := 1;
+  ppart := 0;
+  if splits > 1 then
+  begin
+    NeedDevice(fCu, aCtx.fPart, Int64(c.Heads) * n * splits * (c.HeadDim + 2) * 4);
+    ppart := aCtx.fPart.Ptr;
+  end;
   // the inputs: embeddings, then the rotary factors (cos, then sin)
   p := pointer(aCtx.fIn);
   fModel.Embed(aIds, n, p);
@@ -441,14 +463,15 @@ begin
   kvHeads := c.KvHeads;
   headDim := c.HeadDim;
   ppast := past;
-  keys := past + n; // the stride of the scores: every key a row sees
+  nsplits := splits;
+  hblock := hb;
+  rblock := rb;
   eps := c.RmsEps;
   pq := aCtx.fDevQ.Ptr;
   pk := aCtx.fDevK.Ptr;
   pv := aCtx.fDevV.Ptr;
   pcs := aCtx.fDevCos.Ptr;
   pa := aCtx.fDevAttn.Ptr;
-  psc := aCtx.fScores.Ptr;
   // the input norm of layer 0; every later one comes with the residual of the
   // layer before (addnorm)
   EnqueueNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
@@ -466,8 +489,12 @@ begin
     pvc := aCtx.fDevValues[l].Ptr;
     fCu.Enqueue(fQkRope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
       @heads, @kvHeads, @headDim, @ppast, @eps], c.Heads + c.KvHeads, OPS_BLOCK, n);
-    fCu.Enqueue(fAttention, [@pq, @pkc, @pvc, @pa, @psc, @heads, @headDim,
-      @kvHeads, @ppast, @keys], c.Heads, OPS_BLOCK, n);
+    fCu.Enqueue(fAttention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
+      @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
+      OPS_BLOCK, blocks, splits);
+    if splits > 1 then
+      fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits],
+        c.Heads, OPS_BLOCK, n);
     fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
     // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
     EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);

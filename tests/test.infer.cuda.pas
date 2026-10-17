@@ -53,7 +53,7 @@ type
     // tolerance: another summation order), with and without bias, more than
     // 65535 outputs, the weight cache, and the CPU for other types
     procedure LinearMatchesReference;
-    /// slice C3: rmsnorm, addnorm, swiglu, qkrope and attention of
+    /// slice C3 (attention: C5): rmsnorm, addnorm, swiglu, qkrope and attention of
     // tools/cuda/ops.cu against the CPU reference's RmsNorm, Add, SwiGlu, Rope
     // and CausalAttention (a tolerance: float arithmetic, another order),
     // enqueued without a wait between them
@@ -438,7 +438,7 @@ procedure TTestInferCuda.OpsMatchCpu;
 var
   ops: TInferCuModule;
   ref: TInferCpuBackend;
-  kNorm, kAdd, kSwi, kQk, kAtt: TCuHandle;
+  kNorm, kAdd, kSwi, kQk, kAtt, kMerge: TCuHandle;
   bufs: array of TInferCuBuffer;
 
   // a device copy of v (freed at the end)
@@ -529,13 +529,16 @@ var
   end;
 
   // qkrope of aRows new rows after aPast cached ones, then the attention of
-  // those rows over the whole cache - both against the CPU
-  procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast: PtrInt);
+  // those rows over the whole cache - both against the CPU; the attention
+  // blocks hold aHeadBlock heads times 8 div aHeadBlock rows, the keys of a
+  // row cut into aSplits ranges (merged by attnmerge when more than one)
+  procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast, aHeadBlock,
+    aSplits: PtrInt);
   var
     q, k, v, qn, kn, cs, cosv, sinv, keys, values, y, kc, vc, qc, yc,
-      sc: TSingleDynArray;
-    pq, pk, pv, pqn, pkn, pcs, pkc, pvc, py, psc: TCuDevicePtr;
-    rows, heads, kvHeads, headDim, past, cap: cardinal;
+      part: TSingleDynArray;
+    pq, pk, pv, pqn, pkn, pcs, pkc, pvc, py, ppart: TCuDevicePtr;
+    rows, heads, kvHeads, headDim, past, splits, hb, rb: cardinal;
     eps: single;
     half, kvw, cp, r, i: PtrInt;
   begin
@@ -575,18 +578,24 @@ var
     kvHeads := aKvHeads;
     headDim := aHeadDim;
     past := aPast;
-    cap := cp;
+    splits := aSplits;
+    hb := aHeadBlock;
+    rb := 8 div aHeadBlock;
     eps := 1e-6;
     // every buffer up first: the two kernels then run back to back, with no
     // copy (which waits for the stream) between them
     SetLength(y, aRows * aHeads * aHeadDim);
     py := Up(y);
-    SetLength(sc, aRows * aHeads * cp);
-    psc := Up(sc);
+    SetLength(part, aHeads * aRows * aSplits * (aHeadDim + 2));
+    ppart := Up(part);
     fCu.Enqueue(kQk, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows, @heads,
       @kvHeads, @headDim, @past, @eps], aHeads + aKvHeads, 128, aRows);
-    fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @psc, @heads, @headDim, @kvHeads,
-      @past, @cap], aHeads, 128, aRows);
+    fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @ppart, @rows, @heads, @headDim,
+      @kvHeads, @past, @splits, @hb, @rb], aHeads div aHeadBlock, 128,
+      (aRows + rb - 1) div rb, aSplits);
+    if aSplits > 1 then
+      fCu.Enqueue(kMerge, [@ppart, @py, @rows, @heads, @headDim, @splits],
+        aHeads, 128, aRows);
     SetLength(qc, length(q));
     SetLength(kc, length(keys));
     SetLength(vc, length(values));
@@ -610,8 +619,8 @@ var
     ref.CausalAttention(pointer(q), aRows, aHeads, aHeadDim, pointer(keys),
       pointer(values), aPast, aKvHeads, pointer(y));
     Near(yc, y, 2e-5, FormatUtf8(
-      'attention % rows after %, % heads / % KV heads of %',
-      [aRows, aPast, aHeads, aKvHeads, aHeadDim]));
+      'attention % rows after %, % heads / % KV heads of %, % per block, % splits',
+      [aRows, aPast, aHeads, aKvHeads, aHeadDim, aHeadBlock, aSplits]));
   end;
 
 var
@@ -627,13 +636,18 @@ begin
     kSwi := ops.Kernel('swiglu');
     kQk := ops.Kernel('qkrope');
     kAtt := ops.Kernel('attention');
+    kMerge := ops.Kernel('attnmerge');
     NormAndAdd(5, 1024);
     NormAndAdd(3, 100); // no multiple of the block
     SwiGluCase(100003);
-    AttentionCase(7, 4, 2, 64, 0);     // a prompt
-    AttentionCase(3, 16, 8, 128, 20);  // more rows after a cached prefix
-    AttentionCase(1, 16, 8, 128, 300); // decoding: more keys than threads
-    AttentionCase(2, 4, 4, 256, 5);    // the widest head
+    AttentionCase(7, 4, 2, 64, 0, 2, 1);     // a prompt, 4 rows per block
+    AttentionCase(7, 4, 2, 64, 0, 1, 3);     // early rows: empty late ranges
+    AttentionCase(3, 16, 8, 128, 20, 2, 1);  // more rows after a cached prefix
+    AttentionCase(1, 16, 8, 128, 300, 2, 1); // decoding: more keys than a tile
+    AttentionCase(1, 16, 8, 128, 300, 2, 5); // decoding, the keys in 5 ranges
+    AttentionCase(2, 4, 4, 256, 5, 1, 1);    // the widest head
+    AttentionCase(2, 4, 4, 256, 5, 1, 2);
+    AttentionCase(9, 8, 1, 64, 130, 8, 4);   // 8 heads of one KV head
   finally
     for i := 0 to high(bufs) do
       bufs[i].Free;
@@ -710,10 +724,12 @@ begin
         CheckUtf8(cmp.Cosine >= 0.999, 'Q8_0 prompt logits: %',
           [InferCompareText(cmp)]);
       end;
-      // decoding, one token at a time
+      // decoding, one token at a time - the keys of a row in one range or
+      // cut into ranges of 64
       for i := 0 to 4 do
       begin
         id := ids[i];
+        vk.SplitKeys := (i and 1) * 64;
         model.Forward(c1, @id, 1, pointer(l1));
         vk.Forward(c2, @id, 1, pointer(l2));
         if k = 0 then

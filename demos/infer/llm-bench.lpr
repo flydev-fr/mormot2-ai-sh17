@@ -6,11 +6,12 @@
 //   the peak memory
 //
 //   usage: llm-bench [model folder | file.gguf] [prompt tokens=200] [new tokens=32]
-//                    [threads=0 (default) | ref | exact | vulkan]
+//                    [threads=0 (default) | ref | exact | vulkan | cuda]
 //                    [q8 (default) | q4 | f32]
 //   - ref: the scalar reference backend; exact: TInferCpuFastBackend with
 //     Exact = true; vulkan: the whole forward pass on the Vulkan device
-//     (TQwen3Vulkan, phase 4d); otherwise TInferCpuFastBackend in its float mode
+//     (TQwen3Vulkan, phase 4d); cuda: the same on the CUDA device (TQwen3Cuda,
+//     backlog B3); otherwise TInferCpuFastBackend in its float mode
 //   e.g.   llm-bench vendor/models/qwen3-0.6b 200 32
 program llm.bench;
 
@@ -40,6 +41,9 @@ uses
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
   mormot.ai.infer.model.qwen3.vulkan,
+  mormot.ai.infer.cuda,
+  mormot.ai.infer.backend.cuda,
+  mormot.ai.infer.model.qwen3.cuda,
   mormot.ai.infer.sampler;
 
 type
@@ -280,8 +284,10 @@ var
   text: RawUtf8;
   ids, all: TIntegerDynArray;
   gpu: TInferVulkanBackend;
-  vk: TQwen3Vulkan;
-  vctx: TQwen3VkContext;
+  cu: TInferCudaBackend;
+  backend: TInferBackend;
+  dev: TQwen3Device;
+  dctx: TQwen3Context;
   logits: TSingleDynArray;
   id: integer;
   t0, t1, prefillUs, decodeUs: Int64;
@@ -359,52 +365,74 @@ begin
     until length(all) >= promptLen;
     ids := copy(all, 0, promptLen);
     SetLength(logits, model.Config.VocabSize);
-    if mode = 'vulkan' then
+    if (mode = 'vulkan') or (mode = 'cuda') then
     begin
-      gpu := TInferVulkanBackend.Create;
-      vk := nil;
-      vctx := nil;
+      gpu := nil;
+      cu := nil;
+      backend := nil;
+      dev := nil;
+      dctx := nil;
       try
         QueryPerformanceMicroSeconds(t0);
-        vk := TQwen3Vulkan.Create(model, gpu);
+        if mode = 'vulkan' then
+        begin
+          gpu := TInferVulkanBackend.Create;
+          backend := gpu;
+          dev := TQwen3Vulkan.Create(model, gpu);
+        end
+        else
+        begin
+          cu := TInferCudaBackend.Create;
+          backend := cu;
+          dev := TQwen3Cuda.Create(model, cu);
+        end;
         QueryPerformanceMicroSeconds(t1);
-        ConsoleWrite('vulkan: % (type %), weights uploaded in % ms, peak % MB',
-          [gpu.Vulkan.DeviceName, gpu.Vulkan.DeviceType, (t1 - t0) div 1000,
-           PeakRssMB]);
-        vctx := vk.NewContext;
-        gpu.Vulkan.Profile := GetEnvironmentVariable('LAI_VULKAN_PROFILE') = '1';
+        if gpu <> nil then
+          ConsoleWrite('vulkan: % (type %), weights uploaded in % ms, peak % MB',
+            [gpu.Vulkan.DeviceName, gpu.Vulkan.DeviceType, (t1 - t0) div 1000,
+             PeakRssMB])
+        else
+          ConsoleWrite('cuda: % (compute %.%), weights uploaded in % ms, peak % MB',
+            [cu.Cuda.DeviceName, cu.Cuda.ComputeMajor, cu.Cuda.ComputeMinor,
+             (t1 - t0) div 1000, PeakRssMB]);
+        dctx := dev.NewDeviceContext;
+        if gpu <> nil then
+          gpu.Vulkan.Profile := GetEnvironmentVariable('LAI_VULKAN_PROFILE') = '1';
         // warm-up: pipelines, buffers sized for the prompt
-        vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
-        vctx.Reset;
-        gpu.Vulkan.ProfileReset;
+        dev.Forward(dctx, pointer(ids), length(ids), pointer(logits));
+        dctx.Reset;
+        if gpu <> nil then
+          gpu.Vulkan.ProfileReset;
         QueryPerformanceMicroSeconds(t0);
-        vk.Forward(vctx, pointer(ids), length(ids), pointer(logits));
+        dev.Forward(dctx, pointer(ids), length(ids), pointer(logits));
         QueryPerformanceMicroSeconds(t1);
         prefillUs := t1 - t0;
         ConsoleWrite('prefill: % tokens in % ms = % tokens/s',
           [promptLen, prefillUs div 1000, promptLen * 1000000 / prefillUs]);
-        if gpu.Vulkan.Profile then
+        if (gpu <> nil) and gpu.Vulkan.Profile then
+        begin
           ConsoleWrite('  %', [gpu.Vulkan.ProfileText]);
-        gpu.Vulkan.ProfileReset;
+          gpu.Vulkan.ProfileReset;
+        end;
         n := 0;
         QueryPerformanceMicroSeconds(t0);
         for i := 1 to newTokens do
         begin
           id := InferArgMax(pointer(logits), model.Config.VocabSize);
-          vk.Forward(vctx, @id, 1, pointer(logits));
+          dev.Forward(dctx, @id, 1, pointer(logits));
           inc(n);
         end;
         QueryPerformanceMicroSeconds(t1);
         decodeUs := t1 - t0;
         ConsoleWrite('decode: % tokens in % ms = % tokens/s (% ms/token)',
           [n, decodeUs div 1000, n * 1000000 / decodeUs, decodeUs / 1000 / n]);
-        if gpu.Vulkan.Profile then
+        if (gpu <> nil) and gpu.Vulkan.Profile then
           ConsoleWrite('  %', [gpu.Vulkan.ProfileText]);
-        ConsoleWrite('context: % tokens, peak % MB', [vctx.Length, PeakRssMB]);
+        ConsoleWrite('context: % tokens, peak % MB', [dctx.Length, PeakRssMB]);
       finally
-        vctx.Free;
-        vk.Free;
-        gpu.Free;
+        dctx.Free;
+        dev.Free;
+        backend.Free;
       end;
       exit;
     end;
