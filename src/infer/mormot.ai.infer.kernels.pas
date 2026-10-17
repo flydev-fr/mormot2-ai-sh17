@@ -2890,6 +2890,15 @@ end;
 {$ifdef CPUAARCH64}
 {$ifdef FPC}
 
+{$ifdef OSWINDOWS}
+// mORMot asks Windows for AES and CRC32 only (TestCpuFeatures), not for SDOT
+function IsProcessorFeaturePresent(ProcessorFeature: cardinal): LongBool;
+  stdcall; external 'kernel32';
+
+const
+  PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE = 43;
+{$endif OSWINDOWS}
+
 /// true if this CPU has SDOT (ARMv8.2 dot product)
 // - mORMot fills the aarch64 CpuFeatures on Linux only (auxiliary vector in
 // mormot.core.base, /proc/cpuinfo fallback in mormot.core.os): on macOS and
@@ -2912,6 +2921,10 @@ begin
             (len = SizeOf(v)) and
             (v <> 0);
   {$endif OSDARWIN}
+  {$ifdef OSWINDOWS}
+  if not result then
+    result := IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE);
+  {$endif OSWINDOWS}
 end;
 
 {$endif FPC}

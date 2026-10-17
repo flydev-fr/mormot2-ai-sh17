@@ -14,7 +14,7 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
 > `ILlmClient`: the agent loop calls tools with a model on this machine, at about 33
 > tokens/s in FP32 and 64 in Q8_0 on a laptop, greedy or sampled, with a prompt cache
-> for the next turn. Next: the rest of the speed work, then CUDA. Three test suites, about 4500 assertions, green on every platform in the table below except Windows ARM64: five open failures there, four of them Vulkan on its Adreno GPU (whatever the compiler).
+> for the next turn. Next: the rest of the speed work, then CUDA. Three test suites, about 4500 assertions, green on every platform in the table below except Windows ARM64: four open failures there, all Vulkan on its Adreno GPU (whatever the compiler).
 
 ## What it does
 
@@ -41,16 +41,16 @@ between 2026-10-14 and 17:
 | Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 2644 |
 | Windows x86 | **Delphi 7** | 1253 | 714 | 1751 ⁴ |
 | macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 2655 ⁵ |
-| Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2542, 5 failing ¹ |
+| Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2644, 4 failing ¹ |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 725 | 2486 ³ |
 
 ¹ FPC 3.3.1 is a development compiler, the only one for this target (FPC 3.2 and Delphi
-have none), so this row does not count as a release platform. Of the five failures, one is
-a Qwen3 Q8_0 logits check (cosine 0.979; the same test passes with FPC 3.2.x on Linux
-aarch64 and macOS) and four are Vulkan Q8_0 linear shapes on the Adreno X1-85 GPU. The
-x64 builds (FPC 3.2.2 and Delphi 13) fail the same four under emulation on that GPU, so
-those are not the compiler's. The dot-product kernels (Q8_0, K-quants) are not used there
-yet: their CPU detection does not cover Windows ARM, so those run in Pascal.
+have none), so this row does not count as a release platform. The four failures are
+Vulkan Q8_0 linear shapes on the Adreno X1-85 GPU, in `matvec8.comp`, which only Apple GPUs
+use outside the tests (backlog B10); the x64 builds (FPC 3.2.2 and Delphi 13) fail the same
+four under emulation on that GPU, so they are not the compiler's. A first run without the
+dot-product kernels (their CPU detection did not cover Windows ARM) also missed a Qwen3
+logits check on the Pascal path (cosine 0.979).
 ² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
 that target.
 ³ The production target (Docker uses the same FPC 3.2.2), AVX2 kernels on the System V

@@ -151,11 +151,12 @@ Die README-Tabelle „Where it runs" hat veraltete Zellen:
 
 **Erledigt (2026-10-17):** alle Zeilen außer Linux aarch64 und Delphi 7 (beide vom
 2026-10-14 bis 16) neu gelaufen, Fußnoten zu alten Ständen entfallen.
-Windows ARM64 (FPC 3.3.1, Entwicklungs-Compiler) erstmals mit Inferenz: 2542, davon 5
-rot. Gegenprobe mit den x64-Builds (FPC 3.2.2, Delphi 13) unter Prism auf derselben
+Windows ARM64 (FPC 3.3.1, Entwicklungs-Compiler) erstmals mit Inferenz: zuerst 2542,
+davon 5 rot; nach der SDOT-Erkennung für Windows ARM (`IsProcessorFeaturePresent`) 2644,
+davon 4 rot (B10). Gegenprobe mit den x64-Builds (FPC 3.2.2, Delphi 13) unter Prism auf derselben
 Adreno-X1-85-GPU: dieselben 4 Vulkan-Fehler (Q8_0, eine Zeile, 256 Eingänge) — nicht der
-Compiler. Offen, je eigener Eintrag: der Adreno-Fehler, SDOT-Erkennung unter Windows ARM
-(`IsProcessorFeaturePresent`), der Qwen3-Cosinus 0,979 unter FPC 3.3.1.
+Compiler, siehe B10. Der Qwen3-Cosinus 0,979 trat nur im Pascal-Pfad unter FPC 3.3.1 auf
+(ohne SDOT-Kernel) und ist mit ihnen weg; als Compiler-Vorbehalt vermerkt.
 
 ---
 
@@ -251,3 +252,23 @@ deshalb `attention.comp`.
 
 - SQLite-Extensions `vec0` / `lembed`: fliegen langfristig raus (nativer Store und native
   Engine ersetzen sie) — kein Ausbau mehr.
+
+---
+
+## B10 — `matvec8.comp` Q8_0 rechnet auf der Adreno X1-85 falsch
+
+**Befund (2026-10-17):** `TTestInferVulkan.LinearMatchesReference` scheitert auf der
+Adreno-GPU des Snapdragon-Laptops an Q8_0 mit einer Tokenzeile, egal mit welchem Compiler
+(FPC 3.3.1 nativ, FPC 3.2.2 und Delphi 13 unter Prism, identische Fehlerwerte). Eine
+Probe über Eingänge 32 bis 1024, 1 bis 3 Zeilen, 1 bis 33 Ausgänge, mit und ohne Bias
+grenzt ein: falsch ist nur `matvec8` für Q8_0 (mit und ohne Subgroups); `linear8` und
+`matvec8` für Q4_K/Q6_K sind richtig. Grün bleibt nur, wo jede Gewichtszeile an einer durch
+4 teilbaren Byte-Adresse beginnt (32 Eingänge, 1 Ausgang) — Verdacht: der Adreno-Compiler
+übersetzt das branchfreie `word2`/`half16` an 2-Byte-versetzten Adressen falsch.
+
+**Wirkung:** keine im Produktivbetrieb — `matvec8` ist nur auf Apple-GPUs an (`UseMatvec`,
+Vendor $106B); rot ist der Test, der `matvec8` auf jeder GPU erzwingt.
+
+**Vorgehen:** `word2` für Q8_0 als `OpSelect` statt Doppel-Shift, Adreno-Probe, dann der
+Apple-Decode im A/B-Lauf (B8: Q8_0 98 Tokens/s darf nicht sinken); sonst `matvec8` im Test
+auf Apple begrenzen und den Treiberfehler dokumentieren.
