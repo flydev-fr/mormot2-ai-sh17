@@ -335,16 +335,18 @@ end;
 
 procedure TTestInferCuda.LinearMatchesReference;
 const
-  // rows, in, out: one row, partial tiles, more than 65535 outputs
-  SHAPES: array[0..5, 0..2] of integer = (
+  // rows, in, out: one row, partial tiles, more than 65535 outputs; gemm8
+  // from 16 rows on, linear8 below; the last three F32 only: inputs no
+  // multiple of 32 (linear8 at 20 rows) or of 8 (linear)
+  SHAPES: array[0..8, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
-    (70, 512, 130));
+    (70, 512, 130), (20, 520, 9), (3, 100, 9), (16, 36, 66));
   TYPES: array[0..3] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K);
 var
   gpu: TInferCudaBackend;
   ref: TInferCpuBackend;
   fast: TInferCpuFastBackend;
-  t, i, o, rows, nin, nout: PtrInt;
+  t, i, o, m, rows, nin, nout: PtrInt;
   kind: TInferDType;
   x, bias, wf, wd, y1, y2, y3: TSingleDynArray;
   wq: RawByteString;
@@ -359,11 +361,16 @@ begin
   ref := TInferCpuBackend.Create;
   fast := TInferCpuFastBackend.Create;
   try
+    // the plain linear kernel, then the fast ones
+    for m := 0 to 1 do
     for t := 0 to high(TYPES) do
     begin
+      gpu.FastLinear := m = 1;
       kind := TYPES[t];
       for i := 0 to high(SHAPES) do
       begin
+        if (i > 5) and (kind <> idtF32) then
+          break;
         rows := SHAPES[i, 0];
         nin := SHAPES[i, 1];
         nout := SHAPES[i, 2];
@@ -404,8 +411,8 @@ begin
           pointer(y2));
         CheckUtf8(gpu.GpuLinears = calls + 1, '% on the device', [INFER_DTYPE_NAME[kind]]);
         e := RelError(pointer(y2), pointer(y1), rows * nout);
-        CheckUtf8(e <= 1e-5, '% % x % x %: relative error %',
-          [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
+        CheckUtf8(e <= 1e-5, '% % x % x % (fast %): relative error %',
+          [INFER_DTYPE_NAME[kind], rows, nin, nout, gpu.FastLinear, e]);
         // again, from the weight cache: the same bits
         SetLength(y3, rows * nout);
         gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,

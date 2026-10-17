@@ -128,8 +128,8 @@ nichts installiert werden. C2 (`Linear` F32/Q8_0/Q4_K/Q6_K) erledigt 2026-10-17,
 unter Linux (WSL des RTX-Rechners). C3 (die übrigen Operationen als Kernel) erledigt
 2026-10-17. C4 (`TQwen3Cuda`: der ganze Forward-Pass auf der Karte, auch hinter
 `TNativeLlmClient`) erledigt 2026-10-17. C5 (Tempo) läuft: Messung gegen Vulkan und die
-Attention ohne Scores-Puffer (C5a) erledigt 2026-10-17; als Nächstes die Matrixprodukte
-(`linear8`/`gemm8`).
+Attention ohne Scores-Puffer (C5a) und die Matrixprodukte `linear8`/`gemm8` (C5b) erledigt
+2026-10-17; Prefill jetzt nahe Vulkan, Decode noch etwa 1 ms je Token dahinter.
 
 ---
 

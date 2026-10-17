@@ -46,7 +46,8 @@ type
   protected
     fCu: TInferCuda;
     fLinearModule: TInferCuModule;
-    fLinear: TCuHandle;
+    fLinear, fLinear8, fGemm8: TCuHandle;
+    fFastLinear: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -61,6 +62,10 @@ type
     function Weight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferCuBuffer;
     function Scratch(var aBuffer: TInferCuBuffer; aBytes: Int64): TInferCuBuffer;
+    // the kernel and grid of a Linear: gemm8 for GEMM_ROWS rows or more,
+    // linear8 when the inputs allow, linear otherwise
+    procedure LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
+      out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
   public
     /// the CPU part as TInferCpuFastBackend.Create, plus the CUDA device
     // (TInferCuda.Create: raises EInferCuda without one)
@@ -91,6 +96,9 @@ type
     property GpuLinears: Int64 read fGpuLinears;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
     property WeightEpoch: integer read fWeightEpoch;
+    /// the fast kernels of tools/cuda/linear.cu (linear8, gemm8) - default
+    // true; false: the plain linear kernel only (the tests compare both)
+    property FastLinear: boolean read fFastLinear write fFastLinear;
   end;
 
 
@@ -102,8 +110,12 @@ const
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
     0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4);
 
-  /// the threads of a block of tools/cuda/linear.cu
+  /// the threads of a block of linear and linear8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;
+  /// the threads of a gemm8 block (a tile of 64 rows x 64 features)
+  GEMM_BLOCK = 256;
+  /// from this many rows on a Linear runs gemm8 (as GEMM_ROWS on Vulkan)
+  GEMM_ROWS = 16;
 
 
 { TInferCudaBackend }
@@ -114,6 +126,38 @@ begin
   fCu := TInferCuda.Create;
   fLinearModule := TInferCuModule.Create(fCu, @PTX_LINEAR);
   fLinear := fLinearModule.Kernel('linear');
+  fLinear8 := fLinearModule.Kernel('linear8');
+  fGemm8 := fLinearModule.Kernel('gemm8');
+  fFastLinear := true;
+end;
+
+procedure TInferCudaBackend.LinearShape(aType: TInferDType; aIn, aRows,
+  aOut: PtrInt; out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
+begin
+  if fFastLinear and (aRows >= GEMM_ROWS) and (aIn and 31 = 0) then
+  begin
+    // 64 rows x 64 features per block
+    aKernel := fGemm8;
+    aX := (aOut + 63) shr 6;
+    aY := (aRows + 63) shr 6;
+    aBlock := GEMM_BLOCK;
+  end
+  else if fFastLinear and ((aType <> idtF32) or (aIn and 7 = 0)) then
+  begin
+    // 8 weights per step: every block type qualifies, F32 when aIn allows;
+    // 4 features (one per warp) x 8 rows per block
+    aKernel := fLinear8;
+    aX := (aOut + 3) shr 2;
+    aY := (aRows + 7) shr 3;
+    aBlock := LINEAR_BLOCK;
+  end
+  else
+  begin
+    aKernel := fLinear;
+    aX := aOut;
+    aY := aRows;
+    aBlock := LINEAR_BLOCK;
+  end;
 end;
 
 destructor TInferCudaBackend.Destroy;
@@ -170,7 +214,8 @@ procedure TInferCudaBackend.EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
   const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
 var
   pw, px, pb, py: TCuDevicePtr;
-  rows, nin, nout, dtype, hasBias: cardinal;
+  rows, nin, nout, dtype, hasBias, gx, gy, block: cardinal;
+  kernel: TCuHandle;
 begin
   if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or
      (aOut < 1) or (Int64(aOut) > high(integer)) or
@@ -187,8 +232,9 @@ begin
   nout := aOut;
   dtype := LINEAR_DTYPE[w.DType];
   hasBias := 0;
-  fCu.Enqueue(fLinear, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
-    @hasBias], nout, LINEAR_BLOCK, rows);
+  LinearShape(w.DType, aIn, aRows, aOut, kernel, gx, gy, block);
+  fCu.Enqueue(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
+    @hasBias], gx, block, gy);
 end;
 
 function TInferCudaBackend.Weight(aData: pointer; aType: TInferDType;
@@ -203,7 +249,10 @@ begin
       result := fWeightBuffer[i];
       exit;
     end;
-  result := TInferCuBuffer.Create(fCu, aBytes);
+  // rounded up to whole 32-bit words: linear8 and gemm8 read the weights as
+  // words, the last one of a Q8_0 or Q6_K row (34 and 210 bytes per block)
+  // reaches up to 2 bytes beyond the data (both sizes are even)
+  result := TInferCuBuffer.Create(fCu, (aBytes + 3) and not Int64(3));
   try
     result.Upload(0, aData, aBytes);
   except
@@ -249,7 +298,8 @@ var
   wbytes: Int64;
   wb, bb, xb, yb: TInferCuBuffer;
   pw, px, pb, py: TCuDevicePtr;
-  rows, nin, nout, dtype, hasBias: cardinal;
+  rows, nin, nout, dtype, hasBias, gx, gy, block: cardinal;
+  kernel: TCuHandle;
 begin
   // grid y holds the rows (at most 65535), grid x the outputs
   if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or
@@ -280,8 +330,9 @@ begin
     nout := aOut;
     dtype := LINEAR_DTYPE[w.DType];
     hasBias := ord(bias <> nil);
-    fCu.Launch(fLinear, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
-      @hasBias], nout, LINEAR_BLOCK, rows);
+    LinearShape(w.DType, aIn, aRows, aOut, kernel, gx, gy, block);
+    fCu.Launch(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
+      @hasBias], gx, block, gy);
     yb.Download(0, y, Int64(aRows) * aOut * 4);
     inc(fGpuLinears);
   finally

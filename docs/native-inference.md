@@ -1363,6 +1363,25 @@ Karte, C5 Tempo.
     abwechselnd mit und ohne Aufteilung; RTX 5090 175 Assertions grün unter FPC 3.2.2 und
     Delphi 13. Gegenprobe (Gewicht im Merge, Bereich um einen Schlüssel zu kurz, kein
     Umskalieren, Merge fehlt) scheitert in allen vier Fällen.
+  - *C5b, erledigt 2026-10-17:* die Matrixprodukte als CUDA-Formen von `linear8.comp`
+    (4 Ausgaben je Block, eine je Warp, bis 8 Zeilen, Warp-Shuffle-Summe) und `gemm8.comp`
+    (Kachel 64 × 64, Aktivierungen und entquantisierte Gewichte im Shared Memory), gewählt
+    wie auf Vulkan (`LinearShape`: `gemm8` ab 16 Zeilen, sonst `linear8`, der einfache
+    Kernel bleibt Rückfall; `FastLinear` schaltet auf ihn allein). Gewichtspuffer werden
+    auf ganze 32-Bit-Wörter aufgerundet: die Kernel lesen Wörter, das letzte einer
+    Q8_0- oder Q6_K-Zeile reichte bis 2 Byte hinter die Daten (Codex-Fund).
+
+    | Modell, Prompt | Vulkan | CUDA nach C5a | CUDA nach C5b |
+    |---|---|---|---|
+    | Q8_0, 200 | 13 670 / 361 | 1 922 / 243 | 12 335 / 266 |
+    | Q8_0, 1000 | 14 634 / 375 | 1 895 / 249 | 12 893 / 273 |
+    | Q4_K_M, 200 | 13 017 / 332 | 1 589 / 226 | 11 358 / 274 |
+    | Q4_K_M, 1000 | 13 922 / 346 | 1 548 / 213 | 11 887 / 281 |
+
+    Test: `LinearMatchesReference` jede Form mit und ohne `FastLinear`, dazu F32 mit 520,
+    100 und 36 Eingängen (alle drei Kernel); RTX 5090 265 Assertions grün unter FPC 3.2.2
+    und Delphi 13 und unter FPC 3.2.2 in der WSL (Linux, ganze Inferenz-Suite 2751). Gegenprobe (Bytes in `weights8`, Q4_K-Minimum, letzte Zeile in `gemm8`,
+    Shuffle über 16 Lanes, `gemm8` für ungeeignete Eingänge) scheitert in allen fünf Fällen.
 
 ### Danach — nach Bedarf
 
