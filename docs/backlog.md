@@ -271,7 +271,7 @@ deshalb `attention.comp`.
 
 ---
 
-## B10 — `matvec8.comp` Q8_0 rechnet auf der Adreno X1-85 falsch
+## B10 — `matvec8.comp` Q8_0 rechnet auf der Adreno X1-85 falsch (erledigt 2026-10-17)
 
 **Befund (2026-10-17):** `TTestInferVulkan.LinearMatchesReference` scheitert auf der
 Adreno-GPU des Snapdragon-Laptops an Q8_0 mit einer Tokenzeile, egal mit welchem Compiler
@@ -297,3 +297,17 @@ Helfern richtig rechnet.
 aus dem Shader in einen Debug-Puffer schreiben (gelesene Rohwörter je Einheit), mit den
 Gewichtsbytes vergleichen; danach Treiber-Workaround oder `matvec8` im Test auf Apple
 begrenzen. Jede Shader-Änderung im A/B-Lauf auf dem Mac (B8: Q8_0 98 Tokens/s).
+
+**Erledigt (2026-10-17):** Die Debug-Variante schrieb die gelesenen Wörter einmal mit festen
+Adressen und einmal aus der Schleife über die Einheiten in den Ausgabepuffer. Mit festen
+Adressen stimmten alle, in der Schleife las Einheit 1 jedes Quant-Wort ein Wort zu früh (Wort
+k−1 statt k). Der Adreno-Compiler rechnet `(a + 2 + 4k) >> 2` offenbar als `(a >> 2) + k` und
+verliert den Übertrag, wenn `a` 2 mod 4 ist; Einheit 0 (`a` = 0) trifft das nicht, Q6_K auch
+nicht (dort kommt zu einer Adresse 2 mod 4 nie eine 2 hinzu, die einen Übertrag auslöst).
+Darum blieben alle drei Shader-Umbauten von `word2` wirkungslos: falsch war der Wortindex,
+nicht das Zusammensetzen. Q8_0 rechnet den Index jetzt ohne diesen Übertrag
+(`(a >> 2) + ((a >> 1) & 1)`, Bitlage `16 - (a & 2) * 8`, Helfer `wordAt`). Adreno: die
+Probe über Eingänge, Zeilen, Ausgänge und Bias komplett grün, `LinearMatchesReference`
+292/292; RTX 5090: Vulkan-Suite 360/360. Der SPIR-V-Code für Q4_K und Q6_K ist bis auf
+die Nummerierung gleich, der für Q8_0 hat zwei Befehle weniger; ein A/B-Lauf auf dem Mac
+steht noch aus.

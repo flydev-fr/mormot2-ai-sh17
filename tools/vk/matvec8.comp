@@ -7,9 +7,9 @@
 //   group (four per group decoded 5 % slower on the M2 Pro: fewer work
 //   groups); an invocation takes units of 32 consecutive weights - a Q8_0
 //   block, a Q4_K sub-block, a quarter of a Q6_K half - reading their scales
-//   once and their quants as whole words (shifted by 16 bits where a Q8_0 or
-//   Q6_K block starts at 2 mod 4: both sizes are even, Q4_K blocks are
-//   4-aligned); linear8.comp reads the scales byte by byte for every 8
+//   once and their quants as whole words (shifted by 16 bits where they start
+//   at 2 mod 4: a Q8_0 block at 0 mod 4, its quants follow a 2-byte scale; a
+//   Q6_K block at 2 mod 4; Q4_K blocks are 4-aligned); linear8.comp reads the scales byte by byte for every 8
 //   weights
 // - the dequantization is that of InferRowToF32 (linear8.comp: weights8)
 // - TInferVulkanBackend takes it on Apple GPUs only (UseMatvec): an RTX 5090
@@ -63,14 +63,18 @@ float dot4n(uint v, uint sh, vec4 a)
          float((v >> (sh + 24u)) & 15u) * a.w;
 }
 
-// the 4 bytes at the even byte address a as a word: at 2 mod 4 the halves of
-// two words - without a branch (neighbour invocations alternate between both
+// the 4 bytes from bit sh (0 or 16) of word i on: at 16 the halves of two
+// words - without a branch (neighbour invocations alternate between both
 // cases for Q8_0 and Q6_K), and without a read past the word of the last byte
+uint wordAt(uint i, uint sh)
+{
+  return (w[i] >> sh) | ((w[i + (sh >> 4)] << 16) << (16u - sh));
+}
+
+// the 4 bytes at the even byte address a as a word
 uint word2(uint a)
 {
-  uint i = a >> 2;
-  uint sh = (a & 2u) * 8u; // 0 or 16
-  return (w[i] >> sh) | ((w[i + (sh >> 4)] << 16) << (16u - sh));
+  return wordAt(a >> 2, (a & 2u) * 8u);
 }
 
 // the 2 bytes at the even byte address a (never past their own word)
@@ -95,8 +99,13 @@ float unitDot(uint rowBase, uint u, vec4 xv[8])
     // Q8_0: 34 bytes per 32 values, value = d * qs[j]
     uint a = rowBase + u * 34u;
     float d = unpackHalf2x16(half16(a)).x;
+    // the quants from byte a + 2 on: word qi, bit qs; not word2(a + 2u + 4u *
+    // k) - the Adreno X1-85 compiler took (a + 2 + 4 k) >> 2 for
+    // (a >> 2) + k, losing the carry where a is 2 mod 4 (backlog B10)
+    uint qi = (a >> 2) + ((a >> 1) & 1u);
+    uint qs = 16u - (a & 2u) * 8u;
     for (uint k = 0u; k < 8u; k++)
-      s += dot4s(word2(a + 2u + 4u * k), xv[k]);
+      s += dot4s(wordAt(qi + k, qs), xv[k]);
     return d * s;
   }
   else if (DT == 3u)
