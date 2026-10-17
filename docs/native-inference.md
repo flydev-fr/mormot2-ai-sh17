@@ -1321,6 +1321,28 @@ Karte, C5 Tempo.
     hintereinander; `UploadDownload` prüft `CopyTo`. RTX 5090: 112 Assertions grün unter
     FPC 3.2.2 und Delphi 13. Gegenprobe (Teiler der Norm, Vorzeichen der Rotation,
     Kausalgrenze) lässt 14 von 23 scheitern.
+- *C4, erledigt 2026-10-17:* `TQwen3Cuda` (`mormot.ai.infer.model.qwen3.cuda`), die
+  CUDA-Form von `TQwen3Vulkan` hinter demselben `TQwen3Device`-Vertrag: der ganze
+  Forward-Pass auf der Karte, `TNativeLlmClient` nimmt sie über `Device`.
+  - *Ablauf:* je Chunk und Schicht `EnqueueLinear` (Q, K, V, O, Gate, Up, Down; ohne
+    Warten, Gewichte aus dem Cache des Backends), `qkrope`, `attention`, `addnorm`
+    (Residuum plus Norm der nächsten Schicht), `swiglu`; zuletzt Norm, Kopf und ein
+    einziger Download der Logits. `GpuLock` hält die Karte über den ganzen Pass; `Linear`
+    anderer Threads rechnet derweil auf der CPU.
+  - *Speicher:* Chunks bis 256 Zeilen, halbiert, bis die Scores der Attention unter 256 MB
+    bleiben (eine Zeile allein kann darüber liegen, bis C5 die Attention ohne Scores-Puffer
+    bringt). Der KV-Cache wächst wie auf der CPU und kopiert die vorhandenen Token auf der
+    Karte um (`CopyTo`); der Scores-Puffer bekommt ein Viertel Reserve, sonst würde jeder
+    Decode-Schritt neu anlegen.
+  - *Test:* `TinyQwen3MatchesCpu` (F32 und Q8_0: Prompt über zwei Chunks, Decode,
+    Präfix-Wiederverwendung, `ClearWeights`, Greedy, Cache-Wachstum mit Inhalt),
+    `TinyHeadDim256MatchesCpu`, `Qwen3GgufMatchesCpu` (Qwen3-0.6B Q4_K_M: Logit-Cosinus
+    mindestens 0,9972, Q8_0 0,9991, Argmax 16 von 16) und `NativeClientOnDevice` (Antwort
+    wortgleich zum Backend, nächster Schritt aus dem Prompt-Cache auf der Karte). RTX 5090:
+    159 Assertions grün unter FPC 3.2.2 und Delphi 13 und unter FPC 3.2.2 in der WSL
+    (Linux, ganze Inferenz-Suite 2645). Gegenprobe (Scores-Abstand, Norm der falschen
+    Schicht, letzte Zeile, Länge nach Decode, Cache-Wachstum ohne Kopie) scheitert in jedem
+    der fünf Fälle.
 
 ### Danach — nach Bedarf
 

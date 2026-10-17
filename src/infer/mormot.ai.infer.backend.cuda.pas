@@ -74,6 +74,17 @@ type
     procedure ClearWeights;
     /// true when Linear runs weights of aType with aIn inputs on the device
     function GpuLinear(aType: TInferDType; aIn: PtrInt): boolean;
+    /// take the device for a sequence of enqueued operations (a forward pass
+    // on the GPU): Linear computes on the CPU meanwhile
+    procedure GpuLock;
+    procedure GpuUnLock;
+    /// the device copy of a weight (uploaded on first use) - GpuLock held
+    function DeviceWeight(aData: pointer; aType: TInferDType;
+      aBytes: Int64): TInferCuBuffer;
+    /// enqueue y = x * w^T (no bias), the weights from the cache - GpuLock
+    // held; x and y are [aRows, aIn] and [aRows, aOut] at offset 0; no wait
+    procedure EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
+      const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
     /// the device context
     property Cuda: TInferCuda read fCu;
     /// how many Linear calls ran on the device
@@ -137,6 +148,47 @@ function TInferCudaBackend.GpuLinear(aType: TInferDType; aIn: PtrInt): boolean;
 begin
   result := (LINEAR_DTYPE[aType] <> 0) and (aIn > 0) and
     (aIn mod INFER_DTYPE_BLOCK[aType] = 0);
+end;
+
+procedure TInferCudaBackend.GpuLock;
+begin
+  fGpu.Lock;
+end;
+
+procedure TInferCudaBackend.GpuUnLock;
+begin
+  fGpu.UnLock;
+end;
+
+function TInferCudaBackend.DeviceWeight(aData: pointer; aType: TInferDType;
+  aBytes: Int64): TInferCuBuffer;
+begin
+  result := Weight(aData, aType, aBytes);
+end;
+
+procedure TInferCudaBackend.EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
+  const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
+var
+  pw, px, pb, py: TCuDevicePtr;
+  rows, nin, nout, dtype, hasBias: cardinal;
+begin
+  if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or
+     (aOut < 1) or (Int64(aOut) > high(integer)) or
+     (Int64(aIn) > high(integer)) then
+    raise EInferCuda.CreateUtf8('%.EnqueueLinear: % rows of % % into %',
+      [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
+  pw := Weight(w.Data, w.DType, Int64(aOut) * (aIn div INFER_DTYPE_BLOCK[w.DType]) *
+    INFER_DTYPE_SIZE[w.DType]).Ptr;
+  px := x.Ptr;
+  pb := 0;
+  py := y.Ptr;
+  rows := aRows;
+  nin := aIn;
+  nout := aOut;
+  dtype := LINEAR_DTYPE[w.DType];
+  hasBias := 0;
+  fCu.Enqueue(fLinear, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
+    @hasBias], nout, LINEAR_BLOCK, rows);
 end;
 
 function TInferCudaBackend.Weight(aData: pointer; aType: TInferDType;
