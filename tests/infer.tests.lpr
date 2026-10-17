@@ -24,7 +24,8 @@ uses
   test.infer.bpe,
   test.infer.qwen3,
   test.infer.llm,
-  test.infer.vulkan;
+  test.infer.vulkan,
+  test.infer.cuda;
 
 type
   TInferTests = class(TSynTestsLogged)
@@ -44,7 +45,8 @@ begin
     TTestInferBpe,
     TTestInferQwen3,
     TTestInferLlmNative,
-    TTestInferVulkan
+    TTestInferVulkan,
+    TTestInferCuda
   ]);
 end;
 

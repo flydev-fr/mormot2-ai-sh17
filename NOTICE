@@ -37,6 +37,12 @@ Vulkan-Headers  (Khronos Group)  (FOLLOWED: the compute subset of vulkan_core.h)
   MIT branch applies. Copyright 2015-2026 The Khronos Group Inc.
   https://github.com/KhronosGroup/Vulkan-Headers
 
+CUDA driver API  (NVIDIA)  (LOOKED UP ONLY: names and signatures)
+  src/infer/mormot.ai.infer.cuda.pas declares the driver entry points it loads at
+  run time (nvcuda.dll, libcuda.so.1) after the CUDA Driver API reference and
+  cuda.h of CUDA 13.4.92; no NVIDIA code or header is copied or shipped.
+  https://docs.nvidia.com/cuda/cuda-driver-api/
+
 llama.cpp  (ggml-org)  (PORTED: Unigram tokenizer)
   src/infer/mormot.ai.infer.tokenizer.ugm.pas is ported from src/llama-vocab.cpp
   (llm_tokenizer_ugm) at commit 6868a52cb337450658006ad2f9281c2eb63f1666

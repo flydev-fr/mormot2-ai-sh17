@@ -116,11 +116,15 @@ byteweise Entpacken nach Q8_0.
 geladen, **keine** mitgelieferte DLL), Kernel als eingebettetes PTX.
 
 **Voraussetzung:** Vulkan-Backend (Phase 4) steht; dessen Backend-Schnittstelle und
-Differenztests werden wiederverwendet. Bau-Rechner braucht `nvcc` (fehlt heute überall).
+Differenztests werden wiederverwendet. Bau-Rechner braucht `nvcc` (pip-Paket, siehe Stand).
 
 **Vorlagen:** calm (zeux, MIT), llama.cpp CUDA (MIT).
 
 **Fertig, wenn:** dieselben Referenztests wie die CPU grün auf dem RTX-Rechner (RTX 5090).
+
+**Stand:** C1 (Fundament) erledigt 2026-10-17, siehe `native-inference.md` „CUDA“. `nvcc`
+kommt aus NVIDIAs pip-Paket (13.4.92) und läuft auf dem Laptop; auf dem RTX-Rechner musste
+nichts installiert werden. Als Nächstes C2 (`Linear` F32/Q8_0/Q4_K/Q6_K).
 
 ---
 

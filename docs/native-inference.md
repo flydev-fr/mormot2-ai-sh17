@@ -1275,6 +1275,30 @@ llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.
 
+#### CUDA (Backlog B3)
+
+In Scheiben: C1 Fundament, C2 `Linear`, C3 die übrigen Operationen, C4 Qwen3 ganz auf der
+Karte, C5 Tempo.
+
+- *C1, erledigt 2026-10-17:* `mormot.ai.infer.cuda`.
+  - *Bindung:* die Driver API, zur Laufzeit geladen (`nvcuda.dll`, `libcuda.so.1`), nur
+    was Compute braucht: Gerät, Primärkontext (`cuDevicePrimaryCtxRetain` statt
+    `cuCtxCreate`, dessen Signatur sich mit CUDA 13 geändert hat), Module aus PTX,
+    Gerätespeicher, `cuLaunchKernel`. Jede öffentliche Methode macht den Kontext auf dem
+    rufenden Thread aktuell. Nur 64-Bit; sonst ist `TInferCuda.Available` falsch.
+  - *Kernel:* CUDA C unter `tools/cuda/`, mit `nvcc` nach PTX (`compute_75`), eingecheckt
+    als `cardinal`-Arrays (`mormot.ai.infer.cuda.ptx.inc`, `tools/cuda/build-kernels.sh`).
+    Der Treiber übersetzt das PTX beim Laden für seine GPU. `nvcc` 13.4.92 kommt aus
+    NVIDIAs pip-Paket und läuft auch auf aarch64: gebaut wird auf dem Laptop, der
+    RTX-Rechner bleibt Testrechner. Das PTX (ISA 9.4) verlangt einen Treiber für CUDA 13.4
+    oder neuer (PTX ist von NVIDIAs Minor-Version-Kompatibilität ausgenommen) und
+    mindestens Turing.
+  - *Test:* `TTestInferCuda` (`AddMatchesCpu` bitgleich über 1 000 003 und 17 Werte,
+    `RefusesMisuse` mit dem Fehlernamen des Treibers, `UploadDownload`), ohne Treiber
+    SKIP, `LAI_REQUIRE_CUDA=1` macht daraus einen Fehler. RTX 5090 (Compute 12.0, Treiber
+    CUDA 13.4): 11 Assertions grün unter FPC 3.2.2 und Delphi 13. Gegenprobe (Kernel
+    subtrahiert) lässt 2 scheitern.
+
 ### Danach — nach Bedarf
 
 Weitere Architekturen (Llama 3, Mistral, Gemma), Reranker (BGE-Reranker),

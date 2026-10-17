@@ -119,6 +119,26 @@ never a build input.
            (Ubuntu 24.04 package glslang-tools 15.1.0-2~ubuntu0.24.04.2), driven by
            tools/vk/build-shaders.sh -> src/infer/mormot.ai.infer.vulkan.spv.inc.
 
+## GPU: CUDA (backlog B3)
+
+  Project: NVIDIA CUDA Toolkit 13.4.92 - cuda.h of the PyPI wheel
+           nvidia-cuda-nvcc 13.4.92 (nvidia/cu13/include/cuda.h)
+  URL:     https://docs.nvidia.com/cuda/cuda-driver-api/
+  License: NVIDIA's own (header) - therefore looked up only
+  Use:     looked up only (names and signatures of the driver entry points, the
+           device attribute numbers), nothing copied: the declarations in
+           src/infer/mormot.ai.infer.cuda.pas are written anew. Update: compare
+           the entry points used there with a newer cuda.h.
+
+  Kernel compiler (build time only, output checked in): nvcc 13.4.92 (V13.4.92,
+           build cuda_13.4.r13.4/compiler.38855100_0) from the same wheel, target
+           compute_75, driven by tools/cuda/build-kernels.sh ->
+           src/infer/mormot.ai.infer.cuda.ptx.inc. The PTX (ISA 9.4) needs a
+           driver for CUDA 13.4 or newer (PTX is excluded from minor version
+           compatibility). An older nvcc would widen that, but the CUDA 12
+           wheels carry only ptxas and its aarch64 archive does not compile with
+           the glibc 2.39 headers of the build machine.
+
 ## Native inference engine: reference data and models
 
   Generator: tools/infer-ref/make_reference.py, environment pinned in
