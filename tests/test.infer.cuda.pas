@@ -14,12 +14,14 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.cuda,
   mormot.ai.infer.backend.cuda,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.qwen3.cuda,
   mormot.ai.llm.types,
@@ -82,6 +84,12 @@ type
     // answer of Qwen3-0.6B Q8_0 as without it, the next turn from the prompt
     // cache on the device, back to the backend with Device := nil
     procedure NativeClientOnDevice;
+    /// tiny Qwen3-MoE on the device against the CPU: F32, Q8_0 from GGUF (the
+    // experts of a layer in one buffer) and quantized at load, half floats
+    procedure TinyMoeMatchesCpu;
+    /// Qwen3-30B-A3B (Q4_K_M GGUF) on the device against the fast CPU backend,
+    // teacher-forced - where the file was put
+    procedure Qwen3MoeGgufMatchesCpu;
   end;
 
 
@@ -1331,6 +1339,217 @@ begin
     cu.Free;
     model.Free;
     ref.Free;
+    gpu.Free;
+  end;
+end;
+
+
+procedure TTestInferCuda.TinyMoeMatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the router of the tiny model is sharp (as in TTestInferQwen3): the
+  // rounding of a half-float cache comes out of three layers at up to 4.6e-3
+  // (measured 2026-10-17), where the dense tiny-qwen3 stays within 4e-3
+  TOL: array[boolean] of double = (1e-4, 6e-3);
+var
+  dir: TFileName;
+  gpu: TInferCudaBackend;
+  ref: TInferCpuBackend;
+  model: TDecoderModel;
+  vk: TQwen3Cuda;
+  c1: TQwen3Context;
+  c2: TQwen3CuContext;
+  ids: TIntegerDynArray;
+  l1, l2: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  SetLength(ids, PROMPT);
+  seed := 11;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  // 0: F32 (each expert a buffer of its own), 1: the Q8_0 GGUF (the experts
+  // of a layer one buffer, every expert an offset), 2: Q8_0 quantized at load
+  // (each expert its own buffer), 3: F32 with the cache in half floats
+  for k := 0 to 3 do
+  begin
+    gpu := TInferCudaBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      case k of
+        1:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'q8_0.gguf']), ref);
+        2:
+          model := TQwen3MoeModel.Create(dir, ref, idtQ8_0);
+      else
+        model := TQwen3MoeModel.Create(dir, ref);
+      end;
+      Check(model is TQwen3MoeModel, 'a Qwen3-MoE model');
+      v := model.Config.VocabSize;
+      vk := TQwen3Cuda.Create(model, gpu);
+      vk.KvF16 := k = 3;
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      Check(c2.Length = PROMPT, 'context length');
+      if k in [0, 3] then
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[vk.KvF16], 'MoE F32 prompt logits (KvF16 %): relative error %',
+          [vk.KvF16, e]);
+      end
+      else
+      begin
+        // Q8_0 at load: the CPU also quantizes the activations, the device
+        // not - over 300 tokens measured cosine 0.9988 (the router passes the
+        // difference on), the Q8_0 GGUF 0.999
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.998), 'MoE Q8_0 (%) prompt logits: %',
+          [k, InferCompareText(cmp)]);
+      end;
+      // decoding: one token, two experts of it in a layer
+      for i := 0 to 4 do
+      begin
+        id := ids[i];
+        vk.SplitKeys := (i and 1) * 64;
+        vk.UseGraphs := true; // no graph with experts, whatever it says
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+        if k in [0, 3] then
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[vk.KvF16], 'MoE F32 decode step % (KvF16 %): relative error %',
+            [i, vk.KvF16, e]);
+        end
+        else
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999), 'MoE Q8_0 (%) decode step %: %',
+            [k, i, InferCompareText(cmp)]);
+        end;
+      end;
+      // the backend forgot its weights: the experts go up again
+      gpu.ClearWeights;
+      id := ids[200];
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999), 'MoE after ClearWeights: %', [InferCompareText(cmp)]);
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferCuda.Qwen3MoeGgufMatchesCpu;
+const
+  // "Wie verlege ich ein Kupferrohr?" as for Qwen3-0.6B: the same tokenizer
+  PROMPT: array[0..11] of integer = (
+    151644, 872, 198, 54, 645, 2739, 273, 10109, 12153, 3105, 63084, 30);
+  STEPS = 16;
+var
+  dir, gguf: TFileName;
+  i, v, agree: PtrInt;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuFastBackend;
+  model: TDecoderModel;
+  vk: TQwen3Cuda;
+  c1: TQwen3Context;
+  c2: TQwen3CuContext;
+  l1, l2: TSingleDynArray;
+  cmp: TInferCompare;
+  worst: double;
+  id: integer;
+  timer: TPrecisionTimer;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3-30B-A3B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  // a large model of its own: only where it was put (not LAI_REQUIRE_MODEL)
+  dir := FindQwen3Folder('model.safetensors');
+  gguf := '';
+  if dir <> '' then
+    gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+      'qwen3-30b-a3b-q4_k_m.gguf');
+  if (gguf = '') or not FileExists(gguf) then
+  begin
+    AddConsole('SKIP Qwen3-30B-A3B on the device: no vendor/models/qwen3-30b-a3b-q4_k_m.gguf');
+    exit;
+  end;
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  model := nil;
+  vk := nil;
+  c1 := nil;
+  c2 := nil;
+  try
+    model := NewDecoderModelFromGguf(gguf, cpu);
+    v := model.Config.VocabSize;
+    timer.Start;
+    vk := TQwen3Cuda.Create(model, gpu);
+    AddConsole('Qwen3-30B-A3B uploaded in %', [timer.Stop]);
+    c1 := model.NewContext;
+    c2 := vk.NewContext;
+    SetLength(l1, v);
+    SetLength(l2, v);
+    model.Forward(c1, @PROMPT[0], length(PROMPT), pointer(l1));
+    vk.Forward(c2, @PROMPT[0], length(PROMPT), pointer(l2));
+    worst := 1;
+    agree := 0;
+    for i := 0 to STEPS - 1 do
+    begin
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      if cmp.Cosine < worst then
+        worst := cmp.Cosine;
+      // InferCompare leaves a NaN or an infinity out of the cosine
+      if cmp.NonFinite <> 0 then
+        worst := -1;
+      id := InferArgMax(pointer(l1), v);
+      if InferArgMax(pointer(l2), v) = id then
+        inc(agree);
+      // the CPU's token to both: the comparison stays on one path
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+    end;
+    AddConsole('Qwen3-30B-A3B on %: lowest logits cosine %, argmax agrees % of %',
+      [fCu.DeviceName, worst, agree, STEPS]);
+    // the expert choice of a near tie may differ between the CPU and the
+    // device: measured lowest cosine 0.992 (FPC) and 0.988 (Delphi 13, other
+    // CPU kernels) on 2026-10-17 - the argmax agreement is the sharper test
+    CheckUtf8(worst >= 0.98, 'Qwen3-30B-A3B logits cosine %', [worst]);
+    CheckUtf8(agree >= STEPS - 2, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
+  finally
+    c2.Free;
+    c1.Free;
+    vk.Free;
+    model.Free;
+    cpu.Free;
     gpu.Free;
   end;
 end;

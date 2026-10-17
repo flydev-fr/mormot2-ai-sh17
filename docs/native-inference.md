@@ -1608,6 +1608,44 @@ Tokens/s bei 200 Tokens Prompt (zum Vergleich Qwen3-0.6B Q8_0: 759 und 70). Antw
 `chat_en` mit „Paris“. Grün unter FPC 3.2.2, Delphi 13 (je 3165 Assertions) und Delphi 7
 (1978, der 30B-Test braucht einen 64-Bit-Prozess).
 
+**D3a erledigt (2026-10-17): Mixture of Experts auf CUDA.**
+
+- `TQwen3Cuda` nimmt Layer mit Experten. Der Router rechnet auf dem Gerät, seine Logits
+  kommen herunter (ein Warten je MoE-Layer), die Wahl trifft der Host wie auf der CPU
+  (`TDecoderModel.Route`). Die Token-Zeilen und Gewichte jedes Experten gehen in einem
+  Upload hoch; dann Experte für Experte in Id-Reihenfolge: `gatherrows` sammelt seine
+  Zeilen, die vorhandenen Linear-Kernel rechnen Gate, Up und Down
+  (`TInferCudaBackend.EnqueueLinearAt`: Gewichte an einer Geräteadresse), `swiglu`,
+  `scatteradd` addiert mit dem Router-Gewicht in die Zeilen seiner Tokens (`tools/cuda/ops.cu`:
+  `fill0`, `gatherrows`, `scatteradd`).
+- Die Experten eines Layers liegen als ein Puffer auf dem Gerät, wenn sie im Speicher des
+  Hosts hintereinander liegen (ein 3-D-Tensor im GGUF): jeder Experte ein Versatz. Sonst
+  (safetensors) ein Puffer je Experte. Einzelne Puffer für die 18432 Experten von
+  Qwen3-30B-A3B hätten die 2-MB-Granularität von CUDA mehr als verdoppelt (rund 40 GB).
+- Kein CUDA-Graph mit Experten: der Host wählt in jedem Layer.
+
+*Tests:* `TinyMoeMatchesCpu` (F32 mit einem Puffer je Experte, Q8_0 aus GGUF in einem Puffer,
+Q8_0 beim Laden, Cache in Halbfloats; 300 Tokens Prompt in zwei Chunks, Decode-Schritte,
+`ClearWeights`), `Qwen3MoeGgufMatchesCpu` (Qwen3-30B-A3B gegen die schnelle CPU, Token für
+Token vorgegeben: unter FPC Argmax 16 von 16 und kleinster Kosinus 0,992, unter Delphi 13 mit
+anderen CPU-Kerneln 15 von 16 und 0,988 - bei knappen Router-Entscheidungen kann ein Experte
+kippen; Schwelle 0,98 und 14 von 16).
+Toleranzen des scharfen Tiny-Routers: Halbfloat-Cache bis 4,6e-3, Q8_0 beim Laden Kosinus
+0,9988 (die CPU quantisiert auch die Aktivierungen). Gegenprobe: neun eingebaute Fehler
+(`scatteradd` ohne Router-Gewicht, `gatherrows` nimmt die Zeile des Blocks, Ausgabe nicht
+geleert, alle Experten die Token des ersten, alle Experten auf derselben Adresse, Experten
+immer als ein Puffer genommen, ein Graph trotz Experten, Router-Gewichte nicht übernommen,
+die Router-Logits der ersten Zeile für alle) - alle scheitern, einer durch einen hängenden
+Kernel (Lesen über den Puffer hinaus). Review: Codex fand, dass `InferCompare` NaN und
+unendliche Werte aus dem Kosinus herausnimmt; die neuen Tests prüfen `NonFinite` mit.
+
+*Qwen3-30B-A3B Q4_K_M auf der RTX 5090 (CUDA):* hochgeladen in 2,8 s; Prefill 384 Tokens/s
+bei 200 Tokens Prompt, 494 bei 2000 (CPU: 85 und 67); Decode 33 bis 35 Tokens/s (CPU: 16 und
+11). Der Decode hängt an den drei Wartepunkten je MoE-Layer (Router herunter, zwei Uploads)
+und an rund 45 Kernel-Starts je MoE-Layer ohne Graph - der nächste Hebel ist die Wahl auf
+dem Gerät (ein Route-Kernel, Linear mit Experten-Ids aus einem Gerätepuffer, dann wieder ein
+Graph).
+
 ### Danach — nach Bedarf
 
 Reranker (BGE-Reranker), Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding; weitere

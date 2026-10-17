@@ -12,6 +12,13 @@
 // - the KV cache holds half floats by default (KvF16), as on Vulkan
 // - the model's weights are uploaded once, at Create; the model and the
 //   backend must outlive the TQwen3Cuda and its contexts
+// - a mixture of experts (dfMoe, phase D slice D3): the router logits on the
+//   device, the choice of the experts on the host (TDecoderModel.Route, one
+//   wait per layer with experts), then expert by expert in id order its tokens
+//   gathered, its SwiGLU block by the Linear kernels, its output added back
+//   with the router weights (gatherrows, scatteradd); the experts of a layer
+//   stay one buffer when they are one tensor in the file (GGUF), each expert
+//   an offset in it - a decode step then is no CUDA graph
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -46,6 +53,9 @@ type
   /// one device buffer per layer
   TInferCuBufferDynArray = array of TInferCuBuffer;
 
+  /// the device address of every expert of a layer
+  TCuDevicePtrDynArray = array of TCuDevicePtr;
+
   /// one sequence: its token ids and its KV cache on the device
   // - a TQwen3Context of TQwen3Cuda: Length, Common, Truncate, Reset and the
   // ids at every position as there (Capacity: of the device cache); the CPU
@@ -59,6 +69,11 @@ type
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp,
       fDevCos: TInferCuBuffer;
     fPart, fLogits: TInferCuBuffer; // the key ranges of the attention, logits
+    // a layer with experts: router logits, the rows of one expert (gathered
+    // input, output), the token rows and weights of every expert in id order
+    fDevRoute, fDevGather, fDevExpOut, fDevIdx, fDevW: TInferCuBuffer;
+    fRoute, fChosenW, fW: TSingleDynArray;
+    fChosen, fIdx, fStart: TIntegerDynArray;
     // the inputs of a chunk on the host: embeddings, then cos, then sin
     fIn: TSingleDynArray;
     // the decode step as a graph (TQwen3Cuda.UseGraphs), on fCu
@@ -83,6 +98,10 @@ type
     fCu: TInferCuda;
     fOps, fBasic: TInferCuModule;
     fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fMerge, fAdd: TCuHandle;
+    fFill0, fGather, fScatter: TCuHandle; // a mixture of experts
+    fMoe: boolean; // a layer with experts: no graph, routed on the host
+    // per layer with experts: where every expert's gate, up and down are
+    fExpertGate, fExpertUp, fExpertDown: array of TCuDevicePtrDynArray;
     fQkRope16, fAttention16: TCuHandle; // for a KV cache of half floats
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
@@ -97,6 +116,8 @@ type
       w: PSingleArray; y: TInferCuBuffer);
     procedure EnqueueAddNorm(x, t: TInferCuBuffer; aRows, aCols: PtrInt;
       w: PSingleArray; y: TInferCuBuffer);
+    /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out
+    procedure EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
   public
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no kernel (F32, Q8_0, Q4_K, Q6_K do)
@@ -128,6 +149,7 @@ type
     /// a decode step (one token) is recorded as a CUDA graph and launched at
     // once instead of some 370 kernel launches - default true; the graph of
     // the previous step takes the new parameters (TInferCuda.CaptureEnd)
+    // - not for a model with experts: the host chooses them in every layer
     property UseGraphs: boolean
       read fUseGraphs write fUseGraphs;
     /// the KV cache in half floats (default) instead of floats: half the
@@ -193,6 +215,11 @@ begin
   FreeAndNil(fDevGate);
   FreeAndNil(fDevUp);
   FreeAndNil(fDevCos);
+  FreeAndNil(fDevRoute);
+  FreeAndNil(fDevGather);
+  FreeAndNil(fDevExpOut);
+  FreeAndNil(fDevIdx);
+  FreeAndNil(fDevW);
   fRows := 0;
 end;
 
@@ -216,13 +243,17 @@ end;
 { TQwen3Cuda }
 
 constructor TQwen3Cuda.Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
+var
+  l: PtrInt;
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
-  // the layers it runs: attention and a dense SwiGLU block (Qwen3)
-  if not aModel.HasOnly(dmAttention, dfDense) then
-    EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+  // the layers it runs: attention, and a dense SwiGLU block or experts
+  for l := 0 to high(aModel.Config.Spec) do
+    if aModel.Config.Spec[l].Mixer <> dmAttention then
+      EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+  fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
@@ -241,6 +272,9 @@ begin
   fQkRope16 := fOps.Kernel('qkrope16');
   fAttention16 := fOps.Kernel('attention16');
   fMerge := fOps.Kernel('attnmerge');
+  fFill0 := fOps.Kernel('fill0');
+  fGather := fOps.Kernel('gatherrows');
+  fScatter := fOps.Kernel('scatteradd');
   fSplitKeys := SPLIT_KEYS;
   fUseGraphs := true;
   fKvF16 := true;
@@ -283,12 +317,54 @@ var
       (aCols div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]);
   end;
 
+  // the experts of a layer: one buffer when they lie one after the other in
+  // host memory (a tensor of a GGUF file), else one buffer per expert
+  procedure Experts(const w: TInferWeightDynArray; aRows, aCols: PtrInt;
+    out aPtr: TCuDevicePtrDynArray);
+  var
+    e: PtrInt;
+    slice: Int64;
+    one: boolean;
+    base: TCuDevicePtr;
+  begin
+    SetLength(aPtr, length(w));
+    one := true;
+    for e := 0 to high(w) do
+    begin
+      if not fBackend.GpuLinear(w[e].DType, aCols) then
+        EInferError.RaiseUtf8('%: no kernel for a % expert of % columns',
+          [self, INFER_DTYPE_NAME[w[e].DType], aCols]);
+      if (w[e].DType <> w[0].DType) or (PtrUInt(w[e].Data) <> PtrUInt(w[0].Data) +
+         PtrUInt(e) * PtrUInt(Int64(aRows) * (aCols div INFER_DTYPE_BLOCK[w[0].DType]) *
+         INFER_DTYPE_SIZE[w[0].DType])) then
+        one := false;
+    end;
+    if one then
+    begin
+      slice := Int64(aRows) * (aCols div INFER_DTYPE_BLOCK[w[0].DType]) *
+        INFER_DTYPE_SIZE[w[0].DType];
+      base := fBackend.DeviceWeight(w[0].Data, w[0].DType, slice * length(w)).Ptr;
+      for e := 0 to high(w) do
+        aPtr[e] := base + e * slice;
+    end
+    else
+      for e := 0 to high(w) do
+        aPtr[e] := fBackend.DeviceWeight(w[e].Data, w[e].DType, Int64(aRows) *
+          (aCols div INFER_DTYPE_BLOCK[w[e].DType]) * INFER_DTYPE_SIZE[w[e].DType]).Ptr;
+  end;
+
 begin
   // everything up front: the first token would otherwise carry the transfer
   // - the caller holds GpuLock
   c := fModel.Config;
   qw := c.Heads * c.HeadDim;
   kvw := c.KvHeads * c.HeadDim;
+  fExpertGate := nil;
+  fExpertUp := nil;
+  fExpertDown := nil;
+  SetLength(fExpertGate, c.Layers);
+  SetLength(fExpertUp, c.Layers);
+  SetLength(fExpertDown, c.Layers);
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
@@ -296,9 +372,19 @@ begin
     Matrix(ly^.K, kvw, c.Hidden);
     Matrix(ly^.V, kvw, c.Hidden);
     Matrix(ly^.O, c.Hidden, qw);
-    Matrix(ly^.Gate, c.Intermediate, c.Hidden);
-    Matrix(ly^.Up, c.Intermediate, c.Hidden);
-    Matrix(ly^.Down, c.Hidden, c.Intermediate);
+    if c.Spec[l].Ffn = dfMoe then
+    begin
+      Matrix(ly^.Router, c.Experts, c.Hidden);
+      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l]);
+      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l]);
+      Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l]);
+    end
+    else
+    begin
+      Matrix(ly^.Gate, c.Intermediate, c.Hidden);
+      Matrix(ly^.Up, c.Intermediate, c.Hidden);
+      Matrix(ly^.Down, c.Hidden, c.Intermediate);
+    end;
     Vector(ly^.InputNorm, c.Hidden);
     Vector(ly^.PostNorm, c.Hidden);
     Vector(ly^.QNorm, c.HeadDim);
@@ -406,10 +492,26 @@ begin
     NeedDevice(fCu, aCtx.fDevAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
     NeedDevice(fCu, aCtx.fDevK, Int64(aRows) * kvw * 4);
     NeedDevice(fCu, aCtx.fDevV, Int64(aRows) * kvw * 4);
-    NeedDevice(fCu, aCtx.fDevGate, Int64(aRows) * c.Intermediate * 4);
-    NeedDevice(fCu, aCtx.fDevUp, Int64(aRows) * c.Intermediate * 4);
+    NeedDevice(fCu, aCtx.fDevGate, Int64(aRows) *
+      MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
+    NeedDevice(fCu, aCtx.fDevUp, Int64(aRows) *
+      MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
     NeedDevice(fCu, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     SetLength(aCtx.fIn, aRows * (c.Hidden + 2 * half));
+    if fMoe then
+    begin
+      NeedDevice(fCu, aCtx.fDevRoute, Int64(aRows) * c.Experts * 4);
+      NeedDevice(fCu, aCtx.fDevGather, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fCu, aCtx.fDevExpOut, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fCu, aCtx.fDevIdx, Int64(aRows) * c.ExpertsUsed * 4);
+      NeedDevice(fCu, aCtx.fDevW, Int64(aRows) * c.ExpertsUsed * 4);
+      SetLength(aCtx.fRoute, aRows * c.Experts);
+      SetLength(aCtx.fChosen, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fChosenW, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fIdx, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fW, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fStart, c.Experts + 1);
+    end;
     aCtx.fRows := aRows;
   end;
   if aOutRows > 0 then
@@ -445,6 +547,72 @@ begin
   cols := aCols;
   eps := fModel.Config.RmsEps;
   fCu.Enqueue(fAddNorm, [@px, @pt, @pw, @py, @cols, @eps], aRows, OPS_BLOCK);
+end;
+
+procedure TQwen3Cuda.EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  n, h, fi, k, ne, r, j, e, cnt, total: PtrInt;
+  ph, pg, pe, pt, pidx, pw, pu: TCuDevicePtr;
+  cols, count: cardinal;
+begin
+  ly := @fModel.Layers[aLayer];
+  n := aRows;
+  h := fModel.Config.Hidden;
+  fi := fModel.Config.ExpertIntermediate;
+  k := fModel.Config.ExpertsUsed;
+  ne := fModel.Config.Experts;
+  // the router logits down (waits for the layer so far), the choice on the host
+  fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute);
+  aCtx.fDevRoute.Download(0, pointer(aCtx.fRoute), Int64(n) * ne * 4);
+  for r := 0 to n - 1 do
+    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k]);
+  // the token rows and weights of every expert, expert by expert, up at once
+  total := 0;
+  for e := 0 to ne - 1 do
+  begin
+    aCtx.fStart[e] := total;
+    for r := 0 to n - 1 do
+      for j := 0 to k - 1 do
+        if aCtx.fChosen[r * k + j] = e then
+        begin
+          aCtx.fIdx[total] := r;
+          aCtx.fW[total] := aCtx.fChosenW[r * k + j];
+          inc(total);
+        end;
+  end;
+  aCtx.fStart[ne] := total;
+  aCtx.fDevIdx.Upload(0, pointer(aCtx.fIdx), Int64(total) * 4);
+  aCtx.fDevW.Upload(0, pointer(aCtx.fW), Int64(total) * 4);
+  pt := aCtx.fDevTmp.Ptr;
+  count := n * h;
+  fCu.Enqueue(fFill0, [@pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+  ph := aCtx.fDevH.Ptr;
+  pg := aCtx.fDevGather.Ptr;
+  pe := aCtx.fDevExpOut.Ptr;
+  pu := aCtx.fDevUp.Ptr;
+  cols := h;
+  for e := 0 to ne - 1 do
+  begin
+    cnt := aCtx.fStart[e + 1] - aCtx.fStart[e];
+    if cnt = 0 then
+      continue;
+    pidx := aCtx.fDevIdx.Ptr + Int64(aCtx.fStart[e]) * 4;
+    pw := aCtx.fDevW.Ptr + Int64(aCtx.fStart[e]) * 4;
+    fCu.Enqueue(fGather, [@ph, @pidx, @pg, @cols], cnt, OPS_BLOCK);
+    fBackend.EnqueueLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertGate[e].DType,
+      fExpertGate[aLayer][e], fi, aCtx.fDevGate);
+    fBackend.EnqueueLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
+      fExpertUp[aLayer][e], fi, aCtx.fDevUp);
+    pg := aCtx.fDevGate.Ptr;
+    count := cnt * fi;
+    fCu.Enqueue(fSwiGlu, [@pg, @pu, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+      OPS_BLOCK);
+    fBackend.EnqueueLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
+      fExpertDown[aLayer][e], h, aCtx.fDevExpOut);
+    fCu.Enqueue(fScatter, [@pe, @pidx, @pw, @pt, @cols], cnt, OPS_BLOCK);
+    pg := aCtx.fDevGather.Ptr;
+  end;
 end;
 
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
@@ -525,8 +693,9 @@ begin
   pv := aCtx.fDevV.Ptr;
   pcs := aCtx.fDevCos.Ptr;
   pa := aCtx.fDevAttn.Ptr;
-  // a single token: the whole step recorded as a graph, launched at once
-  capture := fUseGraphs and (n = 1);
+  // a single token: the whole step recorded as a graph, launched at once -
+  // not with experts, which the host chooses in every layer
+  capture := fUseGraphs and (n = 1) and not fMoe;
   if capture then
     fCu.CaptureBegin;
   try
@@ -556,14 +725,19 @@ begin
       fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
       // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
       EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-      px := aCtx.fDevGate.Ptr;
-      pt := aCtx.fDevUp.Ptr;
-      count := n * f;
-      fCu.Enqueue(fSwiGlu, [@px, @pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
-        OPS_BLOCK);
-      fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+      if c.Spec[l].Ffn = dfMoe then
+        EnqueueMoe(aCtx, l, n)
+      else
+      begin
+        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);
+        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
+        px := aCtx.fDevGate.Ptr;
+        pt := aCtx.fDevUp.Ptr;
+        count := n * f;
+        fCu.Enqueue(fSwiGlu, [@px, @pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+          OPS_BLOCK);
+        fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+      end;
       // the residual, and the input norm of the next layer
       if l < c.Layers - 1 then
         EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, fModel.Layers[l + 1].InputNorm,

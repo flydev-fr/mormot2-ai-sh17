@@ -4,6 +4,7 @@
 // - float arithmetic as the Vulkan shaders: the logits match the CPU within a
 //   tolerance, not in bits
 // - every block reducing over a row has 128 threads (four warps)
+// - fill0, gatherrows and scatteradd: a mixture of experts (phase D, D3)
 // - qkrope16 and attention16: the same with the KV cache in half floats
 //   (TQwen3Cuda.KvF16), converted by cvt (no cuda_fp16.h needed)
 
@@ -453,4 +454,40 @@ extern "C" __global__ void attnmerge(const float* part, float* y,
       acc += expf(b[s * stride + d] - mx) * b[s * stride + k];
     y[((unsigned long long)r * heads + h) * d + k] = acc / den;
   }
+}
+
+// a mixture of experts (phase D, slice D3): the rows of the tokens of one
+// expert gathered into a buffer of their own, its SwiGLU block computed by
+// the Linear kernels over them, its output added back into the rows of its
+// tokens with their router weights - one expert after the other, in id order,
+// as the CPU (TDecoderModel.MoeBlock)
+
+// y[i] = 0 for i < n
+extern "C" __global__ void fill0(float* y, unsigned int n)
+{
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    y[i] = 0.0f;
+}
+
+// dst[r] = src[idx[r]], rows of cols floats: one block per gathered row
+extern "C" __global__ void gatherrows(const float* src, const int* idx, float* dst,
+  unsigned int cols)
+{
+  const float* s = src + (unsigned long long)idx[blockIdx.x] * cols;
+  float* d = dst + (unsigned long long)blockIdx.x * cols;
+  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+    d[c] = s[c];
+}
+
+// dst[idx[r]] += w[r] * src[r]: one block per row - the tokens of one expert
+// are distinct, so no two blocks of a launch write the same row
+extern "C" __global__ void scatteradd(const float* src, const int* idx,
+  const float* w, float* dst, unsigned int cols)
+{
+  const float* s = src + (unsigned long long)blockIdx.x * cols;
+  float* d = dst + (unsigned long long)idx[blockIdx.x] * cols;
+  float f = w[blockIdx.x];
+  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+    d[c] = d[c] + f * s[c];
 }

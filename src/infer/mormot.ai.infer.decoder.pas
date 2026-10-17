@@ -236,10 +236,6 @@ type
     /// the dfMoe block of layer aLayer, its output added to fX
     procedure MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
       const aOnState: TOnDecoderState);
-    /// the experts of one token from its router logits: aChosen and aWeights
-    // ([ExpertsUsed] each), highest probability first
-    procedure Route(aLogits: PSingleArray; aChosen: PIntegerArray;
-      aWeights: PSingleArray);
     procedure SetDevice(aDevice: TDecoderDevice);
   public
     /// the model_type of a Hugging Face config.json this class loads
@@ -298,6 +294,11 @@ type
     /// the rotary factors of aRows positions from aFirstPos into aCos and aSin
     // ([aRows, HeadDim / 2] each), as Forward computes them
     procedure Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
+    /// the experts of one token from its [Experts] router logits: aChosen and
+    // aWeights ([ExpertsUsed] each), highest probability first - as MoeBlock
+    // routes, also for a device that routes on the host
+    procedure Route(aLogits: PSingleArray; aChosen: PIntegerArray;
+      aWeights: PSingleArray);
     /// true when every layer is of the kind aMixer and aFfn - what a device
     // checks before it takes a model
     function HasOnly(aMixer: TDecoderMixer; aFfn: TDecoderFfn): boolean;

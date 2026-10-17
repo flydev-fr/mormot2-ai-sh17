@@ -90,6 +90,11 @@ type
     // held; x and y are [aRows, aIn] and [aRows, aOut] at offset 0; no wait
     procedure EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
       const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
+    /// the same with weights of aType already on the device at aWeight - e.g.
+    // one expert inside the buffer of all experts of a layer (DeviceWeight of
+    // the whole tensor, then an offset); aRows up to 65535
+    procedure EnqueueLinearAt(x: TInferCuBuffer; aRows, aIn: PtrInt;
+      aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer);
     /// the device context
     property Cuda: TInferCuda read fCu;
     /// how many Linear calls ran on the device
@@ -212,27 +217,37 @@ end;
 
 procedure TInferCudaBackend.EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
   const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
+begin
+  if not GpuLinear(w.DType, aIn) or (aOut < 1) or (Int64(aOut) > high(integer)) or
+     (Int64(aIn) > high(integer)) then
+    raise EInferCuda.CreateUtf8('%.EnqueueLinear: % rows of % % into %',
+      [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
+  EnqueueLinearAt(x, aRows, aIn, w.DType, Weight(w.Data, w.DType, Int64(aOut) *
+    (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]).Ptr, aOut, y);
+end;
+
+procedure TInferCudaBackend.EnqueueLinearAt(x: TInferCuBuffer; aRows, aIn: PtrInt;
+  aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer);
 var
   pw, px, pb, py: TCuDevicePtr;
   rows, nin, nout, dtype, hasBias, gx, gy, block: cardinal;
   kernel: TCuHandle;
 begin
-  if not GpuLinear(w.DType, aIn) or (aRows < 1) or (aRows > 65535) or
+  if not GpuLinear(aType, aIn) or (aRows < 1) or (aRows > 65535) or
      (aOut < 1) or (Int64(aOut) > high(integer)) or
-     (Int64(aIn) > high(integer)) then
-    raise EInferCuda.CreateUtf8('%.EnqueueLinear: % rows of % % into %',
-      [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
-  pw := Weight(w.Data, w.DType, Int64(aOut) * (aIn div INFER_DTYPE_BLOCK[w.DType]) *
-    INFER_DTYPE_SIZE[w.DType]).Ptr;
+     (Int64(aIn) > high(integer)) or (aWeight = 0) then
+    raise EInferCuda.CreateUtf8('%.EnqueueLinearAt: % rows of % % into %',
+      [self, aRows, aIn, INFER_DTYPE_NAME[aType], aOut]);
+  pw := aWeight;
   px := x.Ptr;
   pb := 0;
   py := y.Ptr;
   rows := aRows;
   nin := aIn;
   nout := aOut;
-  dtype := LINEAR_DTYPE[w.DType];
+  dtype := LINEAR_DTYPE[aType];
   hasBias := 0;
-  LinearShape(w.DType, aIn, aRows, aOut, kernel, gx, gy, block);
+  LinearShape(aType, aIn, aRows, aOut, kernel, gx, gy, block);
   fCu.Enqueue(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
     @hasBias], gx, block, gy);
 end;

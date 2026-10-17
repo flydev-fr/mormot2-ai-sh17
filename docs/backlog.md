@@ -216,6 +216,11 @@ verliert Zeit in vielen kleinen Produkten (128 Experten mit je wenigen Tokens).
 Produkten der gewählten Experten, Prefill gruppiert. Erst korrekt ohne CUDA-Graph, danach ein
 Graph mit wechselnden Experten-IDs. Gate: CPU und GPU gleich bei wechselnder Auswahl und
 leeren Gruppen; Prefill/Decode und Speicherspitze gemessen auf RTX und M2 Pro (Tiny).
+*D3a erledigt 2026-10-17: CUDA* (`native-inference.md`, Phase D) - erst korrekt, die Wahl
+noch auf dem Host: Qwen3-30B-A3B auf der RTX 5090 Decode 33 bis 35, Prefill 384 bis 494
+Tokens/s. *Offen:* D3b Vulkan (Bindungen mit Versatz für die Experten, drei Shader, ein
+Warten je MoE-Layer); danach die Wahl auf dem Gerät (Route-Kernel, Linear mit Experten-Ids,
+Graph) für das Decode-Tempo.
 
 **D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
 dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
