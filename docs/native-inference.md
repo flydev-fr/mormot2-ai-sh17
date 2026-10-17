@@ -1298,6 +1298,18 @@ Karte, C5 Tempo.
     SKIP, `LAI_REQUIRE_CUDA=1` macht daraus einen Fehler. RTX 5090 (Compute 12.0, Treiber
     CUDA 13.4): 11 Assertions grün unter FPC 3.2.2 und Delphi 13. Gegenprobe (Kernel
     subtrahiert) lässt 2 scheitern.
+- *C2, erledigt 2026-10-17:* `TInferCudaBackend` (`mormot.ai.infer.backend.cuda`), das
+  schnelle CPU-Backend mit `Linear` auf der Karte für F32, Q8_0, Q4_K und Q6_K, gebaut wie
+  `TInferVulkanBackend` (Gewichts-Cache, Scratch-Puffer, CPU bei belegtem Gerät).
+  - *Kernel:* `tools/cuda/linear.cu`, die CUDA-Form von `linear.comp`: ein Block aus 128
+    Threads je Ausgabe und Tokenzeile, die Gewichte je Element dequantisiert wie
+    `InferRowToF32`, Warp-Shuffle-Reduktion; Halbfloat per `cvt.f32.f16` (ohne
+    `cuda_fp16.h`, das Header braucht, die im pip-Paket fehlen). Zuerst korrekt, Tempo in C5.
+  - *Test:* `LinearMatchesReference` (4 Typen × 6 Formen bis 70 001 Ausgaben, Bias, Cache
+    bitgleich, Q4_0 auf der CPU). Grün auf der RTX 5090 unter FPC 3.2.2 und Delphi 13
+    (Windows) und unter FPC 3.2.2 in der WSL des RTX-Rechners (Linux, `libcuda.so.1` der
+    WSL; die ganze Inferenz-Suite 2572 Assertions). Gegenprobe (je ein Fehler in Q8_0, Q4_K
+    und Q6_K) lässt 18 scheitern, F32 bleibt grün.
 
 ### Danach — nach Bedarf
 

@@ -124,7 +124,8 @@ Differenztests werden wiederverwendet. Bau-Rechner braucht `nvcc` (pip-Paket, si
 
 **Stand:** C1 (Fundament) erledigt 2026-10-17, siehe `native-inference.md` „CUDA“. `nvcc`
 kommt aus NVIDIAs pip-Paket (13.4.92) und läuft auf dem Laptop; auf dem RTX-Rechner musste
-nichts installiert werden. Als Nächstes C2 (`Linear` F32/Q8_0/Q4_K/Q6_K).
+nichts installiert werden. C2 (`Linear` F32/Q8_0/Q4_K/Q6_K) erledigt 2026-10-17, auch
+unter Linux (WSL des RTX-Rechners). Als Nächstes C3 (die übrigen Operationen).
 
 ---
 
