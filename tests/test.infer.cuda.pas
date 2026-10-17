@@ -69,9 +69,11 @@ type
     // reference - every row of a prompt longer than one chunk, decoding, a
     // reused prefix, the weights uploaded again; F32 from safetensors
     // (relative error), Q8_0 from GGUF (cosine: the CPU quantizes the
-    // activations, the device does not)
+    // activations, the device does not); each with a KV cache of floats and
+    // of half floats (KvF16, a looser tolerance)
     procedure TinyQwen3MatchesCpu;
-    /// the tiny Qwen3 with a head dimension of 256 (the widest qkrope takes)
+    /// the tiny Qwen3 with a head dimension of 256 (the widest qkrope takes),
+    // the cache of floats, then of half floats in the same context
     procedure TinyHeadDim256MatchesCpu;
     /// Qwen3-0.6B (Q4_K_M and Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced - skipped without the model files
@@ -944,6 +946,9 @@ end;
 procedure TTestInferCuda.TinyQwen3MatchesCpu;
 const
   PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the relative error of the F32 logits: a cache of floats, of half floats
+  // (the rounding of 11 bits, as TTestInferVulkan)
+  TOL: array[boolean] of double = (1e-4, 4e-3);
 var
   dir: TFileName;
   gpu: TInferCudaBackend;
@@ -973,7 +978,8 @@ begin
     seed := seed * 1103515245 + 12345;
     ids[i] := 3 + (seed shr 16) mod 93;
   end;
-  for k := 0 to 1 do
+  // k and 1: the F32 or the Q8_0 model; k >= 2: the cache in half floats
+  for k := 0 to 3 do
   begin
     gpu := TInferCudaBackend.Create;
     ref := TInferCpuBackend.Create;
@@ -982,13 +988,14 @@ begin
     c1 := nil;
     c2 := nil;
     try
-      if k = 0 then
+      if k and 1 = 0 then
         model := TQwen3Model.Create(dir, ref)
       else
         model := TQwen3Model.CreateFromGguf(IncludeTrailingPathDelimiter(FindInferRefDir('tiny-qwen3-gguf')) +
           'q8_0.gguf', ref);
       v := model.Config.VocabSize;
       vk := TQwen3Cuda.Create(model, gpu);
+      vk.KvF16 := k >= 2;
       c1 := model.NewContext;
       c2 := vk.NewContext;
       // the prompt: every row's logits
@@ -997,10 +1004,12 @@ begin
       model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
       vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
       Check(c2.Length = PROMPT, 'context length');
-      if k = 0 then
+      Check(c2.KvF16 = vk.KvF16, 'the cache format of KvF16');
+      if k and 1 = 0 then
       begin
         e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-        CheckUtf8(e <= 1e-4, 'F32 prompt logits: relative error %', [e]);
+        CheckUtf8(e <= TOL[vk.KvF16], 'F32 prompt logits (KvF16 %): relative error %',
+          [vk.KvF16, e]);
       end
       else
       begin
@@ -1017,10 +1026,11 @@ begin
         vk.UseGraphs := i >= 2;
         model.Forward(c1, @id, 1, pointer(l1));
         vk.Forward(c2, @id, 1, pointer(l2));
-        if k = 0 then
+        if k and 1 = 0 then
         begin
           e := RelError(pointer(l2), pointer(l1), v);
-          CheckUtf8(e <= 1e-4, 'F32 decode step %: relative error %', [i, e]);
+          CheckUtf8(e <= TOL[vk.KvF16], 'F32 decode step % (KvF16 %): relative error %',
+            [i, vk.KvF16, e]);
         end
         else
         begin
@@ -1204,6 +1214,10 @@ begin
     r1 := llm.ChatComplete(first);
     Check(gpu.GpuLinears > calls, 'the backend computed the first answer');
     client.Device := TQwen3Cuda.Create(client.Model, gpu);
+    // the float cache: the same words as the backend over a whole answer (the
+    // half floats of KvF16 may flip a close greedy choice; Qwen3GgufMatchesCpu
+    // checks them)
+    TQwen3Cuda(client.Device).KvF16 := false;
     Check(client.Model.Device = client.Device, 'the model computes on the device');
     ctx := client.Model.NewContext;
     try
@@ -1244,6 +1258,8 @@ end;
 procedure TTestInferCuda.TinyHeadDim256MatchesCpu;
 const
   PROMPT = 300; // more than one chunk (256)
+  /// the relative error: a cache of floats, of half floats
+  TOL: array[boolean] of double = (1e-4, 4e-3);
 var
   dir: TFileName;
   gpu: TInferCudaBackend;
@@ -1258,6 +1274,7 @@ var
   seed: cardinal;
   e: double;
   id: integer;
+  f16: boolean;
 begin
   if not HasDevice then
     exit;
@@ -1285,18 +1302,28 @@ begin
     c2 := cu.NewContext;
     SetLength(l1, PROMPT * v);
     SetLength(l2, PROMPT * v);
-    model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
-    cu.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
-    e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-    CheckUtf8(e <= 1e-4, 'head dimension 256, prompt: relative error %', [e]);
-    for i := 0 to 3 do
+    // a cache of floats, then of half floats: after Reset, the context takes
+    // the format of KvF16
+    for f16 := false to true do
     begin
-      id := ids[i];
-      model.Forward(c1, @id, 1, pointer(l1));
-      cu.Forward(c2, @id, 1, pointer(l2));
-      e := RelError(pointer(l2), pointer(l1), v);
-      CheckUtf8(e <= 1e-4, 'head dimension 256, decode step %: relative error %',
-        [i, e]);
+      cu.KvF16 := f16;
+      c1.Reset;
+      c2.Reset;
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      cu.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      Check(c2.KvF16 = f16, 'the cache format of KvF16');
+      e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+      CheckUtf8(e <= TOL[f16], 'head dimension 256 (KvF16 %), prompt: relative error %',
+        [f16, e]);
+      for i := 0 to 3 do
+      begin
+        id := ids[i];
+        model.Forward(c1, @id, 1, pointer(l1));
+        cu.Forward(c2, @id, 1, pointer(l2));
+        e := RelError(pointer(l2), pointer(l1), v);
+        CheckUtf8(e <= TOL[f16],
+          'head dimension 256 (KvF16 %), decode step %: relative error %', [f16, i, e]);
+      end;
     end;
   finally
     c2.Free;

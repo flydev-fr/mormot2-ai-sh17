@@ -9,6 +9,7 @@
 //   logits come down, and the host waits once (the download)
 // - the arithmetic is float throughout (the weights dequantized as
 //   InferRowToF32 does): logits match the CPU within a tolerance, not in bits
+// - the KV cache holds half floats by default (KvF16), as on Vulkan
 // - the model's weights are uploaded once, at Create; the model and the
 //   backend must outlive the TQwen3Cuda and its contexts
 unit mormot.ai.infer.model.qwen3.cuda;
@@ -52,6 +53,7 @@ type
   protected
     fRows: PtrInt;
     fDevKeys, fDevValues: TInferCuBufferDynArray; // per layer [capacity, kvWidth]
+    fKvF16: boolean; // the cache holds half floats (TQwen3Cuda.KvF16)
     // device scratch for up to fRows token rows
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp,
       fDevCos: TInferCuBuffer;
@@ -65,6 +67,10 @@ type
     procedure FreeCache;
   public
     destructor Destroy; override;
+    /// true when the cache holds half floats (TQwen3Cuda.KvF16 when it was
+    // allocated)
+    property KvF16: boolean
+      read fKvF16;
   end;
 
   /// the forward pass of a TQwen3Model on the device of a TInferCudaBackend
@@ -76,9 +82,10 @@ type
     fCu: TInferCuda;
     fOps, fBasic: TInferCuModule;
     fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fMerge, fAdd: TCuHandle;
+    fQkRope16, fAttention16: TCuHandle; // for a KV cache of half floats
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
-    fUseGraphs: boolean;
+    fUseGraphs, fKvF16: boolean;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
@@ -122,6 +129,14 @@ type
     // the previous step takes the new parameters (TInferCuda.CaptureEnd)
     property UseGraphs: boolean
       read fUseGraphs write fUseGraphs;
+    /// the KV cache in half floats (default) instead of floats: half the
+    // memory, and half the bytes the attention reads per decoded token -
+    // the keys and values rounded to 11 significant bits, the logits then
+    // within a looser tolerance of the CPU's
+    // - a context takes it when its cache is allocated, and again on its
+    // next Forward while it is empty (after Reset)
+    property KvF16: boolean
+      read fKvF16 write fKvF16;
   end;
 
 
@@ -219,9 +234,12 @@ begin
   fSwiGlu := fOps.Kernel('swiglu');
   fQkRope := fOps.Kernel('qkrope');
   fAttention := fOps.Kernel('attention');
+  fQkRope16 := fOps.Kernel('qkrope16');
+  fAttention16 := fOps.Kernel('attention16');
   fMerge := fOps.Kernel('attnmerge');
   fSplitKeys := SPLIT_KEYS;
   fUseGraphs := true;
+  fKvF16 := true;
   fAdd := fBasic.Kernel('add');
   fBackend.GpuLock;
   try
@@ -317,12 +335,20 @@ procedure TQwen3Cuda.Prepare(aCtx: TQwen3CuContext; aTokens, aRows,
   aOutRows: PtrInt);
 var
   c: TQwen3Config;
-  cap, kvw, l, half: PtrInt;
+  cap, kvw, l, half, es: PtrInt;
   keys, values: TInferCuBufferDynArray;
 begin
   c := fModel.Config;
   kvw := c.KvHeads * c.HeadDim;
   half := c.HeadDim shr 1;
+  // an empty context takes the cache format of KvF16
+  if (aCtx.fLength = 0) and (aCtx.fCapacity > 0) and (aCtx.fKvF16 <> fKvF16) then
+    aCtx.FreeCache;
+  if aCtx.fCapacity = 0 then
+    aCtx.fKvF16 := fKvF16;
+  es := 4; // bytes per cached value
+  if aCtx.fKvF16 then
+    es := 2;
   // the KV cache: doubled, a quarter beyond the tokens wanted (as on the CPU),
   // the cached tokens copied into the new buffers
   if aTokens > aCtx.fCapacity then
@@ -339,12 +365,12 @@ begin
     try
       for l := 0 to c.Layers - 1 do
       begin
-        keys[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * 4);
-        values[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * 4);
+        keys[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
+        values[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
         if aCtx.fLength > 0 then
         begin
-          aCtx.fDevKeys[l].CopyTo(0, keys[l], 0, Int64(aCtx.fLength) * kvw * 4);
-          aCtx.fDevValues[l].CopyTo(0, values[l], 0, Int64(aCtx.fLength) * kvw * 4);
+          aCtx.fDevKeys[l].CopyTo(0, keys[l], 0, Int64(aCtx.fLength) * kvw * es);
+          aCtx.fDevValues[l].CopyTo(0, values[l], 0, Int64(aCtx.fLength) * kvw * es);
         end;
       end;
     except
@@ -428,6 +454,7 @@ var
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count: cardinal;
   eps: single;
   capture: boolean;
+  qkrope, attention: TCuHandle;
 begin
   c := fModel.Config;
   n := aCount;
@@ -444,6 +471,14 @@ begin
     else
       outRows := 1;
   Prepare(aCtx, past + n, n, outRows);
+  // the kernels of the cache format of aCtx (set by Prepare)
+  qkrope := fQkRope;
+  attention := fAttention;
+  if aCtx.fKvF16 then
+  begin
+    qkrope := fQkRope16;
+    attention := fAttention16;
+  end;
   // the attention blocks: hb heads of one KV head (hb divides the group)
   // times rb rows, the keys of a row cut into splits ranges unless there are
   // enough blocks without
@@ -506,9 +541,9 @@ begin
       pkn := Vector(ly^.KNorm, c.HeadDim);
       pkc := aCtx.fDevKeys[l].Ptr;
       pvc := aCtx.fDevValues[l].Ptr;
-      fCu.Enqueue(fQkRope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
+      fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
         @heads, @kvHeads, @headDim, @ppast, @eps], c.Heads + c.KvHeads, OPS_BLOCK, n);
-      fCu.Enqueue(fAttention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
+      fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
         @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
         OPS_BLOCK, blocks, splits);
       if splits > 1 then

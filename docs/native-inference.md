@@ -1307,6 +1307,25 @@ llm := client; // ILlmClient: ChatComplete, ChatStream, Agent, Tools wie bisher
   Auf der RTX bremst die Bandbreite wenig (1,8 TB/s). Auf dem M2 Pro, wo der Decode von 90
   (200 Tokens) auf 40 Tokens/s (4000) fällt, steht die Messung noch aus. `llm-bench` schaltet
   mit `LAI_KV_F32=1` auf den F32-Cache zurück.
+- *CUDA (2026-10-17):* `TQwen3Cuda.KvF16`, ebenfalls Vorgabe an. CUDA adressiert 16-Bit-Werte
+  direkt, deshalb ohne Wortpaare: `qkrope` und `attention` in `tools/cuda/ops.cu` sind
+  Templates über den Typ des Caches (`qkrope16`, `attention16`), umgerechnet per PTX-`cvt`
+  (`cvt.rn.f16.f32`, kein `cuda_fp16.h`). Das PTX der F32-Kernel ist bis auf Namen und
+  Sprungmarken gleich geblieben. Tests: `TinyQwen3MatchesCpu` mit F32- und Q8_0-Modell je in
+  beiden Formaten (mit Graph-Decode, Reuse und Wachsen des Caches), `TinyHeadDim256MatchesCpu`
+  wechselt das Format im selben Kontext; F16-Fehler auf der RTX höchstens 4,7e-4.
+  Gegenprobe: abgeschnittenes Halbwort beim Schreiben, vertauschte Halbwerte und Wörter beim
+  Lesen der Schlüssel, Wert vom Nachbarn, die F32-Attention für einen F16-Cache, Umkopieren
+  mit 2 Byte, ein leerer Kontext mit altem Format: alle sieben scheitern.
+
+  | RTX 5090, Q8_0, Decode | 200 | 1000 | 4000 | 8000 |
+  |---|---|---|---|---|
+  | CUDA, F32-Cache | 405 | 404 | 347 | 252 |
+  | CUDA, F16-Cache | 418 | 415 | 383 | 312 |
+
+  Der Prefill gewinnt bei 4000 und 8000 Tokens 4 bis 6 % (10 045 statt 9644, 7460 statt
+  7047 Tokens/s). Bei 8000 Tokens ist CUDA mit F16-Cache jetzt auch dort schneller als
+  Vulkan (312 gegen 288), wo es mit F32-Cache langsamer war (252 gegen 267).
 
 **Fertig, wenn:** das GPU-Backend dieselben Referenztests besteht wie die CPU (mit
 Float-Toleranzen) und auf der RTX 5090 deutlich schneller dekodiert.

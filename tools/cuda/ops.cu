@@ -4,8 +4,64 @@
 // - float arithmetic as the Vulkan shaders: the logits match the CPU within a
 //   tolerance, not in bits
 // - every block reducing over a row has 128 threads (four warps)
+// - qkrope16 and attention16: the same with the KV cache in half floats
+//   (TQwen3Cuda.KvF16), converted by cvt (no cuda_fp16.h needed)
 
 #define BLOCK 128u
+
+// a half float (its 16 bits) from a float, rounded to nearest even, and back
+__device__ __forceinline__ unsigned short toHalf(float f)
+{
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
+}
+
+__device__ __forceinline__ float fromHalf(unsigned short h)
+{
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+
+// the cache entries of either type: float or half float (unsigned short)
+__device__ __forceinline__ void store(float* c, unsigned long long i, float v)
+{
+  c[i] = v;
+}
+
+__device__ __forceinline__ void store(unsigned short* c, unsigned long long i,
+  float v)
+{
+  c[i] = toHalf(v);
+}
+
+__device__ __forceinline__ float load(const float* c, unsigned long long i)
+{
+  return c[i];
+}
+
+__device__ __forceinline__ float load(const unsigned short* c,
+  unsigned long long i)
+{
+  return fromHalf(c[i]);
+}
+
+// the 4 keys from index 4 i on, i.e. key slot i (16 bytes, or 8 for half
+// floats)
+__device__ __forceinline__ float4 load4(const float* c, unsigned long long i)
+{
+  return reinterpret_cast<const float4*>(c)[i];
+}
+
+__device__ __forceinline__ float4 load4(const unsigned short* c,
+  unsigned long long i)
+{
+  uint2 u = reinterpret_cast<const uint2*>(c)[i];
+  return make_float4(fromHalf((unsigned short)(u.x & 0xffffu)),
+    fromHalf((unsigned short)(u.x >> 16)), fromHalf((unsigned short)(u.y & 0xffffu)),
+    fromHalf((unsigned short)(u.y >> 16)));
+}
 
 // the sum of v over the block (all 128 threads call it; the result in all)
 __device__ float blockSum(float v, float* shared4)
@@ -81,10 +137,11 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n)
 // per token row (grid y) and head (grid x: the heads, then the KV heads):
 // RMSNorm of q (qn) or k (kn), rotary positions (cs: the cos of every row,
 // then the sin), q in place, k and v stored into the cache at past + row
-// - headDim <= 256, even
-extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
-  const float* qn, const float* kn, const float* cs, float* kc, float* vc,
-  unsigned int rows, unsigned int heads, unsigned int kvHeads,
+// - headDim <= 256, even; T: the type of the cache (float or half float)
+template <typename T>
+__device__ __forceinline__ void qkropeT(float* q, const float* k,
+  const float* v, const float* qn, const float* kn, const float* cs, T* kc,
+  T* vc, unsigned int rows, unsigned int heads, unsigned int kvHeads,
   unsigned int headDim, unsigned int past, float eps)
 {
   __shared__ float part[4];
@@ -130,13 +187,31 @@ extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
     }
     else
     {
-      kc[dst + i] = x0;
-      kc[dst + i + half] = x1;
+      store(kc, dst + i, x0);
+      store(kc, dst + i + half, x1);
     }
   }
   if (!isQ)
     for (unsigned int c = t; c < d; c += BLOCK)
-      vc[dst + c] = v[src + c];
+      store(vc, dst + c, v[src + c]);
+}
+
+extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
+  const float* qn, const float* kn, const float* cs, float* kc, float* vc,
+  unsigned int rows, unsigned int heads, unsigned int kvHeads,
+  unsigned int headDim, unsigned int past, float eps)
+{
+  qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
+    eps);
+}
+
+extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
+  const float* qn, const float* kn, const float* cs, unsigned short* kc,
+  unsigned short* vc, unsigned int rows, unsigned int heads,
+  unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps)
+{
+  qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
+    eps);
 }
 
 // causal attention with grouped-query heads - the CUDA form of
@@ -155,11 +230,13 @@ extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
 //   attnmerge combines them into y
 // - headDim a multiple of 4 and at most 256 (the queries kept as float4, each
 //   thread owns the output dimensions t and t + 128); keys 16-byte aligned
+//   (8 for half floats); T: the type of the cache
 #define MAXQ 8
 #define NEG -3.402823466e38f
 
-extern "C" __global__ void attention(const float* q, const float4* keys4,
-  const float* vals, float* y, float* part, unsigned int rows,
+template <typename T>
+__device__ __forceinline__ void attentionT(const float* q, const T* keys,
+  const T* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
   unsigned int rowBlock)
@@ -228,11 +305,11 @@ extern "C" __global__ void attention(const float* q, const float4* keys4,
       sv[i] = 0.0f;
     if (j < hi)
     {
-      const float4* kp = keys4 + ((j * kvw + (unsigned long long)g * d) >> 2);
+      unsigned long long kp = (j * kvw + (unsigned long long)g * d) >> 2;
 #pragma unroll 8
       for (unsigned int k = 0u; k < d4; k++)
       {
-        float4 kv = kp[k];
+        float4 kv = load4(keys, kp + k);
 #pragma unroll
         for (unsigned int i = 0u; i < MAXQ; i++)
           if (i < nq)
@@ -285,9 +362,9 @@ extern "C" __global__ void attention(const float* q, const float4* keys4,
       float v0 = 0.0f;
       float v1 = 0.0f;
       if (t < d)
-        v0 = vals[vb];
+        v0 = load(vals, vb);
       if (t + 128u < d)
-        v1 = vals[vb + 128u];
+        v1 = load(vals, vb + 128u);
 #pragma unroll
       for (unsigned int i = 0u; i < MAXQ; i++)
       {
@@ -327,6 +404,26 @@ extern "C" __global__ void attention(const float* q, const float4* keys4,
         }
       }
     }
+}
+
+extern "C" __global__ void attention(const float* q, const float* keys,
+  const float* vals, float* y, float* part, unsigned int rows,
+  unsigned int heads, unsigned int headDim, unsigned int kvHeads,
+  unsigned int past, unsigned int splits, unsigned int headBlock,
+  unsigned int rowBlock)
+{
+  attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
+    splits, headBlock, rowBlock);
+}
+
+extern "C" __global__ void attention16(const float* q,
+  const unsigned short* keys, const unsigned short* vals, float* y,
+  float* part, unsigned int rows, unsigned int heads, unsigned int headDim,
+  unsigned int kvHeads, unsigned int past, unsigned int splits,
+  unsigned int headBlock, unsigned int rowBlock)
+{
+  attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
+    splits, headBlock, rowBlock);
 }
 
 // combines the key ranges of attention (flash-decoding), the CUDA form of
