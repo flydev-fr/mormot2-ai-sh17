@@ -66,7 +66,8 @@ nichts, die Pascal-Skalenrechnung pro Zeile dafür viel.
   xmm6/7 unter Win64 im X-Bereich gesichert, Skalen-Zwischenwerte in `A[5..6]`). Grün
   unter FPC 3.2.2 und Delphi 13 auf dem i9-14900K; Gegenprobe (Zeilen vertauscht) lässt
   32 Assertions scheitern. Q4_K_M-Prefill bei 200 Tokens: 462 → 579 Tokens/s.
-- *Offen:* nur der Lauf des SysV-Einsprungs (Linux x86_64), statisch geprüft.
+- *SysV-Einsprung (Linux x86_64):* gelaufen 2026-10-17 in der WSL des RTX-Rechners
+  (FPC 3.2.2, Inferenz-Suite grün, siehe B5).
 
 **Fertig, wenn:** `TTestInferFast.LinearKMatchesReference` (bitgleich, auch 513 Blöcke)
 mit einer Form „gerade/ungerade Zeilenzahl" grün; neuer Test Kernel = Pascal; Gegenproben
@@ -140,13 +141,21 @@ safetensors und GGUF, Gate gegen die Referenz.
 Die README-Tabelle „Where it runs" hat veraltete Zellen:
 
 - Windows x64 FPC 3.2.2 und Linux x86_64 (WSL auf dem RTX-Rechner): Inferenz von 821/828
-  — vor den Qwen3-Tests (Fußnote ⁵). Rezept: `docs/native-inference.md` „Plattformen und
+  — vor den Qwen3-Tests (damalige Fußnote ⁵). Rezept: `docs/native-inference.md` „Plattformen und
   Tests" bzw. Notiz zum RTX-Rechner (WSL-Distribution gehört dort Konto `sh`).
 - Windows ARM64 FPC 3.3.1: Inferenz „not yet run" (braucht `sqlite3-64.dll` für ARM64
   neben dem Binary).
-- LLM-Spalte macOS/Windows ARM64 vor den Load-Governor-Tests (Fußnote ⁴).
+- LLM-Spalte macOS/Windows ARM64 vor den Load-Governor-Tests (damalige Fußnote ⁴).
 
 **Fertig, wenn:** die Zellen aktuelle Zahlen tragen und die Fußnoten entfallen.
+
+**Erledigt (2026-10-17):** alle Zeilen außer Linux aarch64 und Delphi 7 (beide vom
+2026-10-14 bis 16) neu gelaufen, Fußnoten zu alten Ständen entfallen.
+Windows ARM64 (FPC 3.3.1, Entwicklungs-Compiler) erstmals mit Inferenz: 2542, davon 5
+rot. Gegenprobe mit den x64-Builds (FPC 3.2.2, Delphi 13) unter Prism auf derselben
+Adreno-X1-85-GPU: dieselben 4 Vulkan-Fehler (Q8_0, eine Zeile, 256 Eingänge) — nicht der
+Compiler. Offen, je eigener Eintrag: der Adreno-Fehler, SDOT-Erkennung unter Windows ARM
+(`IsProcessorFeaturePresent`), der Qwen3-Cosinus 0,979 unter FPC 3.3.1.
 
 ---
 

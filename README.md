@@ -14,7 +14,7 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
 > `ILlmClient`: the agent loop calls tools with a model on this machine, at about 33
 > tokens/s in FP32 and 64 in Q8_0 on a laptop, greedy or sampled, with a prompt cache
-> for the next turn. Next: the rest of the speed work, then CUDA. Three test suites, about 4000 assertions, green wherever they have run (table below).
+> for the next turn. Next: the rest of the speed work, then CUDA. Three test suites, about 4500 assertions, green on every platform in the table below except Windows ARM64: five open failures there, four of them Vulkan on its Adreno GPU (whatever the compiler).
 
 ## What it does
 
@@ -31,38 +31,46 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
 ## Where it runs
 
-Number of assertions per suite, every one passing; each row with numbers ran between 2026-10-14 and 16:
+Number of assertions per suite, every one passing unless noted; each row with numbers ran
+between 2026-10-14 and 17:
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
-| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁸ |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 717 | 821 ¹ ⁵ |
-| Windows x64 | Delphi 13 | 1257 | 726 | 2255 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 1751 ⁶ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 647 ⁴ | 2629 ⁷ |
-| Windows ARM64 | FPC 3.3.1 | 1257 | green ² ⁴ | not yet run |
-| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 719 | 828 ³ ⁵ |
+| Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁶ |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 2644 |
+| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 2644 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 1751 ⁴ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 2655 ⁵ |
+| Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2542, 5 failing ¹ |
+| Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 725 | 2486 ³ |
 
-¹ Without the converted FP32 reference model on that machine; those tests skip.
+¹ FPC 3.3.1 is a development compiler, the only one for this target (FPC 3.2 and Delphi
+have none), so this row does not count as a release platform. Of the five failures, one is
+a Qwen3 Q8_0 logits check (cosine 0.979; the same test passes with FPC 3.2.x on Linux
+aarch64 and macOS) and four are Vulkan Q8_0 linear shapes on the Adreno X1-85 GPU. The
+x64 builds (FPC 3.2.2 and Delphi 13) fail the same four under emulation on that GPU, so
+those are not the compiler's. The dot-product kernels (Q8_0, K-quants) are not used there
+yet: their CPU detection does not cover Windows ARM, so those run in Pascal.
 ² Needs an ARM64 `sqlite3-64.dll` next to the binary — mORMot2 ships no static SQLite for
 that target.
-³ The production target (Docker uses the same FPC 3.2.2), with the BGE-M3 corpus gate
-(`LAI_INFER_GATE=1`) included: nDCG@10 0.8994 on the AVX2 path.
-⁴ Run before the load governor tests were added (they bring about 60 assertions).
-⁵ Run before the Qwen3 tests were added (tokenizer, chat template, decoder and the native
-client: about 540 assertions with the model, about 300 without it).
-⁶ Natively on an i9-14900K (2026-10-16), the Vulkan suite included. The Qwen3-0.6B tests
+³ The production target (Docker uses the same FPC 3.2.2), AVX2 kernels on the System V
+entry. Vulkan there is llvmpipe (a CPU implementation), so the Qwen3 tests on the device
+skip. The BGE-M3 corpus gate (`LAI_INFER_GATE=1`) passed in an earlier run: nDCG@10 0.8994
+on the AVX2 path.
+⁴ Natively on an i9-14900K (2026-10-16), the Vulkan suite included. The Qwen3-0.6B tests
 skip in a 32-bit process (2.4 GB of FP32 weights); the tiny model, the tokenizer and the
 chat template run.
-⁷ With all models, NEON dot-product kernels, and the Vulkan suite on the M2 Pro GPU
-through MoltenVK (`LAI_REQUIRE_VULKAN=1`, 2026-10-16). The BGE-M3 corpus gate passed there
-in an earlier run (nDCG@10 0.9004, the same as on the Snapdragon); it is not part of this
-count.
-⁸ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
+⁵ With all models, NEON dot-product kernels, and the Vulkan suite on the M2 Pro GPU
+through MoltenVK (`LAI_REQUIRE_VULKAN=1`). The BGE-M3 corpus gate passed there in an
+earlier run (nDCG@10 0.9004, the same as on the Snapdragon); it is not part of this count.
+⁶ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
 (without the model).
 
-Counts differ by compiler because some tests only exist where a feature does (the `vec0`
-extension has no 32-bit build, so Delphi 7 skips that test).
+Counts differ because some tests only exist where a feature does: the `vec0` extension
+has no 32-bit or macOS build (its tests skip), Delphi runs an extra branch for its UTF-16
+strings in the chunking test, the load governor reads other sensors per OS, every SIMD
+kernel of a CPU is checked against Pascal (NEON has more of them than AVX2), and Qwen3
+on the GPU skips on a CPU implementation of Vulkan.
 
 ## Native inference
 
