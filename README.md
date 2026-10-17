@@ -14,7 +14,7 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
 > `ILlmClient`: the agent loop calls tools with a model on this machine, at about 33
 > tokens/s in FP32 and 64 in Q8_0 on a laptop, greedy or sampled, with a prompt cache
-> for the next turn. Next: the rest of the speed work, then CUDA. Three test suites, about 4500 assertions, green on every platform in the table below except Windows ARM64: four open failures there, all Vulkan on its Adreno GPU (whatever the compiler).
+> for the next turn. On an NVIDIA card the whole forward pass also runs on CUDA (RTX 5090: about 400 tokens/s decoding, faster than Vulkan). Three test suites, about 4500 assertions, green on every platform in the table below except Windows ARM64: four open failures there, all Vulkan on its Adreno GPU (whatever the compiler).
 
 ## What it does
 
@@ -592,7 +592,9 @@ Next, in this order:
    the same backend runs through MoltenVK (Homebrew `molten-vk` and `vulkan-loader`); on
    the M2 Pro it beats the NEON CPU path (prefill 1254 against 563, decode 98 against
    73 tokens/s at 200 tokens of context). Vulkan first (the driver's loader at run time, shaders as embedded SPIR-V,
-   no shipped DLLs), CUDA through the driver API as the second backend.
+   no shipped DLLs), CUDA through the driver API as the second backend - done too:
+   `TQwen3Cuda` (kernels as embedded PTX, a decode step as one CUDA graph) prefills about
+   12400 and decodes about 404 tokens/s on the RTX 5090 (Q8_0; Vulkan 13700 and 358).
 3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
    Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 

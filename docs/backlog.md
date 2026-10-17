@@ -110,7 +110,7 @@ byteweise Entpacken nach Q8_0.
 
 ---
 
-## B3 — CUDA-Backend (zweites GPU-Backend nach Vulkan)
+## B3 — CUDA-Backend (zweites GPU-Backend nach Vulkan) — erledigt 2026-10-17
 
 **Ziel:** NVIDIA-Karten über die Driver API (`nvcuda.dll` / `libcuda.so`, zur Laufzeit
 geladen, **keine** mitgelieferte DLL), Kernel als eingebettetes PTX.
