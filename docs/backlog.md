@@ -170,7 +170,13 @@ Liste wie `build-demo.sh`, `-Demo` für eine). Gefunden und behoben: `embed-refe
 nutzte das FPC-only `varQWord` (jetzt mORMots `varWord64`), `vector-bench` mischte
 `GetTickCount64` (unter Delphi vorzeichenlos) mit Int64 (W1073); dcc findet Units neben
 dem Programm nicht von selbst, das Skript nimmt das Demo-Verzeichnis in den Suchpfad.
-Offen: Delphi 7.
+- *Delphi 7 (2026-10-17):* `-Delphi7` (mit `-FastMM4`, wie `run-delphi7-tests.ps1`), alle 18
+  Demos. Nachgezogen: `TAddTool`/`TAskClaudeTool` ohne Generics (`TMcpRecordTool` bzw.
+  `IMcpTool` von Hand - ein Record nur aus Integern hat unter Delphi 7 keine RTTI), kein
+  `exit(wert)` mehr in den Demos, `vendor/mormot.ext.os` mit `TStartupInfoW` und
+  `CREATE_BREAKAWAY_FROM_JOB` für Delphi 7 (lokale Änderung, im Unit-Kopf vermerkt), und
+  `NoRedirect` statt `nil` für `TOnRedirect` - Delphi 7 löst ein nacktes `nil` für einen
+  Methodenzeiger unter den `RunRedirect`-Überladungen nicht auf.
 - *Fund dabei, behoben:* Die Delphi-13-`llm-bench` war auf dem i9-14900K viel langsamer
   als die FPC-Exe (Q4_K_M, 200 Tokens: Prefill 216 statt 579, Decode 14 statt 78
   Tokens/s), Attention 80 % der Decode-Zeit, mit 1 Thread aber gleichauf. Ursache:
@@ -269,6 +275,15 @@ grenzt ein: falsch ist nur `matvec8` für Q8_0 (mit und ohne Subgroups); `linear
 **Wirkung:** keine im Produktivbetrieb — `matvec8` ist nur auf Apple-GPUs an (`UseMatvec`,
 Vendor $106B); rot ist der Test, der `matvec8` auf jeder GPU erzwingt.
 
-**Vorgehen:** `word2` für Q8_0 als `OpSelect` statt Doppel-Shift, Adreno-Probe, dann der
-Apple-Decode im A/B-Lauf (B8: Q8_0 98 Tokens/s darf nicht sinken); sonst `matvec8` im Test
-auf Apple begrenzen und den Treiberfehler dokumentieren.
+**Eingrenzung (2026-10-17, Probe `bin/winarm/adreno.lpr`, nicht im Repo):** 64 Eingänge,
+1 Ausgang: GPU −8,568, Referenz −8,706. Einheit 0 (Byte 0) stimmt, Einheit 1 (Byte 34, also
+2 mod 4) liefert einen um etwa 2,4 % zu kleinen Beitrag, als wären die unteren Bits ihrer
+Skala oder einzelne Bytes falsch gelesen. Ohne Wirkung blieben: `word2` als `OpSelect`
+statt Doppel-Shift, `dot4s` per Shift statt `bitfieldExtract`, die Skala per `word2` statt
+`half16`. Rätselhaft bleibt, dass Q6_K (210-Byte-Blöcke, ebenfalls 2 mod 4) mit denselben
+Helfern richtig rechnet.
+
+**Vorgehen, wenn es gebraucht wird (die Adreno nutzt `matvec8` nicht):** einzelne Wörter
+aus dem Shader in einen Debug-Puffer schreiben (gelesene Rohwörter je Einheit), mit den
+Gewichtsbytes vergleichen; danach Treiber-Workaround oder `matvec8` im Test auf Apple
+begrenzen. Jede Shader-Änderung im A/B-Lauf auf dem Mac (B8: Q8_0 98 Tokens/s).

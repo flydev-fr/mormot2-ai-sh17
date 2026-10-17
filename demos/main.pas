@@ -46,12 +46,28 @@ type
     Date: TDateTime;
   end;
 
-  // Example tool implementation
+  // typed: the schema and the parsing come from the record's RTTI
+{$ifdef HASGENERICS}
   TAddTool = class(TMcpToolBase<TAddParams>)
   protected
-    function ExecuteTyped(const aParams: TAddParams; 
+    function ExecuteTyped(const aParams: TAddParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
+{$else}
+  // without generics (Delphi 7) IMcpTool by hand: a record of two integers has
+  // no RTTI there, so TMcpRecordTool could not describe it
+  TAddTool = class(TInterfacedObject, IMcpTool)
+  protected
+    fName: RawUtf8;
+    fDescription: RawUtf8;
+  public
+    constructor Create(const aName, aDescription: RawUtf8);
+    function GetName: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetInputSchema: variant;
+    function Execute(const aArgs: variant; const aAuthCtx: TMcpAuthContext): variant;
+  end;
+{$endif HASGENERICS}
 
   // Demo tool implementation fetching public IP
   // - fetch ip from https://api.ipify.org
@@ -81,18 +97,20 @@ implementation
 
 
 procedure StartExample;
+{$ifdef WITH_LOGS}
+var
+  family: TSynLogFamily;
+{$endif WITH_LOGS}
 begin
   // setup logs
   {$ifdef WITH_LOGS}
-  with TSynLog.Family do
-  begin
-    Level := LOG_VERBOSE;
-    EchoToConsole := LOG_VERBOSE;
-    EchoToConsoleBackground := True;
-    HighResolutionTimestamp := true;
-    PerThreadLog := ptIdentifiedInOneFile;
-    NoFile := True;
-  end;
+  family := TSynLog.Family;
+  family.Level := LOG_VERBOSE;
+  family.EchoToConsole := LOG_VERBOSE;
+  family.EchoToConsoleBackground := True;
+  family.HighResolutionTimestamp := true;
+  family.PerThreadLog := ptIdentifiedInOneFile;
+  family.NoFile := True;
   {$endif WITH_LOGS}
 
   try
@@ -124,22 +142,102 @@ end;
 
 { TAddTool }
 
-function TAddTool.ExecuteTyped(const aParams: TAddParams; 
-  const aAuthCtx: TMcpAuthContext): variant;
+// the work of the tool, the same for both forms of TAddTool
+function AddResult(const aParams: TAddParams): variant;
 var
   builder: TMcpResponseBuilder;
-  resultText: RawUtf8;
 begin
-  resultText := FormatUtf8('% + % = %', [aParams.a, aParams.b, aParams.a + aParams.b]);
-  
   builder := TMcpResponseBuilder.Create;
   try
-    builder.AddText(resultText);
+    builder.AddText(FormatUtf8('% + % = %',
+      [aParams.a, aParams.b, Int64(aParams.a) + aParams.b]));
     result := builder.Build;
   finally
     builder.Free;
   end;
 end;
+
+{$ifdef HASGENERICS}
+
+function TAddTool.ExecuteTyped(const aParams: TAddParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := AddResult(aParams);
+end;
+
+{$else}
+
+constructor TAddTool.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited Create;
+  fName := aName;
+  fDescription := aDescription;
+end;
+
+function TAddTool.GetName: RawUtf8;
+begin
+  result := fName;
+end;
+
+function TAddTool.GetDescription: RawUtf8;
+begin
+  result := fDescription;
+end;
+
+function TAddTool.GetInputSchema: variant;
+begin
+  // what TMcpRecordTool publishes for two integer fields
+  result := _JsonFast('{"type":"object","properties":{' +
+    '"a":{"type":"integer","minimum":-2147483648,"maximum":2147483647},' +
+    '"b":{"type":"integer","minimum":-2147483648,"maximum":2147483647}},' +
+    '"required":["a","b"]}');
+end;
+
+// an argument that is present, an integer JSON number and in the range of
+// integer - as strict as TMcpRecordTool: "5" or 0.5 are refused
+function IntArg(aArgs: PDocVariantData; const aName: RawUtf8;
+  out aValue: integer): boolean;
+var
+  i: PtrInt;
+  v: Int64;
+begin
+  result := false;
+  i := aArgs^.GetValueIndex(aName);
+  if (i < 0) or
+     not (TVarData(aArgs^.Values[i]).VType in [varByte, varShortInt, varWord,
+       varSmallInt, varLongWord, varInteger, varInt64, varWord64]) or
+     not VariantToInt64(aArgs^.Values[i], v) or
+     (v < low(integer)) or
+     (v > high(integer)) then
+    exit;
+  aValue := v;
+  result := true;
+end;
+
+function TAddTool.Execute(const aArgs: variant;
+  const aAuthCtx: TMcpAuthContext): variant;
+var
+  args: PDocVariantData;
+  params: TAddParams;
+  builder: TMcpResponseBuilder;
+begin
+  args := _Safe(aArgs);
+  if IntArg(args, 'a', params.a) and
+     IntArg(args, 'b', params.b) then
+    result := AddResult(params)
+  else
+  begin
+    builder := TMcpResponseBuilder.Create;
+    try
+      builder.AddText('Invalid arguments: a and b must be integers').SetError;
+      result := builder.Build;
+    finally
+      builder.Free;
+    end;
+  end;
+end;
+
+{$endif HASGENERICS}
 
 procedure EnsureIpInfoRtti;
 begin
@@ -153,10 +251,11 @@ var
   body: RawUtf8;
   doc: PDocVariantData;
 begin
+  result := false;
   aIp := '';
   body := HttpGet('https://api.ipify.org?format=json');
   if body = '' then
-    exit(false);
+    exit;
   doc := _Safe(_JsonFast(body));
   result := doc^.GetAsRawUtf8('ip', aIp) and (aIp <> '');
 end;

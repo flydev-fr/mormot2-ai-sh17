@@ -52,7 +52,10 @@ begin
   begin
     cand := MakePath([dir, 'tests', 'data', 'embed-de', 'reference'], true);
     if FileExists(cand + 'manifest.json') then
-      exit(cand);
+    begin
+      result := cand;
+      exit;
+    end;
     dir := ExtractFileDir(dir);
   end;
 end;

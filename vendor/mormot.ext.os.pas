@@ -5,6 +5,8 @@
 // - overloaded RunRedirect(cmd, stdinput, ...) for one-shot stdin pipe
 // - adopted for landrix (LandrixAI MCP demos) from flydev-fr/mormot2-extensions
 //   (mormot-os module); licensed under MPL/GPL/LGPL (follows mORMot)
+// - local change: Delphi 7 compatibility in mormot.ext.os.windows.inc
+//   (TStartupInfoW, CREATE_BREAKAWAY_FROM_JOB)
 unit mormot.ext.os;
 
 interface

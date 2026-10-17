@@ -1,21 +1,27 @@
 <#
-  Baut die Demos dieser Extension mit Delphi (dcc64, Win64).
-  Pendant zu scripts/build-demo.sh (FPC); dieselbe Demo-Liste.
+  Baut die Demos dieser Extension mit Delphi: Delphi 13 (dcc64, Win64) oder mit
+  -Delphi7 Delphi 7 (dcc32, Win32). Pendant zu scripts/build-demo.sh (FPC);
+  dieselbe Demo-Liste.
 
-  FPC ist Referenz-Compiler. Dieses Skript prueft, dass die Demos auch mit
-  Delphi 13 (Compiler-Version 37.0) uebersetzen - die Tests deckt
-  run-delphi-tests.ps1 ab.
+  FPC ist Referenz-Compiler. Dieses Skript prueft, dass die Demos auch mit dem
+  oberen und dem unteren Ende der Delphi-Breite uebersetzen - die Tests decken
+  run-delphi-tests.ps1 und run-delphi7-tests.ps1 ab.
 
   Beispiele:
-    .\scripts\build-delphi-demos.ps1                       # alle Demos
+    .\scripts\build-delphi-demos.ps1                       # alle Demos, Delphi 13
     .\scripts\build-delphi-demos.ps1 -Demo infer\llm-bench.lpr
     .\scripts\build-delphi-demos.ps1 -ShowAll              # voller Compilerlog
     .\scripts\build-delphi-demos.ps1 -Dcc 'C:\...\dcc64.exe'   # expliziter Compiler, ohne Versionspruefung
+    .\scripts\build-delphi-demos.ps1 -Delphi7 -FastMM4 'C:\lib\FastMM4'
 
+  Delphi 7: -Delphi7Root / $env:DELPHI7 (Installationsordner mit Bin\DCC32.EXE
+  und Lib) und -FastMM4 / $env:FASTMM4 (Ordner mit FastMM4.pas), wie in
+  run-delphi7-tests.ps1.
   mORMot2: $env:MORMOT2_ROOT, sonst das Submodul-Layout des Konsumenten
   (<konsument>\shared\delphi\libs\_git_Synopse2, drei Ebenen ueber diesem Repo).
-  Ausgabe: bin\delphi\demos\ (gitignored). Die .lpr-Programme werden dort als
-  .dpr abgelegt - dcc akzeptiert nur eine .dpr als Projektdatei.
+  Ausgabe: bin\delphi\demos\ bzw. bin\delphi7\demos\ (gitignored). Die
+  .lpr-Programme werden dort als .dpr abgelegt - dcc akzeptiert nur eine .dpr
+  als Projektdatei.
 #>
 [CmdletBinding()]
 param(
@@ -23,6 +29,10 @@ param(
   [string]$Demo = '',
   # Pfad zu dcc64.exe; gesetzt = ohne Versionspruefung (bewusste Gegenprobe)
   [string]$Dcc = $env:DCC64,
+  # Delphi 7 (Win32) statt Delphi 13
+  [switch]$Delphi7,
+  [string]$Delphi7Root = $env:DELPHI7,
+  [string]$FastMM4 = $env:FASTMM4,
   [switch]$ShowAll
 )
 
@@ -35,31 +45,60 @@ if (-not (Test-Path (Join-Path $mormot2 'src\mormot.defines.inc'))) {
   throw "mORMot2-Quellbaum nicht gefunden unter '$mormot2' - MORMOT2_ROOT setzen."
 }
 $mormot2 = (Resolve-Path $mormot2).Path
-
-# --- Compiler: explizit (ohne Pruefung) oder das installierte Delphi 13 ---
-if ([string]::IsNullOrWhiteSpace($Dcc)) {
-  $bds = if ($env:BDS) { $env:BDS } else { Join-Path ${env:ProgramFiles(x86)} "Embarcadero\Studio\$baseline" }
-  $Dcc = Join-Path $bds 'bin\dcc64.exe'
-  if (-not (Test-Path $Dcc)) {
-    throw "dcc64.exe nicht gefunden unter '$Dcc' - Delphi 13 installieren oder -Dcc angeben."
-  }
-  $banner = (& $Dcc --version 2>&1 | Out-String).Trim()
-  if ($banner -notmatch "version $([regex]::Escape($baseline))") {
-    throw "'$Dcc' ist nicht Delphi 13 (Compiler $baseline): $banner. Bewusst uebersteuern mit -Dcc."
-  }
-} else {
-  if (-not (Test-Path $Dcc)) { throw "dcc64.exe nicht gefunden: '$Dcc'" }
-  $bds = Split-Path -Parent (Split-Path -Parent $Dcc)
-}
-$compilerVersion = if ((& $Dcc --version 2>&1 | Out-String) -match 'version (\d+\.\d+)') { $Matches[1] } else { '?' }
-
 $src = Join-Path $mormot2 'src'
-$units = @((Join-Path $bds 'lib\win64\release'), $src) +
+$mormotUnits = @($src) +
   @('core', 'lib', 'crypt', 'net', 'db', 'orm', 'rest', 'soa', 'app', 'misc', 'script', 'tools\mget' |
-    ForEach-Object { Join-Path $src $_ }) +
-  @((Join-Path $lai 'src'), (Join-Path $lai 'src\infer'), (Join-Path $lai 'demos'), (Join-Path $lai 'vendor'))
+    ForEach-Object { Join-Path $src $_ })
+$laiUnits = @((Join-Path $lai 'src'), (Join-Path $lai 'src\infer'), (Join-Path $lai 'demos'),
+  (Join-Path $lai 'vendor'))
 $inc = @($src, (Join-Path $src 'core'), (Join-Path $src 'net'), (Join-Path $lai 'vendor'))
-$out = Join-Path $lai 'bin\delphi\demos'
+
+if ($Delphi7) {
+  # --- Delphi 7: wie run-delphi7-tests.ps1 ---
+  if ([string]::IsNullOrWhiteSpace($Delphi7Root)) {
+    # Ablageort auf dem Entwicklungsrechner; anderswo -Delphi7Root oder DELPHI7 setzen
+    $Delphi7Root = Join-Path $lai '..\..\..\..\Borland\Delphi7'
+  }
+  $Dcc = Join-Path $Delphi7Root 'Bin\DCC32.EXE'
+  if (-not (Test-Path $Dcc)) {
+    throw "DCC32.EXE nicht gefunden unter '$Dcc' - -Delphi7Root oder DELPHI7 setzen."
+  }
+  $Delphi7Root = (Resolve-Path $Delphi7Root).Path
+  $banner = (& $Dcc 2>&1 | Select-Object -First 1 | Out-String).Trim()
+  if ($banner -notmatch 'Version 15\.0') {
+    throw "'$Dcc' ist nicht Delphi 7 (Compiler 15.0): $banner"
+  }
+  if ([string]::IsNullOrWhiteSpace($FastMM4) -or
+      -not (Test-Path (Join-Path $FastMM4 'FastMM4.pas'))) {
+    throw "FastMM4.pas nicht gefunden ('$FastMM4') - -FastMM4 oder FASTMM4 setzen."
+  }
+  $FastMM4 = (Resolve-Path $FastMM4).Path
+  $label = 'i386-win32, Delphi 7'
+  $units = @((Join-Path $Delphi7Root 'Lib'), (Join-Path $Delphi7Root 'Lib\Obj'), $FastMM4) +
+    $mormotUnits + $laiUnits
+  $inc += @($FastMM4)
+  $out = Join-Path $lai 'bin\delphi7\demos'
+} else {
+  # --- Delphi 13: explizit (ohne Pruefung) oder das installierte ---
+  if ([string]::IsNullOrWhiteSpace($Dcc)) {
+    $bds = if ($env:BDS) { $env:BDS } else { Join-Path ${env:ProgramFiles(x86)} "Embarcadero\Studio\$baseline" }
+    $Dcc = Join-Path $bds 'bin\dcc64.exe'
+    if (-not (Test-Path $Dcc)) {
+      throw "dcc64.exe nicht gefunden unter '$Dcc' - Delphi 13 installieren oder -Dcc angeben."
+    }
+    $banner = (& $Dcc --version 2>&1 | Out-String).Trim()
+    if ($banner -notmatch "version $([regex]::Escape($baseline))") {
+      throw "'$Dcc' ist nicht Delphi 13 (Compiler $baseline): $banner. Bewusst uebersteuern mit -Dcc."
+    }
+  } else {
+    if (-not (Test-Path $Dcc)) { throw "dcc64.exe nicht gefunden: '$Dcc'" }
+    $bds = Split-Path -Parent (Split-Path -Parent $Dcc)
+  }
+  $compilerVersion = if ((& $Dcc --version 2>&1 | Out-String) -match 'version (\d+\.\d+)') { $Matches[1] } else { '?' }
+  $label = "x86_64-win64, Delphi $compilerVersion"
+  $units = @((Join-Path $bds 'lib\win64\release')) + $mormotUnits + $laiUnits
+  $out = Join-Path $lai 'bin\delphi\demos'
+}
 $dcu = Join-Path $out 'dcu'
 New-Item -ItemType Directory -Force -Path $dcu | Out-Null
 
@@ -83,15 +122,26 @@ foreach ($d in $demos) {
   $dpr = Join-Path $out "$name.dpr"
   $buildLog = Join-Path $out "$name.buildlog"
   Copy-Item $lpr $dpr -Force
+  # Delphi 7 nimmt den Programmnamen ohne den letzten Punkt-Teil
+  # (demo.mcp.http -> demo.mcp.exe, mcp.examples -> mcp.exe): beide Namen vorher
+  # entfernen, nie ein altes Programm melden
+  $short = [IO.Path]::GetFileNameWithoutExtension($name)
+  Remove-Item (Join-Path $out "$name.exe"), (Join-Path $out "$short.exe") -ErrorAction SilentlyContinue
 
-  Write-Host ">>> demo $name (x86_64-win64, Delphi $compilerVersion)"
-  # -B: immer alles neu uebersetzen (kein veralteter Kompilat-Cache), -GD: Map-Datei
+  Write-Host ">>> demo $name ($label)"
   # dazu das Verzeichnis der Demo: FPC findet Units neben dem Programm von selbst,
-  # dcc nicht (die .dpr liegt in bin\delphi\demos)
+  # dcc nicht (die .dpr liegt im Ausgabeordner)
   $demoUnits = @($units) + @(Split-Path -Parent $lpr)
-  & $Dcc -B -Q -GD "-U$($demoUnits -join ';')" "-I$($inc -join ';')" "-R$src" `
-    "-O$(Join-Path $mormot2 'static\delphi')" '-NSSystem;Winapi;System.Win;Data;Data.Win;Xml' `
-    "-NU$dcu" "-E$out" $dpr *> $buildLog
+  # -B: immer alles neu uebersetzen (kein veralteter Kompilat-Cache), -GD: Map-Datei
+  if ($Delphi7) {
+    # -N: Unit-Ausgabe (Delphi 7 kennt -NU noch nicht); Pfade auch als -R
+    & $Dcc -B -Q -GD "-U$($demoUnits -join ';')" "-I$($inc -join ';')" "-R$($demoUnits -join ';')" `
+      "-O$(Join-Path $mormot2 'static\delphi')" "-N$dcu" "-E$out" $dpr *> $buildLog
+  } else {
+    & $Dcc -B -Q -GD "-U$($demoUnits -join ';')" "-I$($inc -join ';')" "-R$src" `
+      "-O$(Join-Path $mormot2 'static\delphi')" '-NSSystem;Winapi;System.Win;Data;Data.Win;Xml' `
+      "-NU$dcu" "-E$out" $dpr *> $buildLog
+  }
   $rc = $LASTEXITCODE
 
   if ($ShowAll) {
@@ -110,7 +160,18 @@ foreach ($d in $demos) {
     $failed++
     continue
   }
-  Write-Host "OK: $(Join-Path $out "$name.exe")"
+  # unter dem vollen Namen ablegen: sonst ueberschreiben sich unter Delphi 7 die
+  # Transport-Demos (demo.mcp.*) gegenseitig
+  $exe = Join-Path $out "$name.exe"
+  if (-not (Test-Path $exe) -and (Test-Path (Join-Path $out "$short.exe"))) {
+    Move-Item (Join-Path $out "$short.exe") $exe -Force
+  }
+  if (-not (Test-Path $exe)) {
+    Write-Host "FAIL: $name - kein Programm erzeugt ($exe)" -ForegroundColor Red
+    $failed++
+    continue
+  }
+  Write-Host "OK: $exe"
 }
 if ($failed -gt 0) {
   Write-Host "SOME DEMOS FAILED ($failed)" -ForegroundColor Red

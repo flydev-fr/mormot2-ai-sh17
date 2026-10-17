@@ -1,5 +1,18 @@
 // mormot.ext.os.windows.inc - Windows implementation of TExternalProcess
 
+{$ifndef FPC}
+{$ifndef UNICODE}
+// local change (landrix): Delphi 7's Windows.pas has neither of these;
+// TStartupInfo has the layout of STARTUPINFOW (only three pointer fields
+// differ in type) and is what its CreateProcessW declaration takes
+type
+  TStartupInfoW = TStartupInfo;
+
+const
+  CREATE_BREAKAWAY_FROM_JOB = $01000000;
+{$endif UNICODE}
+{$endif FPC}
+
 { background reader thread }
 
 function ExtProcessReaderThread(p: pointer):

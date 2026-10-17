@@ -34,11 +34,24 @@ type
   end;
 
   /// MCP tool that asks the Claude CLI a question and returns its answer
+{$ifdef HASGENERICS}
   TAskClaudeTool = class(TMcpToolBase<TAskClaudeParams>)
   protected
     function ExecuteTyped(const aParams: TAskClaudeParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
+{$else}
+  // without generics (Delphi 7): the same tool over TMcpRecordTool
+  TAskClaudeTool = class(TMcpRecordTool)
+  protected
+    function ExecuteRecord(const aParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+    function ExecuteTyped(const aParams: TAskClaudeParams;
+      const aAuthCtx: TMcpAuthContext): variant;
+  public
+    constructor Create(const aName, aDescription: RawUtf8);
+  end;
+{$endif HASGENERICS}
 
 type
   /// streams a tools/call "ask_claude" token-by-token over the Streamable HTTP
@@ -78,6 +91,11 @@ procedure RegisterClaudeTool(const aServer: TMcpServer);
 
 implementation
 
+const
+  /// no output callback: Delphi 7 does not resolve a bare nil for the
+  // method pointer among the RunRedirect overloads
+  NoRedirect: TOnRedirect = nil;
+
 procedure EnsureClaudeRtti;
 begin
   if not RecordHasFields(TypeInfo(TAskClaudeParams)) then
@@ -115,7 +133,7 @@ begin
   end;
   // note: mormot.ext.os's RunRedirect hides the vanilla one, so use the stdin
   // overload with an empty input ('') for these no-input probe commands
-  output := RunRedirect('where claude', '', @exitcode, nil, 5000);
+  output := RunRedirect('where claude', '', @exitcode, NoRedirect, 5000);
   if exitcode = 0 then
   begin
     nl := PosEx(#10, RawUtf8(output));
@@ -125,20 +143,26 @@ begin
       line := TrimU(copy(RawUtf8(output), 1, nl - 1));
     if (line <> '') and
        FileExists(TFileName(line)) then
-      exit(TFileName(line));
+    begin
+      result := TFileName(line);
+      exit;
+    end;
   end;
   result := 'claude';
   {$else}
   result := Executable.ProgramFilePath + 'claude';
   if FileExists(result) then
     exit;
-  output := RunRedirect('/bin/sh -c "command -v claude"', '', @exitcode, nil, 5000);
+  output := RunRedirect('/bin/sh -c "command -v claude"', '', @exitcode, NoRedirect, 5000);
   if exitcode = 0 then
   begin
     line := TrimU(RawUtf8(output));
     if (line <> '') and
        FileExists(TFileName(line)) then
-      exit(TFileName(line));
+    begin
+      result := TFileName(line);
+      exit;
+    end;
   end;
   result := 'claude';
   {$endif OSWINDOWS}
@@ -148,7 +172,7 @@ function ClaudeAvailable(const aCli: TFileName): boolean;
 var
   exitcode: integer;
 begin
-  RunRedirect(QuoteCmd(aCli) + ' --version', '', @exitcode, nil, 10000);
+  RunRedirect(QuoteCmd(aCli) + ' --version', '', @exitcode, NoRedirect, 10000);
   result := exitcode = 0;
 end;
 
@@ -173,6 +197,21 @@ end;
 
 { TAskClaudeTool }
 
+{$ifndef HASGENERICS}
+
+constructor TAskClaudeTool.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited CreateTyped(TypeInfo(TAskClaudeParams), aName, aDescription);
+end;
+
+function TAskClaudeTool.ExecuteRecord(const aParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := ExecuteTyped(TAskClaudeParams(aParams), aAuthCtx);
+end;
+
+{$endif HASGENERICS}
+
 function TAskClaudeTool.ExecuteTyped(const aParams: TAskClaudeParams;
   const aAuthCtx: TMcpAuthContext): variant;
 var
@@ -193,7 +232,7 @@ begin
       output := RunRedirect(
         QuoteCmd(cli) + ' -p --output-format json',
         {stdinput=} aParams.Prompt,
-        @exitcode, nil,
+        @exitcode, NoRedirect,
         {waitfordelayms=} 120000);
       if exitcode = 0 then
       begin

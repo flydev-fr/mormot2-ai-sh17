@@ -640,8 +640,8 @@ Roadmap — DESIGN.md verweist hierher.
     4. flydev-Übernahmen (Punkt 2) nur selektiv; pgvector erst, wenn ein Deployment es
        braucht.
     5. Die Stale-Zähler der Assertions in README/DESIGN vereinheitlichen.
-    6. Ein Build-Skript für die Demos unter Delphi (13 und 7): Delphi 13 ✓
-       (`scripts/build-delphi-demos.ps1`, 2026-10-17, alle 18 Demos); Delphi 7 offen.
+    6. Ein Build-Skript für die Demos unter Delphi (13 und 7) ✓
+       (`scripts/build-delphi-demos.ps1`, `-Delphi7` für Delphi 7, 2026-10-17, alle 18 Demos).
     7. **Load Governor** für Bulk-Embedding ✓ gebaut (2026-10-14, `mormot.ai.governor`,
        im Backend `GetBulkEmbedder` mit `AI_BULK_*`); offen nur sein erster Aufrufer, ein
        Indizier-Job, und ein Lauf auf echter Sensor-Hardware (Linux, nicht WSL2):

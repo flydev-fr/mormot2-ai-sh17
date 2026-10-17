@@ -437,6 +437,7 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 # Delphi 13, on Windows:
 .\scripts\run-delphi-tests.ps1               # MCP, LLM and inference suites (-Suite mcp|llm|infer, -ShowAll)
 .\scripts\build-delphi-demos.ps1             # all demos (or -Demo infer\llm-bench.lpr)
+.\scripts\build-delphi-demos.ps1 -Delphi7 -FastMM4 <dir>   # the same with Delphi 7
 # logs and binaries land in bin\delphi\
 # Delphi 7 (Win32):
 .\scripts\run-delphi7-tests.ps1 -FastMM4 <dir>   # same suites; bin\delphi7\
@@ -600,7 +601,7 @@ by idle machines on the network (task parallelism with leases, not model paralle
 embeddings in the LAN first, LLM batch jobs later), see
 [docs/distributed-execution.md](docs/distributed-execution.md) (German). Also alongside:
 the first real consumer of the load governor (a bulk indexing job in the backend), agent loop limits (cancellation, deadlines, context budget),
-token-based chunking, building the demos with Delphi 7. The German [CONCEPT.md](CONCEPT.md) §9 is
+token-based chunking. The German [CONCEPT.md](CONCEPT.md) §9 is
 the single source of truth for open points.
 
 ## Why a standalone extension
