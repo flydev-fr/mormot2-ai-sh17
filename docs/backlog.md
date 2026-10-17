@@ -134,15 +134,118 @@ schneller als Vulkan (Q8_0 404 gegen 358 Token/s), Prefill bei rund 90 % von Vul
 
 ---
 
-## B4 — Weitere Modelle
+## B4 — Weitere Modelle: Phase D (Plan 2026-10-17)
 
-Je Modell ein eigener Eintrag, sobald gebraucht: Llama 3, Mistral, Gemma, Reranker
-(BGE-Reranker), Qwen3-Embedding, BGE-M3 Sparse-/ColBERT-Ausgabe, MoE.
+Ziel: weitere Decoder-Familien so anbinden, dass jeder neue Baustein mehrere Modelle
+freischaltet. Geplant mit Codex-Abgleich; Modelldaten aus den Modellkarten und `config.json`
+der Hersteller (Stand Oktober 2026), vor jedem Slice gegen die gepinnte Revision prüfen.
 
-**Muster:** wie Qwen3 (`src/infer/mormot.ai.infer.model.qwen3.pas`): Referenzdaten per
-`tools/make_reference*.py` aus `transformers` erzeugen (nur nachschlagen, Apache 2.0),
-Tiny-Modell für schnelle Tests, echtes Modell hinter `LAI_REQUIRE_MODEL`, Laden aus
-safetensors und GGUF, Gate gegen die Referenz.
+**Entscheidungen (2026-10-17):** gpt-oss-20b ist das erste neue produktive Modell, vor
+Gemma 4. Kolibri ist auf dem RTX-Rechner machbar (96 GB RAM, die Experten liegen dort im
+Arbeitsspeicher), kommt aber nach DeltaNet.
+
+### Kandidaten
+
+| Modell | Lizenz | Aufbau | neue Bausteine |
+|---|---|---|---|
+| gpt-oss-20b (120b) | Apache 2.0 | 20b: MoE 32 Experten top-4, 24 Layer (120b: 128 Experten, 36 Layer), abwechselnd Fenster 128 und voll | MoE, Sliding Window, Attention-Sinks, YaRN, Bias, begrenzte SwiGLU, MXFP4, o200k-Tokenizer, Harmony-Chatformat |
+| Gemma 4 26B-A4B, 31B (E2B, E4B) | Apache 2.0 | 26B: 30 Layer, 5 lokal (Fenster 1024) : 1 global, 128 Experten top-8 + dichter Parallelzweig; global 2 KV-Köpfe mit Dimension 512; 31B dicht | Kopfdimension 512 auf der GPU, GELU-tanh, Logit-Softcap, teilweise RoPE, K=V, eigener Tokenizer; nur E2B/E4B zusätzlich Per-Layer Embeddings und geteilter KV |
+| Qwen3.8-27B (`model_type` `qwen3_5`, wie Qwen3.5) | Apache 2.0 | 64 Layer = 16 × (3 Gated DeltaNet + 1 volle Attention mit Ausgangsgate) | Gated DeltaNet mit rekurrentem Zustand und Convolution-Puffer; Bildteil zunächst nicht |
+| Kolibri-1 (Aleph Alpha) | Apache 2.0, nur Gewichte und Konfiguration | MoE 78B / 3,46B aktiv, 50 Layer, 4 Fenster (513) : 1 voll, NoPE in den vollen Layern, 384 Experten top-6 mit Sigmoid-Router + 1 geteilter | FP8 E4M3 in 128×128-Blöcken, safetensors in Teilen, Router mit Bias-Korrektur; GGUF nur von Dritten (Q4_K_M 47,5 GB) |
+| Nemotron 3.5 Bolt | OpenMDW-1.1 | 74B-A9B, Mamba-2/Transformer-Hybrid, LatentMoE | Mamba-2, LatentMoE, IQ2_XXS (Experten) und NVFP4 (Mamba-Projektionen) |
+
+Die Architektur bauen wir nach der Implementierung in `transformers` (Apache 2.0) nach,
+nicht nach Hersteller-Code; das gilt auch für Kolibri, dessen Lizenz Code und Architektur
+ausdrücklich ausnimmt.
+
+### Was der Code heute mitbringt und was fehlt
+
+- Gewichtsformate auf der GPU: F32, Q8_0, Q4_K, Q6_K. Neu wären MXFP4, FP8-Blöcke, IQ2_XXS, NVFP4.
+- Tokenizer: Byte-BPE nur mit dem Qwen2-Pre-Tokenizer; Unigram fest auf BGE-M3 zugeschnitten.
+- `TQwen3Model.Forward` setzt gleich große Layer, QK-Norm, RoPE und SwiGLU voraus.
+- Die GPU-Attention kann Kopfdimensionen bis 256 (Gemma 4 global braucht 512).
+- `Truncate` des Kontexts setzt nur die Länge zurück. Mit Ringpuffer-KV oder rekurrentem
+  Zustand geht das nicht mehr: Es braucht gültige Rücksetzpunkte, sonst einen Cache-Miss.
+- safetensors nur als eine Datei `model.safetensors`, keine Teildateien mit Index.
+- Kein eigenes Metal-Backend nötig: Apple läuft über Vulkan/MoltenVK.
+
+### Testrechner
+
+- RTX-Rechner: RTX 5090 mit 32 GB, 96 GB RAM. Echte große Modelle laufen hier.
+- Mac M2 Pro: 16 GB RAM. Nur Tiny-Modelle und kleine echte Modelle (Qwen3.5-0.8B).
+- Snapdragon X (Adreno): nur Tiny- und kleine Modelle.
+
+### Slices
+
+Jeder Slice wie bisher: FPC zuerst, Gegenproben, Review (Claude-Finder + Codex), Upstream-
+Revision gepinnt, Tiny-Modell aus `transformers` als Referenz, echtes Modell hinter
+`LAI_REQUIRE_MODEL`.
+
+**D1 — Gemeinsame Decoder-Typen.** Reiner Umbau: `TDecoderModel`, Kontext und Gerät statt
+`TQwen3…`, nicht-generisch. Eine Layer-Liste beschreibt je Layer getrennt den Mixer (volle
+Attention, Fenster-Attention, DeltaNet, Mamba), den Zustand (KV, Fenster-KV, geteilter KV,
+rekurrent mit Convolution-Puffer), das FFN (dicht oder MoE: Aktivierung, Router, Top-k-
+Normierung, geteilter Zweig) sowie Dimensionen, Norm-/Residual-Anordnung, Bias und
+Positionsverfahren (RoPE, teilweise RoPE, YaRN, NoPE). Tokenizer, Chat-Template und
+Antwort-Parser hinter kleinen Schnittstellen; Backends melden vor dem Laden, was sie können.
+Gebaut wird nur, was Qwen3 braucht. Gate: alle Qwen3-Tests (CPU, Vulkan, CUDA, Prompt-Cache,
+Client) unverändert grün auf allen Compilern bis Delphi 7.
+
+**D2 — MoE auf der CPU.** Router (Softmax und Sigmoid, Top-k, optional normiert), gewichtete
+Summe der Experten, Experten als Sichten auf die Gewichte; bestehende Quant-Kernel weiter
+nutzen. Decode rechnet nur die gewählten Experten, Prefill gruppiert die Tokens je Experte.
+Erstes Modell **Qwen3-30B-A3B** (nur Zwischenschritt für MoE, kein Kandidat): reines MoE ohne neuen Tokenizer, ohne Sliding Window, ohne
+neues Quant-Format. Gate: Tiny-Qwen3-MoE gegen `transformers` (Experten-IDs, Gewichte,
+Logits), Einzeltoken und Prefill gleich; Qwen3-30B-A3B Q4_K_M auf dem RTX-Rechner.
+
+**D3 — MoE auf CUDA und Vulkan.** Expertenauswahl bleibt auf dem Gerät; Decode mit kleinen
+Produkten der gewählten Experten, Prefill gruppiert. Erst korrekt ohne CUDA-Graph, danach ein
+Graph mit wechselnden Experten-IDs. Gate: CPU und GPU gleich bei wechselnder Auswahl und
+leeren Gruppen; Prefill/Decode und Speicherspitze gemessen auf RTX und M2 Pro (Tiny).
+
+**D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
+dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
+Schlüssel nicht vorher überschreiben. NoPE als Layer-Eigenschaft. Prompt-Cache mit gültigen
+Rücksetzpunkten statt bloßem Kürzen. Gate: Fenstergrenze, mehrfacher Umlauf, verschiedene
+Chunk-Größen und verzweigte Prompts geben dieselben Logits wie eine Neuberechnung.
+
+**D5 — gpt-oss-20b.** MXFP4 (erst skalar entpacken, dann direkt im Linear rechnen, nie das
+ganze Modell nach F32), Attention-Sinks (gelernter Zusatzterm im Softmax-Nenner je Kopf, keine
+festgehaltenen Anfangstokens), YaRN, Bias in Attention und Experten, die begrenzte
+SwiGLU-Variante; safetensors in Teildateien mit Index (Referenzgewichte); o200k-Tokenizer, Harmony-Chatformat und Parser (Kanäle, Tool-Aufrufe). Erst
+CPU, dann Vulkan und CUDA. Gate: Tiny-gpt-oss gegen `transformers`, Token-IDs gegen den
+Referenz-Tokenizer, Harmony-Rendering und -Parsing; gpt-oss-20b auf dem RTX-Rechner.
+
+**D6 — Gemma 4 26B-A4B und 31B.** GELU-tanh, Norm-/Residual-Pfade, Router-Skalierung,
+Logit-Softcap, K=V, der dichte Parallelzweig neben den Experten (26B), lokale und globale
+Kopfdimension verschieden (global 512: Attention-Kernel auf Vulkan und CUDA erweitern),
+teilweise RoPE, eigener Tokenizer exakt nach der Referenz.
+E2B/E4B (Per-Layer Embeddings, geteilter KV) danach als eigener Schritt. Gate: Tiny-Gemma mit
+globalen Köpfen, echtes Modell quantisiert auf dem RTX-Rechner.
+
+**D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
+vollen Attention. Erst seriell auf der CPU, dann Chunk-Prefill, dann GPU. Prompt-Cache mit
+Zustands-Checkpoints. Erst **Qwen3.5-0.8B** (läuft auf allen Testrechnern), dann
+**Qwen3.8-27B** (volle Attention mit Kopfdimension 256). Gate: seriell und in Chunks gleich,
+Checkpoint-Restore und verzweigte Prompts gleich wie Neuberechnung.
+
+**D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
+beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,
+geteilter Experte, NoPE in den vollen Layern. Auf dem RTX-Rechner: Experten im RAM (CPU),
+Attention und dichte Teile auf der GPU. Gate: Tiny-Kolibri mit Router-Bias und 513er-Fenster
+gegen `transformers`; echtes Modell auf dem RTX-Rechner mit gemessenem Speicherbedarf.
+
+**D9 — Mamba-2, LatentMoE, IQ2_XXS, NVFP4 (Nemotron 3.5 Bolt).** Nur bei konkretem Bedarf.
+Gate: Tiny-Mamba-2 und LatentMoE, IQ2_XXS und NVFP4 einzeln, dann echtes Modell mit eigener
+Speichermessung (NVIDIA nennt rund 22 GB Gewichte, 23,8 GB mit Laufzeitzustand und Drafter,
+ohne Bildteil).
+
+### Außerhalb von D
+
+Reranker (BGE-Reranker), Qwen3-Embedding, BGE-M3 Sparse-/ColBERT-Ausgabe, Llama 3, Mistral:
+je ein eigener Eintrag, sobald gebraucht. Llama/Mistral brauchen nach D1 vor allem den
+llama-bpe- bzw. SentencePiece-Tokenizer. Bild- und Videoeingang (Qwen3.8, Gemma 4, Bolt) ist
+nicht Teil von D.
 
 ---
 
