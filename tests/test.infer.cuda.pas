@@ -9,6 +9,7 @@ interface
 
 uses
   sysutils,
+  classes,
   mormot.core.base,
   mormot.core.os,
   mormot.core.unicode,
@@ -48,6 +49,12 @@ type
     procedure RefusesMisuse;
     /// device memory: what goes up comes down, at an offset, also in pieces
     procedure UploadDownload;
+    /// slice C5c: kernels and a device copy recorded as a graph run as
+    // enqueued; the next capture with other parameters updates the graph, one
+    // of another shape makes it again; copies and waits are refused during a
+    // capture, an aborted capture leaves the stream usable; another instance
+    // on another thread copies and waits meanwhile
+    procedure GraphRunsCapture;
     /// slice C2: TInferCudaBackend.Linear for F32, Q8_0, Q4_K and Q6_K weights
     // against the reference's F32 product of the dequantized weights (a
     // tolerance: another summation order), with and without bias, more than
@@ -333,6 +340,276 @@ begin
 end;
 
 
+
+type
+  /// another TInferCuda on another thread: copies, a kernel and a wait
+  // while the test's instance captures a graph (the same primary context)
+  TCudaSideThread = class(TThread)
+  protected
+    fCu: TInferCuda;
+    procedure Execute; override;
+  public
+    Bad: integer;
+    Error: string;
+    constructor Create(aCu: TInferCuda);
+  end;
+
+constructor TCudaSideThread.Create(aCu: TInferCuda);
+begin
+  fCu := aCu; // before the thread starts
+  Bad := -1;
+  inherited Create(false);
+end;
+
+procedure TCudaSideThread.Execute;
+const
+  COUNT = 64;
+var
+  module: TInferCuModule;
+  a, y: TInferCuBuffer;
+  va, vy: array[0..COUNT - 1] of single;
+  pa, py: TCuDevicePtr;
+  n: cardinal;
+  i: PtrInt;
+  sum: single;
+begin
+  module := nil;
+  a := nil;
+  y := nil;
+  try
+    try
+      for i := 0 to COUNT - 1 do
+        va[i] := i * 0.5;
+      module := TInferCuModule.Create(fCu, @PTX_BASIC);
+      a := TInferCuBuffer.Create(fCu, COUNT * 4);
+      y := TInferCuBuffer.Create(fCu, COUNT * 4);
+      a.Upload(0, @va, COUNT * 4);
+      pa := a.Ptr;
+      py := y.Ptr;
+      n := COUNT;
+      fCu.Enqueue(module.Kernel('add'), [@pa, @pa, @py, @n], 1, COUNT);
+      fCu.Synchronize;
+      y.Download(0, @vy, COUNT * 4);
+      Bad := 0;
+      for i := 0 to COUNT - 1 do
+      begin
+        sum := va[i] + va[i];
+        if sum <> vy[i] then
+          inc(Bad);
+      end;
+    except
+      on E: Exception do
+        Error := E.Message;
+    end;
+  finally
+    y.Free;
+    a.Free;
+    module.Free;
+  end;
+end;
+
+procedure TTestInferCuda.GraphRunsCapture;
+const
+  COUNT = 1000;
+  BLOCK = 256;
+var
+  module: TInferCuModule;
+  kernel: TCuHandle;
+  a, b, y: TInferCuBuffer;
+  va, vb, vy: TSingleDynArray;
+  exec: TCuHandle;
+  pa, pb, py: TCuDevicePtr;
+  n: cardinal;
+  i, bad: PtrInt;
+  sum: single;
+  raised: boolean;
+  other: TInferCuda;
+  side: TCudaSideThread;
+  a2: TInferCuBuffer;
+
+  // y = a + b + b (two adds, the second over y), then a copy of y[0 .. 9]
+  // to y[10 .. 19] - over the first aCount values only
+  procedure Steps(aCount: cardinal);
+  begin
+    n := aCount;
+    pa := a.Ptr;
+    pb := b.Ptr;
+    py := y.Ptr;
+    fCu.Enqueue(kernel, [@pa, @pb, @py, @n], (n + BLOCK - 1) div BLOCK, BLOCK);
+    pa := y.Ptr;
+    fCu.Enqueue(kernel, [@pa, @pb, @py, @n], (n + BLOCK - 1) div BLOCK, BLOCK);
+    y.CopyTo(0, y, 10 * 4, 10 * 4);
+  end;
+
+  // compare y with the CPU for the first aCount values (the copy included)
+  procedure Verify(aCount: PtrInt; const aWhat: RawUtf8);
+  var
+    j, k: PtrInt;
+  begin
+    y.Download(0, pointer(vy), COUNT * 4); // waits for the graph
+    bad := 0;
+    for j := 0 to aCount - 1 do
+    begin
+      // two single additions, each rounded (Delphi Win64 evaluates a single
+      // expression in double precision)
+      k := j;
+      if (j >= 10) and (j < 20) then
+        k := j - 10;
+      sum := va[k] + vb[k];
+      sum := sum + vb[k];
+      if PCardinal(@sum)^ <> PCardinal(@vy[j])^ then
+        inc(bad);
+    end;
+    for j := aCount to COUNT - 1 do
+      if vy[j] <> -1 then
+        inc(bad);
+    CheckUtf8(bad = 0, '%: % values differ', [aWhat, bad]);
+  end;
+
+  procedure Reset;
+  var
+    j: PtrInt;
+  begin
+    for j := 0 to COUNT - 1 do
+      vy[j] := -1;
+    y.Upload(0, pointer(vy), COUNT * 4);
+  end;
+
+begin
+  if not HasDevice then
+    exit;
+  SetLength(va, COUNT);
+  SetLength(vb, COUNT);
+  SetLength(vy, COUNT);
+  for i := 0 to COUNT - 1 do
+  begin
+    va[i] := i * 0.25 - 7;
+    vb[i] := 1 / (i + 2);
+  end;
+  module := TInferCuModule.Create(fCu, @PTX_BASIC);
+  a := nil;
+  b := nil;
+  y := nil;
+  exec := nil;
+  try
+    kernel := module.Kernel('add');
+    a := TInferCuBuffer.Create(fCu, COUNT * 4);
+    b := TInferCuBuffer.Create(fCu, COUNT * 4);
+    y := TInferCuBuffer.Create(fCu, COUNT * 4);
+    a.Upload(0, pointer(va), COUNT * 4);
+    b.Upload(0, pointer(vb), COUNT * 4);
+    // first capture: instantiated, launched by CaptureEnd
+    Reset;
+    fCu.CaptureBegin;
+    Steps(500);
+    fCu.CaptureEnd(exec);
+    Check(exec <> nil, 'executable graph');
+    Verify(500, 'graph');
+    // the same shape, another count: the graph takes the new parameters
+    Reset;
+    fCu.CaptureBegin;
+    Steps(COUNT);
+    fCu.CaptureEnd(exec);
+    Verify(COUNT, 'updated graph');
+    // another shape (no copy): the graph is made again
+    Reset;
+    fCu.CaptureBegin;
+    n := 300;
+    pa := a.Ptr;
+    pb := b.Ptr;
+    py := y.Ptr;
+    fCu.Enqueue(kernel, [@pa, @pb, @py, @n], (n + BLOCK - 1) div BLOCK, BLOCK);
+    fCu.CaptureEnd(exec);
+    y.Download(0, pointer(vy), COUNT * 4);
+    bad := 0;
+    for i := 0 to COUNT - 1 do
+    begin
+      sum := va[i] + vb[i];
+      if ((i < 300) and (PCardinal(@sum)^ <> PCardinal(@vy[i])^)) or
+         ((i >= 300) and (vy[i] <> -1)) then
+        inc(bad);
+    end;
+    CheckUtf8(bad = 0, 'graph of another shape: % values differ', [bad]);
+    // copies and waits are refused during a capture; an abort ends it
+    fCu.CaptureBegin;
+    Check(fCu.Capturing, 'capturing');
+    raised := false;
+    try
+      y.Upload(0, pointer(vy), 4);
+    except
+      on EInferCuda do
+        raised := true;
+    end;
+    Check(raised, 'no Upload during a capture');
+    raised := false;
+    try
+      fCu.Synchronize;
+    except
+      on EInferCuda do
+        raised := true;
+    end;
+    Check(raised, 'no Synchronize during a capture');
+    raised := false;
+    try
+      fCu.CaptureBegin;
+    except
+      on EInferCuda do
+        raised := true;
+    end;
+    Check(raised, 'no nested capture');
+    fCu.CaptureAbort;
+    Check(not fCu.Capturing, 'aborted');
+    // the stream works on: a launch and the earlier graph again
+    Reset;
+    fCu.CaptureBegin;
+    Steps(COUNT);
+    fCu.CaptureEnd(exec);
+    Verify(COUNT, 'after an abort');
+    // another instance on another thread works while this one captures:
+    // neither waits for the other's stream
+    other := TInferCuda.Create;
+    try
+      // no copy between the buffers of two instances (two streams)
+      a2 := TInferCuBuffer.Create(other, COUNT * 4);
+      try
+        raised := false;
+        try
+          y.CopyTo(0, a2, 0, 4);
+        except
+          on EInferCuda do
+            raised := true;
+        end;
+        Check(raised, 'no CopyTo into another instance');
+      finally
+        a2.Free;
+      end;
+      Reset;
+      fCu.CaptureBegin;
+      Steps(COUNT);
+      side := TCudaSideThread.Create(other);
+      try
+        side.WaitFor;
+        CheckUtf8((side.Bad = 0) and (side.Error = ''),
+          'another instance during a capture: % differ %', [side.Bad, side.Error]);
+      finally
+        side.Free;
+      end;
+      fCu.CaptureEnd(exec);
+      Verify(COUNT, 'graph beside another instance');
+    finally
+      other.Free;
+    end;
+  finally
+    fCu.CaptureAbort;
+    fCu.GraphFree(exec);
+    y.Free;
+    b.Free;
+    a.Free;
+    module.Free;
+  end;
+  Check(exec = nil, 'GraphFree');
+end;
+
 procedure TTestInferCuda.LinearMatchesReference;
 const
   // rows, in, out: one row, partial tiles, more than 65535 outputs; gemm8
@@ -599,7 +876,7 @@ var
       @kvHeads, @headDim, @past, @eps], aHeads + aKvHeads, 128, aRows);
     fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @ppart, @rows, @heads, @headDim,
       @kvHeads, @past, @splits, @hb, @rb], aHeads div aHeadBlock, 128,
-      (aRows + rb - 1) div rb, aSplits);
+      (aRows + PtrInt(rb) - 1) div PtrInt(rb), aSplits);
     if aSplits > 1 then
       fCu.Enqueue(kMerge, [@ppart, @py, @rows, @heads, @headDim, @splits],
         aHeads, 128, aRows);
@@ -732,11 +1009,12 @@ begin
           [InferCompareText(cmp)]);
       end;
       // decoding, one token at a time - the keys of a row in one range or
-      // cut into ranges of 64
+      // cut into ranges of 64; kernel by kernel, then as a graph
       for i := 0 to 4 do
       begin
         id := ids[i];
         vk.SplitKeys := (i and 1) * 64;
+        vk.UseGraphs := i >= 2;
         model.Forward(c1, @id, 1, pointer(l1));
         vk.Forward(c2, @id, 1, pointer(l2));
         if k = 0 then

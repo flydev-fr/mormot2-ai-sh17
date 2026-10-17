@@ -1382,6 +1382,35 @@ Karte, C5 Tempo.
     100 und 36 Eingängen (alle drei Kernel); RTX 5090 265 Assertions grün unter FPC 3.2.2
     und Delphi 13 und unter FPC 3.2.2 in der WSL (Linux, ganze Inferenz-Suite 2751). Gegenprobe (Bytes in `weights8`, Q4_K-Minimum, letzte Zeile in `gemm8`,
     Shuffle über 16 Lanes, `gemm8` für ungeeignete Eingänge) scheitert in allen fünf Fällen.
+  - *C5c, erledigt 2026-10-17:* ein Decode-Schritt als CUDA-Graph. Die Messung zeigte, wohin
+    die fehlende Millisekunde ging: der Host brauchte 1,8 ms für die rund 370 Kernelstarts
+    eines Tokens, die Karte wartete zwischen ihnen. `TInferCuda.CaptureBegin`/`CaptureEnd`
+    zeichnen den Schritt auf (Stream-Capture) und starten ihn als einen Graphen; der Graph
+    des vorigen Schritts übernimmt die neuen Parameter (`cuGraphExecUpdate`), bei anderer
+    Form wird er neu gebaut. Dafür laufen alle Kernel und Kopien auf einem eigenen,
+    nicht-blockierenden Stream, gewartet wird nur auf ihn (`cuStreamSynchronize`): eine
+    zweite Instanz im selben Primärkontext, in einem anderen Thread, darf während einer
+    Aufzeichnung kopieren und warten (Codex-Fund; mit blockierendem Stream und Kopien auf
+    dem Legacy-Stream scheiterte sie mit `CUDA_ERROR_STREAM_CAPTURE_IMPLICIT`).
+    `TQwen3Cuda.UseGraphs` (Vorgabe an). Dazu die beiden inneren Schleifen der Attention
+    entrollt (`#pragma unroll 8`, Decode +10 %); dasselbe in `linear8` brachte nichts und
+    blieb draußen.
+
+    | Modell, Prompt | Vulkan | CUDA nach C5b | CUDA nach C5c |
+    |---|---|---|---|
+    | Q8_0, 200 | 13 683 / 358 | 12 335 / 266 | 12 392 / 404 |
+    | Q8_0, 1000 | 14 596 / 376 | 12 893 / 273 | 13 319 / 407 |
+    | Q4_K_M, 200 | 12 993 / 331 | 11 358 / 274 | 11 367 / 360 |
+    | Q4_K_M, 1000 | 13 893 / 349 | 11 887 / 281 | 12 193 / 362 |
+
+    Test: `GraphRunsCapture` (Aufzeichnen, Aktualisieren mit anderen Parametern, andere
+    Form, Verweigerung von Kopien und Warten während der Aufzeichnung, Abbruch, eine zweite
+    Instanz in einem anderen Thread), `TinyQwen3MatchesCpu` dekodiert erst Kernel für
+    Kernel, dann als Graph. RTX 5090: 279 Assertions grün unter FPC 3.2.2 und Delphi 13
+    und unter FPC 3.2.2 in der WSL (Linux, ganze Inferenz-Suite 2765). `CopyTo` zwischen
+    Puffern zweier Instanzen wird abgelehnt (zwei Streams, Codex-Fund).
+    Gegenprobe (kein Update, kein Start, Abbruch ohne Ende der Aufzeichnung, Kopie auf dem
+    Legacy-Stream, blockierender Stream) scheitert in allen fünf Fällen.
 
 ### Danach — nach Bedarf
 

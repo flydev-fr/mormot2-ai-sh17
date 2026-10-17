@@ -229,6 +229,7 @@ extern "C" __global__ void attention(const float* q, const float4* keys4,
     if (j < hi)
     {
       const float4* kp = keys4 + ((j * kvw + (unsigned long long)g * d) >> 2);
+#pragma unroll 8
       for (unsigned int k = 0u; k < d4; k++)
       {
         float4 kv = kp[k];
@@ -277,6 +278,7 @@ extern "C" __global__ void attention(const float* q, const float4* keys4,
     __syncthreads();
     // the weighted values of this tile
     unsigned int n = min(BLOCK, hi - base);
+#pragma unroll 8
     for (unsigned int jj = 0u; jj < n; jj++)
     {
       unsigned long long vb = (base + jj) * kvw + vk;

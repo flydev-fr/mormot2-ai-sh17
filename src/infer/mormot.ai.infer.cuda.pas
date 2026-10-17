@@ -78,8 +78,6 @@ type
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     CtxSetCurrent: function(aContext: TCuHandle): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
-    CtxSynchronize: function: TCuResult;
-      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     ModuleLoadData: function(out aModule: TCuHandle; aImage: pointer): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     ModuleUnload: function(aModule: TCuHandle): TCuResult;
@@ -91,19 +89,41 @@ type
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     MemFree: function(aPtr: TCuDevicePtr): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
-    MemcpyHtoD: function(aDst: TCuDevicePtr; aSrc: pointer;
-      aBytes: PtrUInt): TCuResult;
-      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
-    MemcpyDtoH: function(aDst: pointer; aSrc: TCuDevicePtr;
-      aBytes: PtrUInt): TCuResult;
-      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
-    MemcpyDtoD: function(aDst, aSrc: TCuDevicePtr; aBytes: PtrUInt): TCuResult;
-      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     LaunchKernel: function(aFunction: TCuHandle;
       aGridX, aGridY, aGridZ, aBlockX, aBlockY, aBlockZ, aSharedBytes: cardinal;
       aStream: TCuHandle; aParams, aExtra: PPointer): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
     GetErrorName: function(aError: TCuResult; out aText: PAnsiChar): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    StreamCreate: function(out aStream: TCuHandle; aFlags: cardinal): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    StreamDestroy: function(aStream: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    StreamBeginCapture: function(aStream: TCuHandle; aMode: integer): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    StreamEndCapture: function(aStream: TCuHandle; out aGraph: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GraphInstantiate: function(out aExec: TCuHandle; aGraph: TCuHandle;
+      aFlags: Int64): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GraphExecUpdate: function(aExec, aGraph: TCuHandle; aInfo: pointer): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GraphLaunch: function(aExec, aStream: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GraphDestroy: function(aGraph: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    GraphExecDestroy: function(aExec: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    MemcpyDtoDAsync: function(aDst, aSrc: TCuDevicePtr; aBytes: PtrUInt;
+      aStream: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    MemcpyHtoDAsync: function(aDst: TCuDevicePtr; aSrc: pointer; aBytes: PtrUInt;
+      aStream: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    MemcpyDtoHAsync: function(aDst: pointer; aSrc: TCuDevicePtr; aBytes: PtrUInt;
+      aStream: TCuHandle): TCuResult;
+      {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
+    StreamSynchronize: function(aStream: TCuHandle): TCuResult;
       {$ifdef OSWINDOWS} stdcall; {$else} cdecl; {$endif}
   end;
 
@@ -139,7 +159,10 @@ type
     /// copy aBytes of the buffer at aOffset to aDest, waiting until done
     procedure Download(aOffset: Int64; aDest: pointer; aBytes: Int64);
     /// copy aBytes of the buffer at aOffset into aDest at aDestOffset on the
-    // device, in order with the kernels enqueued before and after (no wait)
+    // device, in order with the kernels enqueued before and after (no wait;
+    // recorded into a graph between CaptureBegin and CaptureEnd)
+    // - aDest must belong to the same TInferCuda: the copy runs on its stream,
+    //   another instance would not wait for it
     procedure CopyTo(aOffset: Int64; aDest: TInferCuBuffer; aDestOffset,
       aBytes: Int64);
     /// the device address, as a kernel parameter takes it
@@ -162,6 +185,8 @@ type
     fMultiprocessors: integer;
     fMaxSharedPerBlock: integer;
     fTotalMemory: Int64;
+    fStream: TCuHandle;
+    fCapturing: boolean;
     procedure Load(var aProc; aName: PAnsiChar);
     /// raise EInferCuda with the driver's name of aResult when it is no success
     procedure Check(aResult: TCuResult; const aCall: RawUtf8);
@@ -184,12 +209,30 @@ type
     /// as Launch, without waiting: the kernels run in the order enqueued, after
     // every copy made before (one stream) - Synchronize waits for them
     // - aParams are read by the call itself: their values may change after it
+    // - between CaptureBegin and CaptureEnd: recorded into the graph instead
     procedure Enqueue(aKernel: TCuHandle; const aParams: array of pointer;
       aGridX, aBlockX: cardinal; aGridY: cardinal = 1; aGridZ: cardinal = 1;
       aBlockY: cardinal = 1; aBlockZ: cardinal = 1; aSharedBytes: cardinal = 0);
     /// wait for every kernel and copy enqueued; raises the error of one that
     // failed
     procedure Synchronize;
+    /// record the following Enqueue and CopyTo calls of this thread into a
+    // graph instead of running them (CUDA stream capture): one launch of the
+    // graph then replaces hundreds of kernel launches and the gaps between
+    // them - Upload, Download, Launch and Synchronize are not allowed until
+    // CaptureEnd or CaptureAbort
+    procedure CaptureBegin;
+    /// end the capture and launch the graph (no wait): aExec, nil or the
+    // executable graph of an earlier capture, takes the new kernel parameters
+    // (cuGraphExecUpdate) or is made again when the graph changed its shape
+    // - free aExec with GraphFree
+    procedure CaptureEnd(var aExec: TCuHandle);
+    /// end a capture without launching it (after an error); never raises
+    procedure CaptureAbort;
+    /// release an executable graph of CaptureEnd and set aExec to nil
+    procedure GraphFree(var aExec: TCuHandle);
+    /// true between CaptureBegin and CaptureEnd / CaptureAbort
+    property Capturing: boolean read fCapturing;
     property Api: TInferCuApi read fApi;
     property Device: TCuDevice read fDevice;
     property DeviceName: RawUtf8 read fDeviceName;
@@ -213,6 +256,10 @@ const
   CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
   CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
   CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+  /// cuStreamBeginCapture: only this thread's calls are checked
+  CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1;
+  /// cuStreamCreate: no implicit synchronization with the legacy stream
+  CU_STREAM_NON_BLOCKING = 1;
 
 {$I mormot.ai.infer.cuda.ptx.inc}
 
@@ -344,16 +391,19 @@ procedure TInferCuBuffer.Upload(aOffset: Int64; aSource: pointer; aBytes: Int64)
 var
   fpu: TCudaFpu;
 begin
-  if (aOffset < 0) or (aBytes < 0) or (aBytes > fSize - aOffset) then // no overflow
-    raise EInferCuda.CreateUtf8('%.Upload: % bytes at % of %',
+  if (aOffset < 0) or (aBytes < 0) or (aBytes > fSize - aOffset) or // no overflow
+     fCuda.fCapturing then
+    raise EInferCuda.CreateUtf8('%.Upload: % bytes at % of % (or during a capture)',
       [self, aBytes, aOffset, fSize]);
   if aBytes = 0 then
     exit;
   fpu := CudaFpuEnter;
   try
     fCuda.Use;
-    fCuda.Check(fCuda.fApi.MemcpyHtoD(fPtr + aOffset, aSource, aBytes),
-      'cuMemcpyHtoD');
+    // on the stream of the kernels, then waited for: in order with them
+    fCuda.Check(fCuda.fApi.MemcpyHtoDAsync(fPtr + aOffset, aSource, aBytes,
+      fCuda.fStream), 'cuMemcpyHtoDAsync');
+    fCuda.Check(fCuda.fApi.StreamSynchronize(fCuda.fStream), 'cuStreamSynchronize');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -363,16 +413,19 @@ procedure TInferCuBuffer.Download(aOffset: Int64; aDest: pointer; aBytes: Int64)
 var
   fpu: TCudaFpu;
 begin
-  if (aOffset < 0) or (aBytes < 0) or (aBytes > fSize - aOffset) then // no overflow
-    raise EInferCuda.CreateUtf8('%.Download: % bytes at % of %',
+  if (aOffset < 0) or (aBytes < 0) or (aBytes > fSize - aOffset) or // no overflow
+     fCuda.fCapturing then
+    raise EInferCuda.CreateUtf8('%.Download: % bytes at % of % (or during a capture)',
       [self, aBytes, aOffset, fSize]);
   if aBytes = 0 then
     exit;
   fpu := CudaFpuEnter;
   try
     fCuda.Use;
-    fCuda.Check(fCuda.fApi.MemcpyDtoH(aDest, fPtr + aOffset, aBytes),
-      'cuMemcpyDtoH');
+    // after every kernel enqueued before (the same stream)
+    fCuda.Check(fCuda.fApi.MemcpyDtoHAsync(aDest, fPtr + aOffset, aBytes,
+      fCuda.fStream), 'cuMemcpyDtoHAsync');
+    fCuda.Check(fCuda.fApi.StreamSynchronize(fCuda.fStream), 'cuStreamSynchronize');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -384,8 +437,9 @@ procedure TInferCuBuffer.CopyTo(aOffset: Int64; aDest: TInferCuBuffer;
 var
   fpu: TCudaFpu;
 begin
-  if (aDest = nil) or (aOffset < 0) or (aDestOffset < 0) or (aBytes < 0) or
-     (aBytes > fSize - aOffset) or (aBytes > aDest.fSize - aDestOffset) then
+  if (aDest = nil) or (aDest.fCuda <> fCuda) or (aOffset < 0) or
+     (aDestOffset < 0) or (aBytes < 0) or (aBytes > fSize - aOffset) or
+     (aBytes > aDest.fSize - aDestOffset) then
     raise EInferCuda.CreateUtf8('%.CopyTo: % bytes at % to % of %',
       [self, aBytes, aOffset, aDestOffset, aDest]);
   if aBytes = 0 then
@@ -393,8 +447,9 @@ begin
   fpu := CudaFpuEnter;
   try
     fCuda.Use;
-    fCuda.Check(fCuda.fApi.MemcpyDtoD(aDest.fPtr + aDestOffset, fPtr + aOffset,
-      aBytes), 'cuMemcpyDtoD');
+    // on the stream of the kernels: ordered with them, and capturable
+    fCuda.Check(fCuda.fApi.MemcpyDtoDAsync(aDest.fPtr + aDestOffset,
+      fPtr + aOffset, aBytes, fCuda.fStream), 'cuMemcpyDtoDAsync');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -454,15 +509,24 @@ begin
   Load(fApi.DevicePrimaryCtxRetain, 'cuDevicePrimaryCtxRetain');
   Load(fApi.DevicePrimaryCtxRelease, 'cuDevicePrimaryCtxRelease_v2');
   Load(fApi.CtxSetCurrent, 'cuCtxSetCurrent');
-  Load(fApi.CtxSynchronize, 'cuCtxSynchronize');
   Load(fApi.ModuleLoadData, 'cuModuleLoadData');
   Load(fApi.ModuleUnload, 'cuModuleUnload');
   Load(fApi.ModuleGetFunction, 'cuModuleGetFunction');
   Load(fApi.MemAlloc, 'cuMemAlloc_v2');
   Load(fApi.MemFree, 'cuMemFree_v2');
-  Load(fApi.MemcpyHtoD, 'cuMemcpyHtoD_v2');
-  Load(fApi.MemcpyDtoH, 'cuMemcpyDtoH_v2');
-  Load(fApi.MemcpyDtoD, 'cuMemcpyDtoD_v2');
+  Load(fApi.MemcpyDtoDAsync, 'cuMemcpyDtoDAsync_v2');
+  Load(fApi.MemcpyHtoDAsync, 'cuMemcpyHtoDAsync_v2');
+  Load(fApi.MemcpyDtoHAsync, 'cuMemcpyDtoHAsync_v2');
+  Load(fApi.StreamSynchronize, 'cuStreamSynchronize');
+  Load(fApi.StreamCreate, 'cuStreamCreate');
+  Load(fApi.StreamDestroy, 'cuStreamDestroy_v2');
+  Load(fApi.StreamBeginCapture, 'cuStreamBeginCapture_v2');
+  Load(fApi.StreamEndCapture, 'cuStreamEndCapture');
+  Load(fApi.GraphInstantiate, 'cuGraphInstantiateWithFlags');
+  Load(fApi.GraphExecUpdate, 'cuGraphExecUpdate_v2');
+  Load(fApi.GraphLaunch, 'cuGraphLaunch');
+  Load(fApi.GraphDestroy, 'cuGraphDestroy');
+  Load(fApi.GraphExecDestroy, 'cuGraphExecDestroy');
   Load(fApi.LaunchKernel, 'cuLaunchKernel');
   Load(fApi.GetErrorName, 'cuGetErrorName');
   fpu := CudaFpuEnter;
@@ -490,6 +554,12 @@ begin
     fTotalMemory := bytes;
     Check(fApi.DevicePrimaryCtxRetain(fContext, v), 'cuDevicePrimaryCtxRetain');
     fDevice := v; // retained: released by the destructor
+    // the stream of every kernel and copy of this instance, waited for on
+    // its own: non-blocking, so nothing on the legacy default stream or on the
+    // stream of another instance (the same primary context, maybe another
+    // thread) depends on it while it is captured into a graph
+    Use;
+    Check(fApi.StreamCreate(fStream, CU_STREAM_NON_BLOCKING), 'cuStreamCreate');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -503,6 +573,12 @@ begin
   begin
     fpu := CudaFpuEnter;
     try
+      if fStream <> nil then
+      begin
+        CaptureAbort; // freed during a capture: end it first
+        fApi.CtxSetCurrent(fContext);
+        fApi.StreamDestroy(fStream);
+      end;
       fApi.DevicePrimaryCtxRelease(fDevice);
     finally
       CudaFpuLeave(fpu);
@@ -534,8 +610,9 @@ var
   fpu: TCudaFpu;
   params: PPointer;
 begin
-  if (aKernel = nil) or (aGridX = 0) or (aBlockX = 0) then
-    raise EInferCuda.CreateUtf8('%.Launch: no kernel or an empty grid', [self]);
+  if (aKernel = nil) or (aGridX = 0) or (aBlockX = 0) or fCapturing then
+    raise EInferCuda.CreateUtf8('%.Launch: no kernel, an empty grid or a capture',
+      [self]);
   params := nil;
   if length(aParams) > 0 then
     params := @aParams[0];
@@ -543,9 +620,9 @@ begin
   try
     Use;
     Check(fApi.LaunchKernel(aKernel, aGridX, aGridY, aGridZ, aBlockX, aBlockY,
-      aBlockZ, aSharedBytes, nil, params, nil), 'cuLaunchKernel');
+      aBlockZ, aSharedBytes, fStream, params, nil), 'cuLaunchKernel');
     // the launch is asynchronous: its errors surface here
-    Check(fApi.CtxSynchronize(), 'cuCtxSynchronize');
+    Check(fApi.StreamSynchronize(fStream), 'cuStreamSynchronize');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -566,7 +643,7 @@ begin
   try
     Use;
     Check(fApi.LaunchKernel(aKernel, aGridX, aGridY, aGridZ, aBlockX, aBlockY,
-      aBlockZ, aSharedBytes, nil, params, nil), 'cuLaunchKernel');
+      aBlockZ, aSharedBytes, fStream, params, nil), 'cuLaunchKernel');
   finally
     CudaFpuLeave(fpu);
   end;
@@ -576,13 +653,98 @@ procedure TInferCuda.Synchronize;
 var
   fpu: TCudaFpu;
 begin
+  if fCapturing then
+    raise EInferCuda.CreateUtf8('%.Synchronize: during a capture', [self]);
   fpu := CudaFpuEnter;
   try
     Use;
-    Check(fApi.CtxSynchronize(), 'cuCtxSynchronize');
+    // this instance's stream only: another one may be capturing meanwhile
+    Check(fApi.StreamSynchronize(fStream), 'cuStreamSynchronize');
   finally
     CudaFpuLeave(fpu);
   end;
+end;
+
+procedure TInferCuda.CaptureBegin;
+var
+  fpu: TCudaFpu;
+begin
+  if fCapturing then
+    raise EInferCuda.CreateUtf8('%.CaptureBegin: already capturing', [self]);
+  fpu := CudaFpuEnter;
+  try
+    Use;
+    Check(fApi.StreamBeginCapture(fStream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+      'cuStreamBeginCapture');
+    fCapturing := true;
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.CaptureEnd(var aExec: TCuHandle);
+var
+  fpu: TCudaFpu;
+  graph: TCuHandle;
+  info: array[0..2] of Int64; // CUgraphExecUpdateResultInfo: 24 bytes
+begin
+  if not fCapturing then
+    raise EInferCuda.CreateUtf8('%.CaptureEnd: no capture', [self]);
+  fpu := CudaFpuEnter;
+  try
+    Use;
+    graph := nil;
+    fCapturing := false;
+    Check(fApi.StreamEndCapture(fStream, graph), 'cuStreamEndCapture');
+    try
+      // the same kernels as last time: only their parameters change
+      if (aExec <> nil) and
+         (fApi.GraphExecUpdate(aExec, graph, @info) <> CUDA_SUCCESS) then
+        GraphFree(aExec);
+      if aExec = nil then
+        Check(fApi.GraphInstantiate(aExec, graph, 0), 'cuGraphInstantiate');
+    finally
+      fApi.GraphDestroy(graph); // aExec is independent of it
+    end;
+    Check(fApi.GraphLaunch(aExec, fStream), 'cuGraphLaunch');
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.CaptureAbort;
+var
+  fpu: TCudaFpu;
+  graph: TCuHandle;
+begin
+  if not fCapturing then
+    exit;
+  fCapturing := false;
+  fpu := CudaFpuEnter;
+  try
+    graph := nil;
+    fApi.CtxSetCurrent(fContext); // no Use: this method never raises
+    if fApi.StreamEndCapture(fStream, graph) = CUDA_SUCCESS then
+      fApi.GraphDestroy(graph);
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.GraphFree(var aExec: TCuHandle);
+var
+  fpu: TCudaFpu;
+begin
+  if aExec = nil then
+    exit;
+  fpu := CudaFpuEnter;
+  try
+    fApi.CtxSetCurrent(fContext);
+    fApi.GraphExecDestroy(aExec);
+  finally
+    CudaFpuLeave(fpu);
+  end;
+  aExec := nil;
 end;
 
 

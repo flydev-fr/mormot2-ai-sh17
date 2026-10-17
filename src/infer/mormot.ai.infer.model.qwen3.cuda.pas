@@ -58,6 +58,9 @@ type
     fPart, fLogits: TInferCuBuffer; // the key ranges of the attention, logits
     // the inputs of a chunk on the host: embeddings, then cos, then sin
     fIn: TSingleDynArray;
+    // the decode step as a graph (TQwen3Cuda.UseGraphs), on fCu
+    fCu: TInferCuda;
+    fGraph: TCuHandle;
     procedure FreeScratch;
     procedure FreeCache;
   public
@@ -75,6 +78,7 @@ type
     fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fMerge, fAdd: TCuHandle;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
+    fUseGraphs: boolean;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
@@ -113,6 +117,11 @@ type
     // (the tests compare both)
     property SplitKeys: integer
       read fSplitKeys write fSplitKeys;
+    /// a decode step (one token) is recorded as a CUDA graph and launched at
+    // once instead of some 370 kernel launches - default true; the graph of
+    // the previous step takes the new parameters (TInferCuda.CaptureEnd)
+    property UseGraphs: boolean
+      read fUseGraphs write fUseGraphs;
   end;
 
 
@@ -149,6 +158,8 @@ end;
 
 destructor TQwen3CuContext.Destroy;
 begin
+  if fCu <> nil then
+    fCu.GraphFree(fGraph);
   FreeScratch;
   FreeCache;
   inherited Destroy;
@@ -210,6 +221,7 @@ begin
   fAttention := fOps.Kernel('attention');
   fMerge := fOps.Kernel('attnmerge');
   fSplitKeys := SPLIT_KEYS;
+  fUseGraphs := true;
   fAdd := fBasic.Kernel('add');
   fBackend.GpuLock;
   try
@@ -279,6 +291,7 @@ function TQwen3Cuda.NewContext: TQwen3CuContext;
 begin
   result := TQwen3CuContext.Create;
   result.fDevice := self;
+  result.fCu := fCu;
 end;
 
 function TQwen3Cuda.NewDeviceContext: TQwen3Context;
@@ -414,6 +427,7 @@ var
   pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt: TCuDevicePtr;
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count: cardinal;
   eps: single;
+  capture: boolean;
 begin
   c := fModel.Config;
   n := aCount;
@@ -472,68 +486,80 @@ begin
   pv := aCtx.fDevV.Ptr;
   pcs := aCtx.fDevCos.Ptr;
   pa := aCtx.fDevAttn.Ptr;
-  // the input norm of layer 0; every later one comes with the residual of the
-  // layer before (addnorm)
-  EnqueueNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
-  for l := 0 to c.Layers - 1 do
-  begin
-    ly := @fModel.Layers[l];
-    // attention block: the projections, per head the norms, rotary positions
-    // and the store of k and v into the cache, the attention, the output
-    fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ);
-    fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK);
-    fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
-    pqn := Vector(ly^.QNorm, c.HeadDim);
-    pkn := Vector(ly^.KNorm, c.HeadDim);
-    pkc := aCtx.fDevKeys[l].Ptr;
-    pvc := aCtx.fDevValues[l].Ptr;
-    fCu.Enqueue(fQkRope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
-      @heads, @kvHeads, @headDim, @ppast, @eps], c.Heads + c.KvHeads, OPS_BLOCK, n);
-    fCu.Enqueue(fAttention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
-      @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
-      OPS_BLOCK, blocks, splits);
-    if splits > 1 then
-      fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits],
-        c.Heads, OPS_BLOCK, n);
-    fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
-    // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
-    EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
-    fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);
-    fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-    px := aCtx.fDevGate.Ptr;
-    pt := aCtx.fDevUp.Ptr;
-    count := n * f;
-    fCu.Enqueue(fSwiGlu, [@px, @pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
-      OPS_BLOCK);
-    fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
-    // the residual, and the input norm of the next layer
-    if l < c.Layers - 1 then
-      EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, fModel.Layers[l + 1].InputNorm,
-        aCtx.fDevH)
-    else
+  // a single token: the whole step recorded as a graph, launched at once
+  capture := fUseGraphs and (n = 1);
+  if capture then
+    fCu.CaptureBegin;
+  try
+    // the input norm of layer 0; every later one comes with the residual of the
+    // layer before (addnorm)
+    EnqueueNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
+    for l := 0 to c.Layers - 1 do
     begin
-      px := aCtx.fDevX.Ptr;
-      pt := aCtx.fDevTmp.Ptr;
-      count := n * h;
-      fCu.Enqueue(fAdd, [@px, @pt, @px, @count],
-        (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+      ly := @fModel.Layers[l];
+      // attention block: the projections, per head the norms, rotary positions
+      // and the store of k and v into the cache, the attention, the output
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
+      pqn := Vector(ly^.QNorm, c.HeadDim);
+      pkn := Vector(ly^.KNorm, c.HeadDim);
+      pkc := aCtx.fDevKeys[l].Ptr;
+      pvc := aCtx.fDevValues[l].Ptr;
+      fCu.Enqueue(fQkRope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
+        @heads, @kvHeads, @headDim, @ppast, @eps], c.Heads + c.KvHeads, OPS_BLOCK, n);
+      fCu.Enqueue(fAttention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
+        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
+        OPS_BLOCK, blocks, splits);
+      if splits > 1 then
+        fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits],
+          c.Heads, OPS_BLOCK, n);
+      fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
+      // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
+      EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
+      px := aCtx.fDevGate.Ptr;
+      pt := aCtx.fDevUp.Ptr;
+      count := n * f;
+      fCu.Enqueue(fSwiGlu, [@px, @pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+        OPS_BLOCK);
+      fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+      // the residual, and the input norm of the next layer
+      if l < c.Layers - 1 then
+        EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, fModel.Layers[l + 1].InputNorm,
+          aCtx.fDevH)
+      else
+      begin
+        px := aCtx.fDevX.Ptr;
+        pt := aCtx.fDevTmp.Ptr;
+        count := n * h;
+        fCu.Enqueue(fAdd, [@px, @pt, @px, @count],
+          (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+      end;
     end;
-  end;
-  if outRows > 0 then
-  begin
-    if outRows = 1 then
+    if outRows > 0 then
     begin
-      // the last row only: to the start of the scratch, its norm, the head
-      aCtx.fDevX.CopyTo(Int64(n - 1) * h * 4, aCtx.fDevTmp, 0, Int64(h) * 4);
-      EnqueueNorm(aCtx.fDevTmp, 1, h, fModel.FinalNorm, aCtx.fDevH);
-    end
-    else
-      EnqueueNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
-    fBackend.EnqueueLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
-      aCtx.fLogits);
-    // waits for every kernel before it (one stream)
-    aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4);
-  end
+      if outRows = 1 then
+      begin
+        // the last row only: to the start of the scratch, its norm, the head
+        aCtx.fDevX.CopyTo(Int64(n - 1) * h * 4, aCtx.fDevTmp, 0, Int64(h) * 4);
+        EnqueueNorm(aCtx.fDevTmp, 1, h, fModel.FinalNorm, aCtx.fDevH);
+      end
+      else
+        EnqueueNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
+      fBackend.EnqueueLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
+        aCtx.fLogits);
+    end;
+    if capture then
+      fCu.CaptureEnd(aCtx.fGraph);
+  except
+    fCu.CaptureAbort;
+    raise;
+  end;
+  // waits for every kernel before it (one stream)
+  if outRows > 0 then
+    aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4)
   else
     fCu.Synchronize;
   MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer));

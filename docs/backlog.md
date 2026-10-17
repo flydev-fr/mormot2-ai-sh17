@@ -128,8 +128,9 @@ nichts installiert werden. C2 (`Linear` F32/Q8_0/Q4_K/Q6_K) erledigt 2026-10-17,
 unter Linux (WSL des RTX-Rechners). C3 (die übrigen Operationen als Kernel) erledigt
 2026-10-17. C4 (`TQwen3Cuda`: der ganze Forward-Pass auf der Karte, auch hinter
 `TNativeLlmClient`) erledigt 2026-10-17. C5 (Tempo) läuft: Messung gegen Vulkan und die
-Attention ohne Scores-Puffer (C5a) und die Matrixprodukte `linear8`/`gemm8` (C5b) erledigt
-2026-10-17; Prefill jetzt nahe Vulkan, Decode noch etwa 1 ms je Token dahinter.
+Attention ohne Scores-Puffer (C5a), die Matrixprodukte `linear8`/`gemm8` (C5b) und der
+Decode-Schritt als CUDA-Graph (C5c) erledigt 2026-10-17: Decode auf der RTX 5090 jetzt
+schneller als Vulkan (Q8_0 404 gegen 358 Token/s), Prefill bei rund 90 % von Vulkan.
 
 ---
 
