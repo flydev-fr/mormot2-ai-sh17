@@ -62,8 +62,11 @@ nichts, die Pascal-Skalenrechnung pro Zeile dafür viel.
   `DotQ4K2` zu `DotK2` für beide K-Typen verallgemeinert. Gegenprobe (vertauschte
   Ausgaben) lässt 16 Assertions scheitern. Q4_K_M-Prefill bei 200 Tokens: Snapdragon
   291 → 311 Tokens/s, M2 Pro 291 → 305.
-- *Offen:* Schritt 3 (AVX2, braucht wegen der Register xmm6..xmm15 aus dem
-  Sicherungsbereich).
+- *Schritt 3 (2026-10-17):* `Q4KSums2Avx2Asm`, `Q6KSums2Avx2Asm` (erzeugt, ymm0..ymm7,
+  xmm6/7 unter Win64 im X-Bereich gesichert, Skalen-Zwischenwerte in `A[5..6]`). Grün
+  unter FPC 3.2.2 und Delphi 13 auf dem i9-14900K; Gegenprobe (Zeilen vertauscht) lässt
+  32 Assertions scheitern. Q4_K_M-Prefill bei 200 Tokens: 462 → 579 Tokens/s.
+- *Offen:* nur der Lauf des SysV-Einsprungs (Linux x86_64), statisch geprüft.
 
 **Fertig, wenn:** `TTestInferFast.LinearKMatchesReference` (bitgleich, auch 513 Blöcke)
 mit einer Form „gerade/ungerade Zeilenzahl" grün; neuer Test Kernel = Pascal; Gegenproben
@@ -100,8 +103,9 @@ byteweise Entpacken nach Q8_0.
   ein `nop` statt des zweiten NEON-`sub` lässt 13 Assertions scheitern.
 - *Messung (Decode, Qwen3-0.6B Q4_0, 32 Tokens):* Snapdragon X 30 → 70–78 Tokens/s
   (Q8_0 58–66), M2 Pro 28,5 → 84.
-- *Offen:* AVX2-Fassung von `InferQ4Unpack` (Messung auf dem RTX-Rechner); fusionierter
-  Kernel und Repacking nur, wenn größere Modelle es verlangen.
+- *x64:* Schon das Pascal-Entpacken erfüllt das Ziel (i9-14900K: 64 → 79 Tokens/s, Q8_0
+  71–73); ein AVX2-`InferQ4Unpack` ist zurückgestellt (höchstens etwa 1 ms je Token).
+  Fusionierter Kernel und Repacking nur, wenn größere Modelle es verlangen.
 
 ---
 

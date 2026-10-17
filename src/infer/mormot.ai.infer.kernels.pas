@@ -2426,6 +2426,464 @@ begin
   Q6KSumsAvx2Asm(args);
 end;
 
+/// Q4KSums2Avx2 body: A = w, x, aBlocks, aOut, aXStride
+// - Q4KSumsAvx2Asm for the two activation rows x and x + aXStride: the
+// nibbles and each sub-block scale broadcast once, multiplied against both;
+// out per block isumA, msumA, isumB, msumB (exact int32)
+// - the scales and mins unpacked into A[5] and A[6] (the X area keeps
+// xmm6 and xmm7 on Win64); the out pointer advances in A[3]
+// - ymm0..ymm7
+procedure Q4KSums2Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        vmovups oword ptr [r11 + 128], xmm6
+        vmovups oword ptr [r11 + 144], xmm7
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm4, eax
+        vpbroadcastd ymm4, xmm4          // the low nibble mask
+        test    rcx, rcx
+        jz      @done
+@block: mov     eax, dword ptr [r8 + 4]
+        and     eax, 3F3F3F3FH
+        mov     dword ptr [r11 + 40], eax       // scales 0..3
+        mov     eax, dword ptr [r8 + 4]
+        shr     eax, 6
+        and     eax, 03030303H
+        shl     eax, 4
+        mov     edx, dword ptr [r8 + 12]
+        and     edx, 0F0F0F0FH
+        or      eax, edx
+        mov     dword ptr [r11 + 44], eax       // scales 4..7
+        mov     eax, dword ptr [r8 + 8]
+        and     eax, 3F3F3F3FH
+        mov     dword ptr [r11 + 48], eax       // mins 0..3
+        mov     eax, dword ptr [r8 + 8]
+        shr     eax, 6
+        and     eax, 03030303H
+        shl     eax, 4
+        mov     edx, dword ptr [r8 + 12]
+        shr     edx, 4
+        and     edx, 0F0F0F0FH
+        or      eax, edx
+        mov     dword ptr [r11 + 52], eax       // mins 4..7
+        mov     rdx, r9
+        add     rdx, qword ptr [r11 + 32]       // row B
+        vpxor   ymm5, ymm5, ymm5
+        vpxor   ymm6, ymm6, ymm6
+        vmovdqu ymm0, yword ptr [r8 + 16]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        movzx   eax, byte ptr [r11 + 40]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm1, yword ptr [r9 + 4]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm1, yword ptr [rdx + 4]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        movzx   eax, byte ptr [r11 + 41]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 36]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 36]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        vmovdqu ymm0, yword ptr [r8 + 48]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        movzx   eax, byte ptr [r11 + 42]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm1, yword ptr [r9 + 68]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm1, yword ptr [rdx + 68]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        movzx   eax, byte ptr [r11 + 43]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 100]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 100]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        vmovdqu ymm0, yword ptr [r8 + 80]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        movzx   eax, byte ptr [r11 + 44]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm1, yword ptr [r9 + 132]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm1, yword ptr [rdx + 132]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        movzx   eax, byte ptr [r11 + 45]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 164]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 164]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        vmovdqu ymm0, yword ptr [r8 + 112]
+        vpand   ymm1, ymm0, ymm4
+        vpsrlw  ymm2, ymm0, 4
+        vpand   ymm2, ymm2, ymm4
+        movzx   eax, byte ptr [r11 + 46]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm1, yword ptr [r9 + 196]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm1, yword ptr [rdx + 196]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        movzx   eax, byte ptr [r11 + 47]
+        imul    eax, eax, 00010001H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 228]
+        vpmaddwd ymm0, ymm0, ymm3
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 228]
+        vpmaddwd ymm7, ymm7, ymm3
+        vpaddd  ymm6, ymm6, ymm7
+        mov     rax, qword ptr [r11 + 48]       // FPC 3.2: no vmovq from memory
+        vmovq   xmm1, rax
+        vpmovzxbw xmm1, xmm1                    // the mins as int16
+        vpunpcklwd xmm2, xmm1, xmm1
+        vpunpckhwd xmm1, xmm1, xmm1
+        vinserti128 ymm2, ymm2, xmm1, 1         // m0 m0 m1 m1 .. m7 m7
+        vpmaddwd ymm0, ymm2, yword ptr [r9 + 260]
+        vpmaddwd ymm1, ymm2, yword ptr [rdx + 260]
+        // per 128-bit lane: [isumA, msumA, isumB, msumB] partial, then both lanes
+        vphaddd ymm5, ymm5, ymm0
+        vphaddd ymm6, ymm6, ymm1
+        vphaddd ymm5, ymm5, ymm6
+        vextracti128 xmm0, ymm5, 1
+        vpaddd  xmm5, xmm5, xmm0
+        mov     rax, qword ptr [r11 + 24]
+        vmovdqu oword ptr [rax], xmm5
+        add     rax, 16
+        mov     qword ptr [r11 + 24], rax
+        add     r8, 144
+        add     r9, 292
+        sub     rcx, 1
+        jnz     @block
+@done:  {$ifdef ABIWINX64}
+        vmovups xmm6, oword ptr [r11 + 128]
+        vmovups xmm7, oword ptr [r11 + 144]
+        {$endif ABIWINX64}
+        vzeroupper
+end;
+
+/// Q6KSums2Avx2 body: A = w, x, aBlocks, aOut, aXStride
+// - Q6KSumsAvx2Asm for the two activation rows x and x + aXStride: the
+// 6-bit values and the group scales built once, multiplied against both;
+// out per block isumA, 0, isumB, 0 (exact int32)
+// - the X area keeps xmm6 and xmm7 on Win64; the out pointer advances in
+// A[3]; ymm0..ymm7
+procedure Q6KSums2Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        vmovups oword ptr [r11 + 128], xmm6
+        vmovups oword ptr [r11 + 144], xmm7
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 8]
+        mov     rcx, qword ptr [r11 + 16]
+        mov     eax, 03030303H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3          // the 2-bit mask
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm4, eax
+        vpbroadcastd ymm4, xmm4          // the low nibble mask
+        test    rcx, rcx
+        jz      @done
+@block: mov     rdx, r9
+        add     rdx, qword ptr [r11 + 32]       // row B
+        vpxor   ymm5, ymm5, ymm5
+        vpxor   ymm6, ymm6, ymm6
+        // positions 0..31
+        vpand   ymm2, ymm4, yword ptr [r8 + 0]
+        vpand   ymm0, ymm3, yword ptr [r8 + 128]
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 192]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 193]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 4]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 4]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 32..63
+        vpand   ymm2, ymm4, yword ptr [r8 + 32]
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 2
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 194]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 195]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 36]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 36]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 64..95
+        vmovdqu ymm2, yword ptr [r8 + 0]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 4
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 196]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 197]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 68]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 68]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 96..127
+        vmovdqu ymm2, yword ptr [r8 + 32]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 128]
+        vpsrlw  ymm0, ymm0, 6
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 198]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 199]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 100]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 100]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 128..159
+        vpand   ymm2, ymm4, yword ptr [r8 + 64]
+        vpand   ymm0, ymm3, yword ptr [r8 + 160]
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 200]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 201]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 132]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 132]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 160..191
+        vpand   ymm2, ymm4, yword ptr [r8 + 96]
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 2
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 202]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 203]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 164]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 164]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 192..223
+        vmovdqu ymm2, yword ptr [r8 + 64]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 4
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 204]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 205]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 196]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 196]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // positions 224..255
+        vmovdqu ymm2, yword ptr [r8 + 96]
+        vpsrlw  ymm2, ymm2, 4
+        vpand   ymm2, ymm2, ymm4
+        vmovdqu ymm0, yword ptr [r8 + 160]
+        vpsrlw  ymm0, ymm0, 6
+        vpand   ymm0, ymm0, ymm3
+        vpsllw  ymm0, ymm0, 4
+        vpor    ymm2, ymm2, ymm0
+        movsx   eax, byte ptr [r8 + 206]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        movsx   eax, byte ptr [r8 + 207]
+        and     eax, 0FFFFH
+        imul    eax, eax, 00010001H
+        vmovd   xmm0, eax
+        vpbroadcastd ymm0, xmm0
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpmaddubsw ymm0, ymm2, yword ptr [r9 + 228]
+        vpmaddwd ymm0, ymm0, ymm1
+        vpaddd  ymm5, ymm5, ymm0
+        vpmaddubsw ymm7, ymm2, yword ptr [rdx + 228]
+        vpmaddwd ymm7, ymm7, ymm1
+        vpaddd  ymm6, ymm6, ymm7
+        // minus 32 * sum of scale * activation block sum, per row
+        vpmovsxbw ymm1, oword ptr [r8 + 192]
+        vpmaddwd ymm0, ymm1, yword ptr [r9 + 260]
+        vpslld  ymm0, ymm0, 5
+        vpsubd  ymm5, ymm5, ymm0
+        vpmaddwd ymm7, ymm1, yword ptr [rdx + 260]
+        vpslld  ymm7, ymm7, 5
+        vpsubd  ymm6, ymm6, ymm7
+        // [isumA, isumB] then interleaved with zeros
+        vphaddd ymm5, ymm5, ymm6
+        vextracti128 xmm0, ymm5, 1
+        vpaddd  xmm5, xmm5, xmm0
+        vphaddd xmm5, xmm5, xmm5
+        vpxor   xmm0, xmm0, xmm0
+        vpunpckldq xmm5, xmm5, xmm0
+        mov     rax, qword ptr [r11 + 24]
+        vmovdqu oword ptr [rax], xmm5
+        add     rax, 16
+        mov     qword ptr [r11 + 24], rax
+        add     r8, 210
+        add     r9, 292
+        sub     rcx, 1
+        jnz     @block
+@done:  {$ifdef ABIWINX64}
+        vmovups xmm6, oword ptr [r11 + 128]
+        vmovups xmm7, oword ptr [r11 + 144]
+        {$endif ABIWINX64}
+        vzeroupper
+end;
+
+procedure Q4KSums2Avx2(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
+  aXStride: PtrInt);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aOut);
+  args.A[4] := aXStride;
+  Q4KSums2Avx2Asm(args);
+end;
+
+procedure Q6KSums2Avx2(w, x: pointer; aBlocks: PtrInt; aOut: PIntegerArray;
+  aXStride: PtrInt);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(w);
+  args.A[1] := PtrInt(x);
+  args.A[2] := aBlocks;
+  args.A[3] := PtrInt(aOut);
+  args.A[4] := aXStride;
+  Q6KSums2Avx2Asm(args);
+end;
+
 {$endif ASMX64AVX1}
 {$endif CPUX64}
 
@@ -2509,6 +2967,8 @@ begin
     InferQ8DotF32x4x2 := Q8DotF32x4x2Avx2;
     InferQ4KSums := Q4KSumsAvx2;
     InferQ6KSums := Q6KSumsAvx2;
+    InferQ4KSums2 := Q4KSums2Avx2;
+    InferQ6KSums2 := Q6KSums2Avx2;
     InferQ8KernelName := 'avx2';
   end;
   {$endif INFERAVX2}
